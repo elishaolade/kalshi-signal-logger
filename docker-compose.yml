@@ -4,6 +4,11 @@ services:
   mysql:
     image: mysql:8.0
     container_name: kalshi_mysql
+    command:
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --max-connections=25
+      - --table-open-cache=200
     environment:
       MYSQL_ROOT_PASSWORD: root_password
       MYSQL_DATABASE: ${MYSQL_DATABASE:-signal_logger}
@@ -18,8 +23,8 @@ services:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 30
+      start_period: 120s
     restart: unless-stopped
 
   logger:
