@@ -1,0 +1,245 @@
+-- =============================================================
+-- Kalshi BTC Signal Logger — schema
+-- MySQL 8.0+
+-- =============================================================
+
+-- ---------------------------------------------------------------
+-- 1. markets
+--    One row per 15-minute up/down contract window.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS markets (
+    id             BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    market_ticker  VARCHAR(100) NOT NULL,
+    title          VARCHAR(500),
+    target_price   DECIMAL(12, 2),          -- BTC target price for this window
+    open_time      DATETIME,
+    close_time     DATETIME,
+    created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uq_market_ticker (market_ticker)
+);
+
+-- ---------------------------------------------------------------
+-- 2. btc_ticks
+--    Raw BTC price feed; market_ticker is nullable so ticks can
+--    be stored before a market is matched/opened.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS btc_ticks (
+    id             BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    market_ticker  VARCHAR(100)  NULL,
+    btc_price      DECIMAL(12, 2) NOT NULL,
+    source         VARCHAR(100),            -- e.g. "coinbase", "binance"
+    recorded_at    DATETIME(3)   NOT NULL,
+
+    INDEX idx_btc_ticker_time (market_ticker, recorded_at),
+    INDEX idx_btc_recorded_at (recorded_at),
+
+    CONSTRAINT fk_btc_ticks_market
+        FOREIGN KEY (market_ticker) REFERENCES markets (market_ticker)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- ---------------------------------------------------------------
+-- 3. contract_ticks
+--    Order-book snapshots for a specific market + side.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS contract_ticks (
+    id                     BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    market_ticker          VARCHAR(100) NOT NULL,
+    side                   ENUM('YES', 'NO') NOT NULL,
+    bid_price              DECIMAL(6, 4),
+    ask_price              DECIMAL(6, 4),
+    mid_price              DECIMAL(6, 4),
+    last_price             DECIMAL(6, 4),
+    spread                 DECIMAL(6, 4),
+    volume                 INT,
+    open_interest          INT,
+    time_remaining_seconds INT,
+    contract_age_seconds   INT,
+    recorded_at            DATETIME(3)  NOT NULL,
+    created_at             TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_ct_ticker_side_time (market_ticker, side, recorded_at),
+
+    CONSTRAINT fk_contract_ticks_market
+        FOREIGN KEY (market_ticker) REFERENCES markets (market_ticker)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- ---------------------------------------------------------------
+-- 4. signals
+--    One row per strategy rule firing. Stores the full feature
+--    snapshot at signal time for later analysis.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signals (
+    id                     BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    market_ticker          VARCHAR(100)  NOT NULL,
+    rule_name              VARCHAR(100)  NOT NULL,
+    rule_version           VARCHAR(20)   NOT NULL,
+    side                   ENUM('YES', 'NO') NOT NULL,
+
+    -- contract state at signal time
+    contract_price         DECIMAL(6, 4),
+    bid_price              DECIMAL(6, 4),
+    ask_price              DECIMAL(6, 4),
+    spread                 DECIMAL(6, 4),
+
+    -- BTC context
+    btc_price              DECIMAL(12, 2),
+    target_price           DECIMAL(12, 2),
+    gap                    DECIMAL(10, 4),      -- btc_price - target_price
+    directional_gap        DECIMAL(10, 4),      -- gap signed toward side
+    gap_z_score            DECIMAL(10, 6),
+
+    -- timing
+    contract_age_seconds   INT,
+    time_remaining_seconds INT,
+
+    -- derived features
+    momentum_score         DECIMAL(10, 6),
+    reversal_score         DECIMAL(10, 6),
+    btc_velocity           DECIMAL(12, 6),
+    volatility_30s         DECIMAL(10, 6),
+    volatility_60s         DECIMAL(10, 6),
+    volatility_120s        DECIMAL(10, 6),
+
+    -- optional enrichment (may be filled after the fact)
+    edge                   DECIMAL(8, 4)  NULL,
+    confidence_score       DECIMAL(5, 4)  NULL,
+    reason                 TEXT,
+    signal_status          VARCHAR(50)    DEFAULT 'paper',
+
+    recorded_at            DATETIME(3)   NOT NULL,
+    created_at             TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_sig_ticker_time  (market_ticker, recorded_at),
+    INDEX idx_sig_rule         (rule_name, rule_version),
+    INDEX idx_sig_status       (signal_status),
+
+    CONSTRAINT fk_signals_market
+        FOREIGN KEY (market_ticker) REFERENCES markets (market_ticker)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- ---------------------------------------------------------------
+-- 5. paper_trades
+--    Simulated entry/exit lifecycle for each signal.
+--    No real orders are ever placed.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id                    BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    signal_id             BIGINT        NULL,
+    market_ticker         VARCHAR(100)  NOT NULL,
+    rule_name             VARCHAR(100)  NOT NULL,
+    rule_version          VARCHAR(20)   NOT NULL,
+    side                  ENUM('YES', 'NO') NOT NULL,
+
+    -- prices
+    entry_price           DECIMAL(6, 4),
+    simulated_entry_price DECIMAL(6, 4),   -- mid at entry time (no fill assumption)
+    exit_price            DECIMAL(6, 4),
+    simulated_exit_price  DECIMAL(6, 4),
+    peak_price            DECIMAL(6, 4),   -- best price seen while open
+    lowest_price          DECIMAL(6, 4),   -- worst price seen while open
+
+    -- timing
+    entry_time            DATETIME(3),
+    exit_time             DATETIME(3),
+    exit_reason           VARCHAR(200),    -- e.g. "stop_loss", "take_profit", "expiry"
+
+    -- performance
+    pnl                   DECIMAL(10, 4),
+    pnl_percent           DECIMAL(8, 4),
+    final_outcome         ENUM('YES', 'NO', 'UNKNOWN') DEFAULT 'UNKNOWN',
+    would_have_won        BOOLEAN,         -- did the market resolve in favor of side?
+    followed_rules        BOOLEAN,
+
+    -- sizing / friction
+    position_size         DECIMAL(10, 2),  -- simulated contract count or notional
+    total_slippage        DECIMAL(8, 4),
+
+    status                ENUM('OPEN', 'CLOSED') DEFAULT 'OPEN',
+
+    created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_pt_signal      (signal_id),
+    INDEX idx_pt_ticker_rule (market_ticker, rule_name),
+    INDEX idx_pt_entry_time  (entry_time),
+
+    CONSTRAINT fk_paper_trades_signal
+        FOREIGN KEY (signal_id) REFERENCES signals (id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- ---------------------------------------------------------------
+-- 6. trade_snapshots
+--    Per-tick feature record captured while a paper trade is open.
+--    Used to replay trade evolution and build training datasets.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trade_snapshots (
+    id                  BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    paper_trade_id      BIGINT        NOT NULL,
+    signal_id           BIGINT        NULL,
+    market_ticker       VARCHAR(100)  NOT NULL,
+    side                ENUM('YES', 'NO') NOT NULL,
+
+    -- BTC context
+    btc_price           DECIMAL(12, 2),
+    target_price        DECIMAL(12, 2),
+    raw_gap             DECIMAL(10, 4),
+    directional_gap     DECIMAL(10, 4),
+
+    -- rolling volatility
+    rolling_std_30s     DECIMAL(10, 6),
+    rolling_std_60s     DECIMAL(10, 6),
+    rolling_std_120s    DECIMAL(10, 6),
+
+    -- z-scores vs target
+    z_from_target_30s   DECIMAL(10, 6),
+    z_from_target_60s   DECIMAL(10, 6),
+    z_from_target_120s  DECIMAL(10, 6),
+
+    -- contract state
+    contract_price      DECIMAL(6, 4),
+    bid_price           DECIMAL(6, 4),
+    ask_price           DECIMAL(6, 4),
+    spread              DECIMAL(6, 4),
+
+    -- derived features
+    momentum_score      DECIMAL(10, 6),
+    reversal_score      DECIMAL(10, 6),
+    btc_velocity        DECIMAL(12, 6),
+    time_remaining_seconds INT,
+
+    recorded_at         DATETIME(3)  NOT NULL,
+    created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_ts_trade_time (paper_trade_id, recorded_at),
+    INDEX idx_ts_signal     (signal_id),
+
+    CONSTRAINT fk_ts_paper_trade
+        FOREIGN KEY (paper_trade_id) REFERENCES paper_trades (id)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+
+    CONSTRAINT fk_ts_signal
+        FOREIGN KEY (signal_id) REFERENCES signals (id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- ---------------------------------------------------------------
+-- 7. strategy_versions
+--    Registry of every rule/version combination with its logic
+--    snapshot, so analysis scripts can join on exact parameters.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    id           INT          AUTO_INCREMENT PRIMARY KEY,
+    rule_name    VARCHAR(100) NOT NULL,
+    rule_version VARCHAR(20)  NOT NULL,
+    description  TEXT,
+    entry_rules  JSON,
+    exit_rules   JSON,
+    is_active    BOOLEAN      DEFAULT FALSE,
+    created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uq_rule_version (rule_name, rule_version)
+);

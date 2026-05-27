@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m app.features)",
+      "Bash(python3 -)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)"
+    ]
+  }
+}
