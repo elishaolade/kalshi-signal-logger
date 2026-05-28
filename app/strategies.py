@@ -527,10 +527,180 @@ def premium_momentum_scalp_v2(
     )
 
 
+# ── premium_no_midrange_scalp ─────────────────────────────────────────────────
+
+_PNMS_RULE_NAME    = "premium_no_midrange_scalp"
+_PNMS_RULE_VERSION = "v1"
+
+_PNMS_MIN_TIME_REMAINING = 180   # seconds
+_PNMS_MAX_TIME_REMAINING = 300   # seconds
+_PNMS_MIN_NO_ASK         = 0.65  # NO ask floor
+_PNMS_MAX_NO_ASK         = 0.80  # NO ask ceiling
+_PNMS_MAX_SPREAD         = 0.03
+_PNMS_MIN_DIR_MOMENTUM   = 3.0   # directional (NO = -raw_momentum_score)
+_PNMS_MIN_DIR_GAP_Z      = 2.0   # directional (NO = -raw_gap_z_score)
+_PNMS_MOMENTUM_N         = 10
+
+
+def premium_no_midrange_scalp(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+) -> Optional[Signal]:
+    """
+    Hypothesis
+    ----------
+    NO contracts priced 0.65–0.80 in the final 3–5 minutes of a 15-minute
+    BTC window may produce reliable short scalps when BTC momentum and the
+    gap z-score both confirm the NO direction (BTC trending below target).
+    Rationale: the cross-bucket analysis showed the 0.65–0.80 band has PF 1.80
+    overall, but it may be driven by one side; this isolates the NO side and
+    tightens the directional filters.
+
+    Entry conditions
+    ----------------
+    1. 180 ≤ time_remaining_seconds ≤ 300
+    2. Side = NO only
+    3. NO ask price in [0.65, 0.80]
+    4. Spread ≤ 0.03
+    5. Directional momentum ≥ 3   (NO → −raw_momentum_score ≥ 3,
+                                   i.e. raw_momentum_score ≤ −3)
+    6. Directional gap z-score ≥ 2 (NO → −raw_gap_z_score ≥ 2,
+                                    i.e. raw_gap_z_score ≤ −2)
+
+    Side-normalised values
+    ----------------------
+    directional_momentum_score:  YES = raw_mom       NO = −raw_mom
+    directional_gap_z_score:     YES = raw_gz        NO = −raw_gz
+    """
+    side = "NO"
+
+    # ── 1. Time-window gate ───────────────────────────────────────────────────
+    if not (_PNMS_MIN_TIME_REMAINING <= time_remaining_seconds <= _PNMS_MAX_TIME_REMAINING):
+        logger.debug(
+            "%s: skip — remaining=%.0fs outside [%d, %d]",
+            _PNMS_RULE_NAME, time_remaining_seconds,
+            _PNMS_MIN_TIME_REMAINING, _PNMS_MAX_TIME_REMAINING,
+        )
+        return None
+
+    # ── 2. Feature computation ────────────────────────────────────────────────
+    mom  = momentum_score(ticks, n=_PNMS_MOMENTUM_N)
+    rev  = reversal_score(ticks, side, n=_PNMS_MOMENTUM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, side)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    # ── 3. Directional momentum (NO side: flip sign) ──────────────────────────
+    dir_mom = -mom
+    if dir_mom < _PNMS_MIN_DIR_MOMENTUM:
+        logger.debug(
+            "%s: skip — directional_mom=%.2f < %.1f  (raw_mom=%.2f)",
+            _PNMS_RULE_NAME, dir_mom, _PNMS_MIN_DIR_MOMENTUM, mom,
+        )
+        return None
+
+    # ── 4. Directional gap z-score (NO side: flip sign) ──────────────────────
+    dir_gz = (-gz) if gz is not None else None
+    if dir_gz is None or dir_gz < _PNMS_MIN_DIR_GAP_Z:
+        logger.debug(
+            "%s: skip — directional_gz=%s < %.1f",
+            _PNMS_RULE_NAME,
+            f"{dir_gz:.4f}" if dir_gz is not None else "N/A",
+            _PNMS_MIN_DIR_GAP_Z,
+        )
+        return None
+
+    # ── 5. NO contract price and spread ──────────────────────────────────────
+    quotes = contract_prices.get(side, {})
+    ask    = quotes.get("ask_price", 0.0)
+    bid    = quotes.get("bid_price", 0.0)
+    mid    = quotes.get("mid_price", 0.0)
+    spread = quotes.get("spread",    0.0)
+
+    if not (_PNMS_MIN_NO_ASK <= ask <= _PNMS_MAX_NO_ASK):
+        logger.debug(
+            "%s: skip — NO ask=%.4f outside [%.2f, %.2f]",
+            _PNMS_RULE_NAME, ask, _PNMS_MIN_NO_ASK, _PNMS_MAX_NO_ASK,
+        )
+        return None
+
+    if spread > _PNMS_MAX_SPREAD:
+        logger.debug(
+            "%s: skip — spread=%.4f > %.2f", _PNMS_RULE_NAME, spread, _PNMS_MAX_SPREAD,
+        )
+        return None
+
+    # ── 6. Build signal ───────────────────────────────────────────────────────
+    vel_s   = f"{vel:+.2f}$/s"   if vel  is not None else "n/a"
+    gz_s    = f"{gz:+.4f}"       if gz   is not None else "n/a"
+    dgz_s   = f"{dir_gz:+.4f}"  if dir_gz is not None else "n/a"
+    reason  = (
+        f"{_PNMS_RULE_NAME} {_PNMS_RULE_VERSION}: {side} @ ask={ask:.4f} | "
+        f"dir_mom={dir_mom:+.0f} dir_gz={dgz_s} gz_raw={gz_s} vel={vel_s} | "
+        f"btc={btc_price:,.2f} target={target_price:,.2f} gap={g:+.2f} "
+        f"remaining={time_remaining_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _PNMS_RULE_NAME,
+        rule_version           = _PNMS_RULE_VERSION,
+        side                   = side,
+
+        contract_price         = mid,
+        bid_price              = bid,
+        ask_price              = ask,
+        spread                 = spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "paper_active",
+    )
+
+
+# ── Strategy registry ─────────────────────────────────────────────────────────
+#
+# Active strategies are evaluated every poll cycle.
+# Watch-only keys (see _WATCH_ONLY_KEYS below) are still evaluated and logged
+# to the signals table but will NOT open paper trades.
+
 _STRATEGIES = [
-    premium_momentum_continuation,
-    premium_momentum_scalp_v2,
+    premium_momentum_continuation,   # NO-side active; YES-side watch_only (see below)
+    premium_no_midrange_scalp,       # paper_active — NO only, 0.65–0.80
+    premium_momentum_scalp_v2,       # watch_only — conflicts with PNMS in 240-300s/NO band
+    # cheap_reversal_scalp           # disabled — removed from registry 2026-05-28
 ]
+
+# Keys that produce signals for the DB log but must NOT open paper trades.
+# Format: "rule_name/rule_version"        → all sides paused
+#         "rule_name/rule_version/SIDE"   → one side paused
+_WATCH_ONLY_KEYS: frozenset[str] = frozenset({
+    "premium_momentum_continuation/v1/YES",  # YES-side PMC: watch-only
+    "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
+})
 
 
 def run_all(
@@ -562,9 +732,24 @@ def run_all(
     for fn in _STRATEGIES:
         try:
             result = fn(**kwargs)
-            if result is not None:
-                signals.append(result)
         except Exception:
             logger.exception("Unhandled exception in strategy %s", fn.__name__)
+            continue
+
+        if result is None:
+            continue
+
+        # Apply watch-only status for paused rule/side combinations.
+        # Signals are still inserted into the DB for visibility, but the
+        # caller must not open a paper trade when signal_status == "watch_only".
+        rule_base = f"{result.rule_name}/{result.rule_version}"
+        rule_side = f"{rule_base}/{result.side}"
+        if rule_base in _WATCH_ONLY_KEYS or rule_side in _WATCH_ONLY_KEYS:
+            result.signal_status = "watch_only"
+            logger.debug(
+                "Watch-only signal: %s %s (not paper-traded)", rule_base, result.side,
+            )
+
+        signals.append(result)
 
     return signals

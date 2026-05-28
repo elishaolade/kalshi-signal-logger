@@ -31,6 +31,13 @@ Exit rules
     trailing_stop   mid <= peak - 0.03    (once peak >= entry + 0.04)
     timeout_60s     elapsed >= 60 seconds
     near_expiry     time_remaining <= 30 seconds
+
+  premium_no_midrange_scalp/v1  (NO side only)
+    take_profit     mid >= entry + 0.05
+    stop_loss       mid <= entry - 0.03
+    timeout_60s     elapsed >= 60 seconds
+    near_expiry     time_remaining <= 30 seconds
+    trailing_stop   disabled for v1
 """
 
 from __future__ import annotations
@@ -117,6 +124,12 @@ _PMS_V2_SL_ABS        = 0.04
 _PMS_V2_TRAIL_ARM     = 0.04
 _PMS_V2_TRAIL_DIST    = 0.03
 
+_PNMS_TIMEOUT_S     = 60
+_PNMS_NEAR_EXPIRY_S = 30
+_PNMS_TP_ABS        = 0.05   # take profit: +5 cents from simulated entry
+_PNMS_SL_ABS        = 0.03   # stop loss:   -3 cents from simulated entry
+# trailing stop disabled for v1
+
 ExitFn = Callable[["OpenTrade", float, float, float], Optional[str]]
 
 
@@ -186,10 +199,36 @@ def _exit_premium_momentum_scalp_v2(
     return None
 
 
+def _exit_premium_no_midrange_scalp(
+    trade: OpenTrade,
+    mid: float,
+    time_remaining_seconds: float,
+    elapsed_seconds: float,
+) -> Optional[str]:
+    """
+    Exit rules for premium_no_midrange_scalp/v1 (NO side only).
+    Priority: near_expiry → take_profit → stop_loss → timeout_60s.
+    Trailing stop is disabled for v1.
+    Fills use ask+slip at entry and bid-slip at exit (never mid).
+    """
+    entry = trade.entry_price
+
+    if time_remaining_seconds <= _PNMS_NEAR_EXPIRY_S:
+        return "near_expiry"
+    if mid >= entry + _PNMS_TP_ABS:
+        return "take_profit"
+    if mid <= entry - _PNMS_SL_ABS:
+        return "stop_loss"
+    if elapsed_seconds >= _PNMS_TIMEOUT_S:
+        return "timeout_60s"
+    return None
+
+
 _EXIT_DISPATCH: dict[str, ExitFn] = {
-    "cheap_reversal_scalp/v1":          _exit_cheap_reversal_scalp,
-    "premium_momentum_continuation/v1": _exit_premium_momentum_continuation,
-    "premium_momentum_scalp/v2":        _exit_premium_momentum_scalp_v2,
+    "cheap_reversal_scalp/v1":           _exit_cheap_reversal_scalp,
+    "premium_momentum_continuation/v1":  _exit_premium_momentum_continuation,
+    "premium_momentum_scalp/v2":         _exit_premium_momentum_scalp_v2,
+    "premium_no_midrange_scalp/v1":      _exit_premium_no_midrange_scalp,
 }
 
 
@@ -250,6 +289,20 @@ class PaperTrader:
                 rule_key,
             )
             return None
+
+        # Block if an open trade already exists for this rule/side/market.
+        # Prevents doubling into the same position while a trade is running.
+        for existing in self._open_trades.values():
+            if (
+                existing.market_ticker == signal.market_ticker
+                and existing.rule_key  == rule_key
+                and existing.side      == signal.side
+            ):
+                logger.debug(
+                    "open_trade: skip — trade #%d already open for %s %s %s",
+                    existing.trade_id, rule_key, signal.side, signal.market_ticker,
+                )
+                return None
 
         quotes   = contract_prices.get(signal.side, {})
         ask      = quotes.get("ask_price", 0.0)

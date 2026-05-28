@@ -9,7 +9,9 @@ Poll cycle (every POLL_INTERVAL_SECONDS):
   5.  Get YES/NO contract prices  (mock pricing model)
   6.  Store contract ticks        → contract_ticks
   7.  Maintain BTC history        (in-memory deque, warm-started from DB)
-  8.  Evaluate strategies         cheap_reversal_scalp_v1 + premium_momentum_continuation_v1
+  8.  Evaluate strategies         premium_momentum_continuation/v1 (NO active, YES watch-only)
+                                  premium_no_midrange_scalp/v1    (NO only, paper_active)
+                                  premium_momentum_scalp/v2       (watch-only — conflicts with PNMS)
   9.  Deduplicate signals          cooldown window per (rule/version/side/ticker)
   10. Insert fired signals         → signals
   11. Open paper trades            → paper_trades  (via PaperTrader)
@@ -336,6 +338,13 @@ def _tick(
                 "Signal #%d fired: %s  side=%s  ask=%.4f",
                 signal_id, sig.rule_name, sig.side, sig.ask_price,
             )
+
+            # watch_only signals are logged to the DB but must not open trades.
+            if sig.signal_status == "watch_only":
+                logger.debug(
+                    "Watch-only signal #%d — recorded but no trade opened", signal_id,
+                )
+                continue
 
             try:
                 trade_id = trader.open_trade(sig, signal_id, contract_prices)
