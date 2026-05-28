@@ -4,7 +4,8 @@
       "Bash(python3 -m app.features)",
       "Bash(python3 -)",
       "Bash(pip install *)",
-      "Bash(pip3 install *)"
+      "Bash(pip3 install *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/analyze_trades.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }

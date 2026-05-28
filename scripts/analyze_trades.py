@@ -2,8 +2,17 @@
 """
 Analyze closed paper trades stored in MySQL.
 
-Groups by rule_name, rule_version, exit_reason, and five feature buckets
-(time_remaining, contract_price, spread, momentum_score, gap_z_score).
+Part 1 — Single-dimension breakdowns
+  Groups by rule_name, rule_version, exit_reason, and five feature buckets
+  (time_remaining, contract_price, spread, momentum_score, gap_z_score).
+
+Part 2 — Cross-bucket analysis (n ≥ 10 per cell)
+  Answers five specific questions:
+    Q1. Does premium_momentum_continuation work better for YES or NO?
+    Q2. Does negative momentum outperform positive momentum?
+    Q3. Is gap_z_score sign mapped correctly for each side?
+    Q4. Does the 0.65–0.80 contract-price edge belong to one side only?
+    Q5. Are stop_loss and trailing_stop hurting more than helping?
 
 Metrics per group: trade count, win rate, avg/median PnL, avg win, avg loss,
 expectancy, max loss, sequential max drawdown, profit factor.
@@ -32,6 +41,7 @@ _QUERY = """
     SELECT
         pt.rule_name,
         pt.rule_version,
+        pt.side,
         pt.exit_reason,
         CAST(pt.pnl AS DOUBLE) AS pnl,
         s.time_remaining_seconds,
@@ -256,8 +266,9 @@ def _md_table(title: str, groups: list[tuple[str, dict]]) -> list[str]:
 
 
 def write_report(
-    sections: list[tuple[str, list[tuple[str, dict]]]],
-    overall:  dict,
+    sections:       list[tuple[str, list[tuple[str, dict]]]],
+    overall:        dict,
+    cross_sections: Optional[list[tuple[str, list[tuple[str, dict]], str]]] = None,
 ) -> Path:
     today   = date.today()
     out_dir = Path(__file__).parent.parent / "reports"
@@ -290,8 +301,253 @@ def write_report(
     for title, groups in sections:
         lines.extend(_md_table(title, groups))
 
+    if cross_sections:
+        lines += [
+            "---",
+            "",
+            "## Cross-Bucket Analysis",
+            "",
+            f"_Only cells with n ≥ {_MIN_CROSS_COUNT} trades are shown. "
+            "Sorted by expectancy (best first)._",
+            "",
+        ]
+        for title, groups, note in cross_sections:
+            lines.extend(_md_cross_table(title, groups, note))
+
     out_path.write_text("\n".join(lines) + "\n")
     return out_path
+
+
+# ── Cross-bucket helpers ───────────────────────────────────────────────────────
+
+_MIN_CROSS_COUNT = 10
+
+# Compact column set for cross tables (drops Med PnL and Max Loss to save width)
+_CROSS_W_BUCKET = 52
+_CROSS_COLS = [
+    ("Count",   6),
+    ("Win%",    6),
+    ("Avg PnL", 9),
+    ("Avg Win", 9),
+    ("Avg Loss",9),
+    ("Expect",  9),
+    ("PF",      6),
+    ("Max DD",  9),
+]
+
+
+def _b_side(r: dict) -> str:
+    return str(r.get("side") or "N/A")
+
+
+def _b_rule_short(r: dict) -> str:
+    """Abbreviated rule names so composite keys stay readable."""
+    name = str(r.get("rule_name") or "N/A")
+    return {
+        "cheap_reversal_scalp":          "CRS",
+        "premium_momentum_continuation": "PMC",
+        "premium_momentum_scalp":        "PMS",
+    }.get(name, name[:8])
+
+
+def _b_exit(r: dict) -> str:
+    return str(r.get("exit_reason") or "N/A")
+
+
+def _b_directional_gap_z(r: dict) -> str:
+    """
+    Gap z-score signed relative to the traded side.
+    Positive = BTC is on the winning side of the target.
+    YES → use raw gz;  NO → flip sign.
+    This tests whether the signal's gz filter is directionally correct.
+    """
+    z    = _fv(r, "gap_z_score")
+    side = r.get("side", "")
+    if z is None:
+        return "N/A"
+    dz = z if side == "YES" else -z
+    if dz <= -2: return "≤-2 (vs trade)"
+    if dz <= -1: return "-2 to -1 (vs)"
+    if dz <   0: return "-1 to 0  (vs)"
+    if dz <   1: return "0 to 1   (with)"
+    if dz <   2: return "1 to 2   (with)"
+    return              "≥2      (with, far)"
+
+
+def _b_momentum_sign(r: dict) -> str:
+    """Signed momentum relative to the traded side."""
+    m    = _fv(r, "momentum_score")
+    side = r.get("side", "")
+    if m is None:
+        return "N/A"
+    dm = m if side == "YES" else -m
+    if dm <= -3: return "≤-3 (vs trade)"
+    if dm <   0: return "-3 to 0 (vs)"
+    if dm <   3: return "0 to 3  (with)"
+    return              "≥3     (with)"
+
+
+def cross_group_by(
+    rows:      list[dict],
+    key_fns:   list[tuple[str, Callable[[dict], str]]],
+    min_count: int = _MIN_CROSS_COUNT,
+    sort_by:   str = "expectancy",
+) -> list[tuple[str, dict]]:
+    """
+    Group rows by the compound key formed by applying each key_fn in order.
+    Cells with fewer than min_count trades are dropped.
+    Sorted by sort_by descending (best first).
+    """
+    buckets: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        key = "  |  ".join(fn(r) for _, fn in key_fns)
+        buckets[key].append(float(r["pnl"]))
+
+    results = []
+    for label, pnls in buckets.items():
+        if len(pnls) < min_count:
+            continue
+        results.append((label, compute_metrics(pnls)))
+
+    results.sort(
+        key=lambda x: x[1].get(sort_by, float("-inf")),
+        reverse=True,
+    )
+    return results
+
+
+def _cross_metric_cells(m: dict) -> list[str]:
+    return [
+        str(m["count"]),
+        f"{m['win_rate'] * 100:.1f}%",
+        f"{m['avg_pnl']:+.4f}",
+        f"{m['avg_win']:+.4f}",
+        f"{m['avg_loss']:+.4f}",
+        f"{m['expectancy']:+.4f}",
+        _pf_str(m["profit_factor"]),
+        f"{m['max_drawdown']:+.4f}",
+    ]
+
+
+def print_cross_table(
+    title:   str,
+    groups:  list[tuple[str, dict]],
+    note:    str = "",
+    col_headers: Optional[list[str]] = None,
+) -> None:
+    """Print a cross-bucket table with optional column headers override."""
+    cols = list(zip(col_headers, [c[1] for c in _CROSS_COLS])) if col_headers else _CROSS_COLS
+
+    hdr = f"{'Bucket':<{_CROSS_W_BUCKET}}  " + "  ".join(f"{h:>{w}}" for h, w in cols)
+    sep = "-" * _CROSS_W_BUCKET + "  " + "  ".join("-" * w for _, w in cols)
+    rule = "─" * max(0, 76 - len(title))
+
+    print(f"\n── {title} {rule}")
+    if note:
+        print(f"   {note}")
+    print(hdr)
+    print(sep)
+    for bucket, m in groups:
+        if not m:
+            continue
+        left  = f"{bucket:<{_CROSS_W_BUCKET}}"
+        right = "  ".join(f"{v:>{w}}" for v, (_, w) in zip(_cross_metric_cells(m), cols))
+        print(f"{left}  {right}")
+    if not groups:
+        print(f"  (no cells with n ≥ {_MIN_CROSS_COUNT})")
+    print()
+
+
+def _md_cross_table(title: str, groups: list[tuple[str, dict]], note: str = "") -> list[str]:
+    hdrs   = ["Bucket"] + [h for h, _ in _CROSS_COLS]
+    aligns = [":---"]   + ["---:" for _ in _CROSS_COLS]
+    lines  = [f"### {title}", ""]
+    if note:
+        lines += [f"_{note}_", ""]
+    lines += [
+        "| " + " | ".join(hdrs)   + " |",
+        "| " + " | ".join(aligns) + " |",
+    ]
+    for bucket, m in groups:
+        if m:
+            cells = [bucket.replace("|", "\\|")] + _cross_metric_cells(m)
+            lines.append("| " + " | ".join(cells) + " |")
+    if not groups:
+        lines.append(f"_(no cells with n ≥ {_MIN_CROSS_COUNT})_")
+    lines.append("")
+    return lines
+
+
+# ── Five-question cross analysis ───────────────────────────────────────────────
+
+def run_cross_analysis(
+    rows: list[dict],
+) -> list[tuple[str, list[tuple[str, dict]], str]]:
+    """
+    Build cross-bucket tables for the five research questions.
+    Returns list of (title, groups, note) tuples for both console and markdown.
+    """
+    pmc = [r for r in rows if r.get("rule_name") == "premium_momentum_continuation"]
+
+    sections: list[tuple[str, list[tuple[str, dict]], str]] = []
+
+    # ── Q1: PMC — YES vs NO ───────────────────────────────────────────────────
+    q1 = cross_group_by(pmc, [("side", _b_side)])
+    sections.append((
+        "Q1 · PMC: YES vs NO  (sorted by expectancy)",
+        q1,
+        "Does premium_momentum_continuation work better on one side?",
+    ))
+
+    # ── Q2: Momentum direction × side × rule ──────────────────────────────────
+    q2 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("side", _b_side), ("mom_dir", _b_momentum_sign)],
+    )
+    sections.append((
+        "Q2 · Momentum direction × rule × side  (n ≥ 10, sorted by expectancy)",
+        q2,
+        "Momentum sign is relative to the traded side: "
+        "'with' = confirms direction, 'vs' = counter-direction.",
+    ))
+
+    # ── Q3: Directional gap z-score × rule × side ─────────────────────────────
+    q3 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("side", _b_side), ("dgz", _b_directional_gap_z)],
+    )
+    sections.append((
+        "Q3 · Directional gap-z × rule × side  (n ≥ 10, sorted by expectancy)",
+        q3,
+        "gap_z flipped for NO trades so positive always means "
+        "BTC is on the correct side of the target. "
+        "If mapping is correct, 'with' buckets should outperform 'vs' buckets.",
+    ))
+
+    # ── Q4: Contract price × side ─────────────────────────────────────────────
+    q4 = cross_group_by(
+        rows,
+        [("side", _b_side), ("cp", _b_contract_price)],
+    )
+    sections.append((
+        "Q4 · Contract price × side  (n ≥ 10, sorted by expectancy)",
+        q4,
+        "Does the 0.65–0.80 edge hold for both YES and NO, or just one side?",
+    ))
+
+    # ── Q5: Exit reason × rule × side ─────────────────────────────────────────
+    q5 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("side", _b_side), ("exit", _b_exit)],
+        min_count=5,      # relax to 5 here — exit combos are naturally sparse
+    )
+    sections.append((
+        "Q5 · Exit reason × rule × side  (n ≥ 5, sorted by expectancy)",
+        q5,
+        "Are stop_loss and trailing_stop worse on a particular rule or side?",
+    ))
+
+    return sections
 
 
 # ── Dimension registry ─────────────────────────────────────────────────────────
@@ -371,7 +627,18 @@ def main() -> None:
         print_table(title, groups)
         sections.append((title, groups))
 
-    path = write_report(sections, overall)
+    # ── Cross-bucket analysis ─────────────────────────────────────────────────
+    print(f"\n{'═' * 96}")
+    print("  Cross-Bucket Analysis")
+    print(f"{'═' * 96}")
+    print(f"  (Only cells with n ≥ {_MIN_CROSS_COUNT} shown, except Q5 where n ≥ 5.)")
+    print("  Sorted by expectancy — best cells first.\n")
+
+    cross_sections = run_cross_analysis(rows)
+    for title, groups, note in cross_sections:
+        print_cross_table(title, groups, note)
+
+    path = write_report(sections, overall, cross_sections)
     print(f"Report written → {path}\n")
 
 
