@@ -8,6 +8,7 @@ the script identifies positive/negative expectancy regions, scores each
 finding by effect size and sample quality, then surfaces:
 
   • Top 5 promising strategy ideas  (where to concentrate)
+  • Top 5 watchlist buckets         (better than baseline, not profitable yet)
   • Top 5 no-trade filters           (where to stop trading)
   • Top 5 exit experiments           (how to tune exits)
 
@@ -42,6 +43,7 @@ WEAK_SAMPLE        = 30   # warn but include findings below this
 
 # Minimum |effect size| to surface a finding at all (avoids noise)
 _MIN_EFFECT = 0.4
+_MIN_STD_ERR = 0.005
 
 # ── Data ───────────────────────────────────────────────────────────────────────
 
@@ -81,7 +83,9 @@ def _fv(row: dict, key: str) -> Optional[float]:
 
 
 def _b_rule(r: dict) -> str:
-    return str(r.get("rule_name") or "N/A")
+    rule = r.get("rule_name") or "N/A"
+    version = r.get("rule_version") or "N/A"
+    return f"{rule}/{version}"
 
 def _b_side(r: dict) -> str:
     return str(r.get("side") or "N/A")
@@ -159,8 +163,9 @@ def _b_velocity(r: dict) -> str:
 
 def _b_rule_side(r: dict) -> str:
     rule = r.get("rule_name") or "?"
+    version = r.get("rule_version") or "?"
     side = r.get("side") or "?"
-    return f"{rule} / {side}"
+    return f"{rule}/{version} / {side}"
 
 
 # ── Entry-dimension registry ───────────────────────────────────────────────────
@@ -193,7 +198,7 @@ def _metrics(pnls: list[float]) -> dict[str, Any]:
     losses = [p for p in pnls if p < 0]
     mu     = mean(pnls)
     sd     = stdev(pnls) if n > 1 else 0.0
-    se     = sd / math.sqrt(n) if sd > 0 else 1e-9
+    se     = max(sd / math.sqrt(n), _MIN_STD_ERR) if sd > 0 else _MIN_STD_ERR
     gp     = sum(wins)
     gl     = abs(sum(losses))
     return {
@@ -235,7 +240,7 @@ def _sample_tag(n: int, min_sample: int) -> str:
 
 @dataclass
 class Finding:
-    ftype:        str    # "strategy_idea" | "no_trade_filter" | "exit_experiment"
+    ftype:        str    # "strategy_idea" | "watchlist" | "no_trade_filter" | "exit_experiment"
     title:        str
     hypothesis:   str    # one actionable sentence
     evidence:     str    # multi-line narrative
@@ -291,13 +296,23 @@ def generate_entry_findings(
             pct_of_trades = n / total_n * 100
             wr_delta      = (m["win_rate"] - owr) * 100
 
-            if effect > 0:
+            is_profitable = exp > 0 and m["pf"] > 1.0
+
+            if effect > 0 and is_profitable:
                 ftype = "strategy_idea"
                 title = f"Concentrate on {dim_label} = {bucket}"
                 hypothesis = (
                     f"Add entry filter: only take trades where {dim_label} "
                     f"is in '{bucket}'. This regime covers {pct_of_trades:.0f}% "
                     f"of trades and shows {_pct_delta(exp, oe)} better expectancy."
+                )
+            elif effect > 0:
+                ftype = "watchlist"
+                title = f"Watch {dim_label} = {bucket}"
+                hypothesis = (
+                    f"This bucket beats the current baseline but is not profitable yet "
+                    f"(expectancy {exp:+.4f}, PF {_pf_str(m['pf'])}). Keep collecting "
+                    f"data before promoting it into an entry filter."
                 )
             else:
                 ftype = "no_trade_filter"
@@ -489,6 +504,7 @@ def _top(findings: list[Finding], ftype: str, n: int) -> list[Finding]:
 
 _FTYPE_LABELS = {
     "strategy_idea":   "Promising Strategy Ideas",
+    "watchlist":       "Watchlist",
     "no_trade_filter": "No-Trade Filters",
     "exit_experiment": "Exit Experiments",
 }
@@ -577,6 +593,7 @@ def write_report(
     out_path = out_dir / f"strategy_ideas_{today.strftime('%Y_%m_%d')}.md"
 
     ideas   = _top(all_findings, "strategy_idea",   5)
+    watch   = _top(all_findings, "watchlist",        5)
     filters = _top(all_findings, "no_trade_filter",  5)
     exits   = _top(all_findings, "exit_experiment",  5)
 
@@ -597,6 +614,7 @@ def write_report(
         "| Category | Findings surfaced |",
         "|:---|---:|",
         f"| Promising strategy ideas | {len(ideas)} |",
+        f"| Watchlist buckets | {len(watch)} |",
         f"| No-trade filters | {len(filters)} |",
         f"| Exit experiments | {len(exits)} |",
         "",
@@ -614,8 +632,8 @@ def write_report(
         "",
         "## Top 5 Promising Strategy Ideas",
         "",
-        "Buckets where historical expectancy significantly *exceeds* baseline. "
-        "Each idea suggests an entry condition or strategy focus.",
+        "Buckets where historical expectancy is positive, profit factor exceeds 1, "
+        "and performance significantly beats baseline.",
         "",
     ]
 
@@ -624,6 +642,22 @@ def write_report(
             lines.extend(_md_finding(i, f))
     else:
         lines.append("*No promising ideas met the minimum thresholds.*\n")
+
+    lines += [
+        "---",
+        "",
+        "## Top 5 Watchlist Buckets",
+        "",
+        "Buckets that beat the current baseline but are not yet profitable. "
+        "Treat these as hypotheses to monitor, not filters to promote.",
+        "",
+    ]
+
+    if watch:
+        for i, f in enumerate(watch, 1):
+            lines.extend(_md_finding(i, f))
+    else:
+        lines.append("*No watchlist buckets met the minimum thresholds.*\n")
 
     lines += [
         "---",
@@ -646,8 +680,8 @@ def write_report(
         "",
         "## Top 5 Exit Experiments",
         "",
-        "Exit-reason buckets with the largest deviation from baseline. "
-        "Each experiment suggests a tweak to exit rules.",
+        "Outcome-conditioned exit diagnostics with the largest deviation from "
+        "baseline. Treat these as prompts for controlled exit tests.",
         "",
     ]
 
@@ -713,6 +747,7 @@ def main() -> None:
     all_findings   = entry_findings + exit_findings
 
     ideas   = _top(all_findings, "strategy_idea",   5)
+    watch   = _top(all_findings, "watchlist",        5)
     filters = _top(all_findings, "no_trade_filter",  5)
     exits   = _top(all_findings, "exit_experiment",  5)
 
@@ -728,6 +763,7 @@ def main() -> None:
     print(f"{'═' * W}")
 
     print_section("Top 5 Promising Strategy Ideas", ideas)
+    print_section("Top 5 Watchlist Buckets", watch)
     print_section("Top 5 No-Trade Filters", filters)
     print_section("Top 5 Exit Experiments", exits)
 
