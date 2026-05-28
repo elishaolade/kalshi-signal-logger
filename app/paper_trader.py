@@ -21,7 +21,7 @@ Exit rules
   premium_momentum_continuation/v1
     take_profit     mid >= entry + 0.06
     stop_loss       mid <= entry - 0.05
-    trailing_stop   mid <= peak - 0.04   (always active from first tick)
+    trailing_stop   mid <= peak - 0.04   (once peak >= entry + 0.03)
     break_even_stop mid <= entry          (active after peak >= entry + 0.04)
     near_expiry     time_remaining <= 30 seconds
 
@@ -106,7 +106,8 @@ _CRS_TRAIL_ARM     = 0.03    # peak must reach entry+this before trailing arms
 _PMC_NEAR_EXPIRY_S = 30
 _PMC_TP_ABS        = 0.06    # absolute take profit
 _PMC_SL_ABS        = 0.05    # absolute stop loss
-_PMC_TRAIL_DIST    = 0.04    # trailing distance from peak (always active)
+_PMC_TRAIL_ARM     = 0.03    # peak must reach entry+this before trailing arms
+_PMC_TRAIL_DIST    = 0.04    # trailing distance from peak (once armed)
 _PMC_BE_THRESH     = 0.04    # gain required to arm break-even stop
 
 _PMS_V2_TIMEOUT_S     = 60
@@ -158,7 +159,7 @@ def _exit_premium_momentum_continuation(
         return "stop_loss"
     if trade.break_even_activated and mid <= entry:
         return "break_even_stop"
-    if mid <= peak - _PMC_TRAIL_DIST:
+    if peak >= entry + _PMC_TRAIL_ARM and mid <= peak - _PMC_TRAIL_DIST:
         return "trailing_stop"
     return None
 
