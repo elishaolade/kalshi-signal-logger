@@ -403,9 +403,133 @@ def premium_momentum_continuation(
 
 # ── Registry / dispatcher ─────────────────────────────────────────────────────
 
+_PMS_V2_RULE_NAME    = "premium_momentum_scalp"
+_PMS_V2_RULE_VERSION = "v2"
+
+_PMS_V2_MIN_CONTRACT_PRICE = 0.65
+_PMS_V2_MAX_CONTRACT_PRICE = 0.80
+_PMS_V2_MIN_TIME_REMAINING = 240
+_PMS_V2_MAX_TIME_REMAINING = 300
+_PMS_V2_MAX_SPREAD         = 0.03
+_PMS_V2_MIN_MOMENTUM_YES   = 3.0
+_PMS_V2_MAX_MOMENTUM_NO    = -3.0
+_PMS_V2_MIN_DIRECTIONAL_GZ = -1.0
+_PMS_V2_MOMENTUM_N         = 10
+
+
+def premium_momentum_scalp_v2(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+) -> Optional[Signal]:
+    """
+    Hypothesis
+    ----------
+    The first promising refinement is a tighter premium momentum scalp:
+    enter only in the 4–5 minute-to-expiry window, only when the selected
+    contract is priced in the 65c–80c band, and only when momentum confirms
+    the side without BTC being extremely stretched against it.
+    """
+    if not (_PMS_V2_MIN_TIME_REMAINING <= time_remaining_seconds <= _PMS_V2_MAX_TIME_REMAINING):
+        logger.debug(
+            "%s: skip — remaining=%.0fs outside [%d, %d]",
+            _PMS_V2_RULE_NAME, time_remaining_seconds,
+            _PMS_V2_MIN_TIME_REMAINING, _PMS_V2_MAX_TIME_REMAINING,
+        )
+        return None
+
+    mom  = momentum_score(ticks, n=_PMS_V2_MOMENTUM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    candidates: list[tuple[str, float, dict]] = []
+    for side in ("YES", "NO"):
+        quotes = contract_prices.get(side, {})
+        mid    = quotes.get("mid_price", 0.0)
+        spread = quotes.get("spread", 0.0)
+
+        if not (_PMS_V2_MIN_CONTRACT_PRICE <= mid <= _PMS_V2_MAX_CONTRACT_PRICE):
+            continue
+        if spread > _PMS_V2_MAX_SPREAD:
+            continue
+        if side == "YES" and mom < _PMS_V2_MIN_MOMENTUM_YES:
+            continue
+        if side == "NO" and mom > _PMS_V2_MAX_MOMENTUM_NO:
+            continue
+
+        directional_gz = gz if side == "YES" else (-gz if gz is not None else None)
+        if directional_gz is None or directional_gz < _PMS_V2_MIN_DIRECTIONAL_GZ:
+            continue
+
+        candidates.append((side, directional_gz, quotes))
+
+    if not candidates:
+        logger.debug(
+            "%s: skip — no side passed price/spread/momentum/gap filters",
+            _PMS_V2_RULE_NAME,
+        )
+        return None
+
+    side, directional_gz, quotes = max(candidates, key=lambda item: item[1])
+    bid    = quotes.get("bid_price", 0.0)
+    ask    = quotes.get("ask_price", 0.0)
+    mid    = quotes.get("mid_price", 0.0)
+    spread = quotes.get("spread", 0.0)
+    rev    = reversal_score(ticks, side, n=_PMS_V2_MOMENTUM_N)
+    dg     = _directional_gap(btc_price, target_price, side)
+
+    vel_s  = f"{vel:+.2f}$/s" if vel is not None else "n/a"
+    gz_s   = f"{gz:+.4f}"    if gz  is not None else "n/a"
+    reason = (
+        f"{_PMS_V2_RULE_NAME} {_PMS_V2_RULE_VERSION}: {side} @ mid={mid:.4f} "
+        f"ask={ask:.4f} | mom={mom:+.0f} gz_dir={directional_gz:+.4f} "
+        f"gz_raw={gz_s} vel={vel_s} | btc={btc_price:,.2f} "
+        f"target={target_price:,.2f} gap={g:+.2f} "
+        f"remaining={time_remaining_seconds:.0f}s"
+    )
+
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _PMS_V2_RULE_NAME,
+        rule_version           = _PMS_V2_RULE_VERSION,
+        side                   = side,
+
+        contract_price         = mid,
+        bid_price              = bid,
+        ask_price              = ask,
+        spread                 = spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+    )
+
+
 _STRATEGIES = [
-    cheap_reversal_scalp,
     premium_momentum_continuation,
+    premium_momentum_scalp_v2,
 ]
 
 

@@ -24,6 +24,13 @@ Exit rules
     trailing_stop   mid <= peak - 0.04   (always active from first tick)
     break_even_stop mid <= entry          (active after peak >= entry + 0.04)
     near_expiry     time_remaining <= 30 seconds
+
+  premium_momentum_scalp/v2
+    take_profit     mid >= entry + 0.05
+    stop_loss       mid <= entry - 0.04
+    trailing_stop   mid <= peak - 0.03    (once peak >= entry + 0.04)
+    timeout_60s     elapsed >= 60 seconds
+    near_expiry     time_remaining <= 30 seconds
 """
 
 from __future__ import annotations
@@ -102,6 +109,13 @@ _PMC_SL_ABS        = 0.05    # absolute stop loss
 _PMC_TRAIL_DIST    = 0.04    # trailing distance from peak (always active)
 _PMC_BE_THRESH     = 0.04    # gain required to arm break-even stop
 
+_PMS_V2_TIMEOUT_S     = 60
+_PMS_V2_NEAR_EXPIRY_S = 30
+_PMS_V2_TP_ABS        = 0.05
+_PMS_V2_SL_ABS        = 0.04
+_PMS_V2_TRAIL_ARM     = 0.04
+_PMS_V2_TRAIL_DIST    = 0.03
+
 ExitFn = Callable[["OpenTrade", float, float, float], Optional[str]]
 
 
@@ -149,9 +163,32 @@ def _exit_premium_momentum_continuation(
     return None
 
 
+def _exit_premium_momentum_scalp_v2(
+    trade: OpenTrade,
+    mid: float,
+    time_remaining_seconds: float,
+    elapsed_seconds: float,
+) -> Optional[str]:
+    entry = trade.entry_price
+    peak  = trade.peak_price
+
+    if elapsed_seconds >= _PMS_V2_TIMEOUT_S:
+        return "timeout_60s"
+    if time_remaining_seconds <= _PMS_V2_NEAR_EXPIRY_S:
+        return "near_expiry"
+    if mid >= entry + _PMS_V2_TP_ABS:
+        return "take_profit"
+    if mid <= entry - _PMS_V2_SL_ABS:
+        return "stop_loss"
+    if peak >= entry + _PMS_V2_TRAIL_ARM and mid <= peak - _PMS_V2_TRAIL_DIST:
+        return "trailing_stop"
+    return None
+
+
 _EXIT_DISPATCH: dict[str, ExitFn] = {
     "cheap_reversal_scalp/v1":          _exit_cheap_reversal_scalp,
     "premium_momentum_continuation/v1": _exit_premium_momentum_continuation,
+    "premium_momentum_scalp/v2":        _exit_premium_momentum_scalp_v2,
 }
 
 
