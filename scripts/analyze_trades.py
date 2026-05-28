@@ -42,6 +42,8 @@ _QUERY = """
     FROM paper_trades pt
     LEFT JOIN signals s ON pt.signal_id = s.id
     WHERE pt.exit_time IS NOT NULL
+      AND pt.pnl IS NOT NULL
+      AND pt.followed_rules = TRUE
     ORDER BY pt.entry_time
 """
 

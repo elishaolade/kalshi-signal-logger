@@ -65,6 +65,8 @@ def load_trades(strategy: Optional[str]) -> tuple[np.ndarray, np.ndarray, str]:
                    CAST(entry_price  AS DOUBLE) AS ep
             FROM   paper_trades
             WHERE  exit_time IS NOT NULL
+              AND  pnl IS NOT NULL
+              AND  followed_rules = TRUE
               AND  rule_name = %s
             ORDER BY entry_time
             """,
@@ -78,6 +80,8 @@ def load_trades(strategy: Optional[str]) -> tuple[np.ndarray, np.ndarray, str]:
                    CAST(entry_price  AS DOUBLE) AS ep
             FROM   paper_trades
             WHERE  exit_time IS NOT NULL
+              AND  pnl IS NOT NULL
+              AND  followed_rules = TRUE
             ORDER BY entry_time
             """,
         )

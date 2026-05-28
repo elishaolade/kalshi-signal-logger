@@ -183,6 +183,7 @@ class PaperTrader:
             "PaperTrader ready — mode=%s entry_slip=+%.2f exit_slip=-%.2f positions=%d",
             slippage_mode, self._slip.entry_add, self._slip.exit_sub, position_size,
         )
+        self._close_recovered_open_trades()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -289,6 +290,9 @@ class PaperTrader:
 
         for trade_id, trade in list(self._open_trades.items()):
             if trade.market_ticker != market_ticker:
+                self._apply_forced_exit(trade, "market_rollover", now)
+                del self._open_trades[trade_id]
+                closed.append(trade_id)
                 continue
 
             quotes = contract_prices.get(trade.side, {})
@@ -391,6 +395,79 @@ class PaperTrader:
             "Closed trade #%d  %s  %s  reason=%-18s  exit=%.4f  pnl=%+.4f  (%.1f%%)",
             trade.trade_id, trade.rule_key, trade.side,
             exit_reason, sim_exit, pnl, pnl_pct * 100,
+        )
+
+    def _apply_forced_exit(
+        self,
+        trade: OpenTrade,
+        exit_reason: str,
+        now: datetime,
+    ) -> None:
+        """
+        Close a trade when its market is no longer active.
+
+        This should be rare because normal near-expiry exits usually fire first.
+        When a trade gets stranded across a market rollover, we no longer have a
+        live quote for that old ticker, so close it at entry and mark the rule
+        as not followed to keep the row out of strategy-quality conclusions.
+        """
+        execute_query(
+            """
+            UPDATE paper_trades
+            SET
+                exit_price           = entry_price,
+                simulated_exit_price = simulated_entry_price,
+                peak_price           = %s,
+                lowest_price         = %s,
+                exit_time            = %s,
+                exit_reason          = %s,
+                pnl                  = 0,
+                pnl_percent          = 0,
+                total_slippage       = %s,
+                followed_rules       = FALSE,
+                status               = 'CLOSED'
+            WHERE id = %s
+            """,
+            (
+                trade.peak_price,
+                trade.lowest_price,
+                now,
+                exit_reason,
+                round(self._slip.entry_add + self._slip.exit_sub, 4),
+                trade.trade_id,
+            ),
+        )
+
+        logger.warning(
+            "Forced close trade #%d  %s  %s  reason=%s",
+            trade.trade_id, trade.rule_key, trade.side, exit_reason,
+        )
+
+    def _close_recovered_open_trades(self) -> None:
+        """
+        Close DB rows left OPEN by a previous process.
+
+        Open trade state is in memory. After a restart, those rows cannot be
+        managed safely, so mark them closed at breakeven and exclude them from
+        followed-rules analysis.
+        """
+        now = datetime.now(timezone.utc)
+        execute_query(
+            """
+            UPDATE paper_trades
+            SET
+                exit_price           = entry_price,
+                simulated_exit_price = simulated_entry_price,
+                exit_time            = %s,
+                exit_reason          = 'recovered_after_restart',
+                pnl                  = 0,
+                pnl_percent          = 0,
+                total_slippage       = %s,
+                followed_rules       = FALSE,
+                status               = 'CLOSED'
+            WHERE status = 'OPEN'
+            """,
+            (now, round(self._slip.entry_add + self._slip.exit_sub, 4)),
         )
 
     def _write_snapshot(
