@@ -27,5 +27,9 @@ PAPER_POSITION_SIZE = int(os.getenv("PAPER_POSITION_SIZE", "1"))
 # harsh:      entry=ask+0.02  exit=bid-0.02
 SLIPPAGE_MODE = os.getenv("SLIPPAGE_MODE", "realistic")
 
+# ── Timezone (for time-of-day feature logging) ────────────────────────────────
+# All entry_date / entry_hour / block fields stored in this timezone.
+SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
+
 # ── External API ─────────────────────────────────────────────────────────────
 KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")

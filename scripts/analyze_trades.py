@@ -48,7 +48,12 @@ _QUERY = """
         CAST(s.contract_price  AS DOUBLE) AS contract_price,
         CAST(s.spread          AS DOUBLE) AS spread,
         CAST(s.momentum_score  AS DOUBLE) AS momentum_score,
-        CAST(s.gap_z_score     AS DOUBLE) AS gap_z_score
+        CAST(s.gap_z_score     AS DOUBLE) AS gap_z_score,
+        -- time-of-day features stored on the trade row (NULL for pre-migration rows)
+        pt.entry_day_name,
+        pt.entry_hour_block,
+        pt.entry_30m_block,
+        pt.entry_15m_block
     FROM paper_trades pt
     LEFT JOIN signals s ON pt.signal_id = s.id
     WHERE pt.exit_time IS NOT NULL
@@ -232,41 +237,54 @@ def _console_row(bucket: str, m: dict) -> str:
     return f"{left}  {right}"
 
 
-def print_table(title: str, groups: list[tuple[str, dict]]) -> None:
+def print_table(
+    title: str,
+    groups: list[tuple[str, dict]],
+    min_flag: int = 0,
+) -> None:
     hdr  = f"{'Bucket':<{_W_BUCKET}}  " + "  ".join(f"{h:>{w}}" for h, w in _COLS)
     sep  = "-" * _W_BUCKET + "  " + "  ".join("-" * w for _, w in _COLS)
     rule = "─" * max(0, 76 - len(title))
 
     print(f"\n── {title} {rule}")
+    if min_flag:
+        print(f"   ⚑ = n < {min_flag}  (insufficient sample size)")
     print(hdr)
     print(sep)
     for bucket, m in groups:
         if m:
-            print(_console_row(bucket, m))
+            label = bucket if (not min_flag or m["count"] >= min_flag) else f"{bucket}  ⚑"
+            print(_console_row(label, m))
     print()
 
 
 # ── Markdown output ────────────────────────────────────────────────────────────
 
-def _md_table(title: str, groups: list[tuple[str, dict]]) -> list[str]:
+def _md_table(
+    title: str,
+    groups: list[tuple[str, dict]],
+    min_flag: int = 0,
+) -> list[str]:
     hdrs   = ["Bucket"] + [h for h, _ in _COLS]
     aligns = [":---"]   + ["---:" for _ in _COLS]
-    lines  = [
-        f"### {title}",
-        "",
+    lines  = [f"### {title}", ""]
+    if min_flag:
+        lines += [f"_⚑ = n < {min_flag}  (insufficient sample size)_", ""]
+    lines += [
         "| " + " | ".join(hdrs)   + " |",
         "| " + " | ".join(aligns) + " |",
     ]
     for bucket, m in groups:
         if m:
-            cells = [bucket] + _metric_cells(m)
+            label = bucket if (not min_flag or m["count"] >= min_flag) else f"{bucket} ⚑"
+            cells = [label] + _metric_cells(m)
             lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
     return lines
 
 
 def write_report(
-    sections:       list[tuple[str, list[tuple[str, dict]]]],
+    sections:       list[tuple[str, list[tuple[str, dict]], int]],
     overall:        dict,
     cross_sections: Optional[list[tuple[str, list[tuple[str, dict]], str]]] = None,
 ) -> Path:
@@ -298,8 +316,8 @@ def write_report(
         "## Breakdowns",
         "",
     ]
-    for title, groups in sections:
-        lines.extend(_md_table(title, groups))
+    for title, groups, min_flag in sections:
+        lines.extend(_md_table(title, groups, min_flag))
 
     if cross_sections:
         lines += [
@@ -547,53 +565,178 @@ def run_cross_analysis(
         "Are stop_loss and trailing_stop worse on a particular rule or side?",
     ))
 
+    # ── Time-of-day cross-bucket sections ──────────────────────────────────────
+    # Cells with n < 10 are excluded; flagged as insufficient sample size.
+
+    # Q6: strategy × hour_block
+    q6 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("hour", _b_hour_block)],
+    )
+    sections.append((
+        "Q6 · Strategy × hour_block  (n ≥ 10, sorted by expectancy)",
+        q6,
+        "Does performance vary by hour of day?  Hour is in America/New_York "
+        "(or configured SIGNAL_TIMEZONE).  N/A = pre-migration rows.",
+    ))
+
+    # Q7: strategy × day_name
+    q7 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("day", _b_day_name)],
+    )
+    sections.append((
+        "Q7 · Strategy × day_name  (n ≥ 10, sorted by expectancy)",
+        q7,
+        "Does performance differ by day of week?",
+    ))
+
+    # Q8: strategy × side × hour_block
+    q8 = cross_group_by(
+        rows,
+        [("rule", _b_rule_short), ("side", _b_side), ("hour", _b_hour_block)],
+    )
+    sections.append((
+        "Q8 · Strategy × side × hour_block  (n ≥ 10, sorted by expectancy)",
+        q8,
+        "Combines direction and time of day to surface side-specific time edges.",
+    ))
+
+    # Q9: PNMS v1 by hour_block
+    pnms = [r for r in rows if r.get("rule_name") == "premium_no_midrange_scalp"]
+    q9   = cross_group_by(pnms, [("hour", _b_hour_block)])
+    sections.append((
+        "Q9 · PNMS v1 by hour_block  (n ≥ 10, sorted by expectancy)",
+        q9,
+        "Which hour of day is most profitable for premium_no_midrange_scalp?",
+    ))
+
+    # Q10: PNMS v1 by day_name
+    q10 = cross_group_by(pnms, [("day", _b_day_name)])
+    sections.append((
+        "Q10 · PNMS v1 by day_name  (n ≥ 10, sorted by expectancy)",
+        q10,
+        "Which day of week is most profitable for premium_no_midrange_scalp?",
+    ))
+
     return sections
 
 
-# ── Dimension registry ─────────────────────────────────────────────────────────
+# ── Time-of-day bucket helpers ────────────────────────────────────────────────
 
-_DIMENSIONS: list[tuple[str, Callable, Optional[list[str]]]] = [
+# Canonical orderings so tables read chronologically, not alphabetically.
+_DAY_ORDER: list[str] = [
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday", "N/A",
+]
+_HOUR_ORDER:    list[str] = [f"{h:02d}:00" for h in range(24)] + ["N/A"]
+_BLOCK_30M_ORDER: list[str] = [
+    f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)
+] + ["N/A"]
+_BLOCK_15M_ORDER: list[str] = [
+    f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)
+] + ["N/A"]
+
+_MIN_TIME_SAMPLE = 10   # flag rows below this count in time-based tables
+
+
+def _b_day_name(r: dict) -> str:
+    return str(r.get("entry_day_name") or "N/A")
+
+
+def _b_hour_block(r: dict) -> str:
+    return str(r.get("entry_hour_block") or "N/A")
+
+
+def _b_30m_block(r: dict) -> str:
+    return str(r.get("entry_30m_block") or "N/A")
+
+
+def _b_15m_block(r: dict) -> str:
+    return str(r.get("entry_15m_block") or "N/A")
+
+
+# ── Dimension registry ─────────────────────────────────────────────────────────
+#
+# Each entry: (title, key_fn, order, min_flag)
+# min_flag: rows with count < min_flag get a "  ⚑" suffix in console output.
+#           0 = no flagging.
+
+_DIMENSIONS: list[tuple[str, Callable, Optional[list[str]], int]] = [
     (
         "rule_name",
         lambda r: str(r["rule_name"] or "N/A"),
         None,
+        0,
     ),
     (
         "rule_version",
         lambda r: str(r["rule_version"] or "N/A"),
         None,
+        0,
     ),
     (
         "exit_reason",
         lambda r: str(r["exit_reason"] or "N/A"),
         ["near_expiry", "take_profit", "stop_loss",
          "trailing_stop", "break_even_stop", "timeout_60s", "N/A"],
+        0,
     ),
     (
         "time_remaining",
         _b_time_remaining,
         ["<60s", "60-120s", "120-180s", "180-240s", "240-300s", "300s+", "N/A"],
+        0,
     ),
     (
         "contract_price",
         _b_contract_price,
         ["<0.15", "0.15-0.25", "0.25-0.35", "0.35-0.50",
          "0.50-0.65", "0.65-0.80", "0.80+", "N/A"],
+        0,
     ),
     (
         "spread",
         _b_spread,
         ["<0.01", "0.01-0.02", "0.02-0.03", "0.03+", "N/A"],
+        0,
     ),
     (
         "momentum_score",
         _b_momentum,
         ["≤-5", "-5 to -3", "-3 to 0", "0", "0 to 3", "3 to 5", ">5", "N/A"],
+        0,
     ),
     (
         "gap_z_score",
         _b_gap_z,
         ["≤-2", "-2 to -1", "-1 to 0", "0 to 1", "1 to 2", "≥2", "N/A"],
+        0,
+    ),
+    # ── Time-of-day dimensions (flag rows with n < 10) ────────────────────────
+    (
+        "day_name",
+        _b_day_name,
+        _DAY_ORDER,
+        _MIN_TIME_SAMPLE,
+    ),
+    (
+        "hour_block",
+        _b_hour_block,
+        _HOUR_ORDER,
+        _MIN_TIME_SAMPLE,
+    ),
+    (
+        "block_30m",
+        _b_30m_block,
+        _BLOCK_30M_ORDER,
+        _MIN_TIME_SAMPLE,
+    ),
+    (
+        "block_15m",
+        _b_15m_block,
+        _BLOCK_15M_ORDER,
+        _MIN_TIME_SAMPLE,
     ),
 ]
 
@@ -621,11 +764,11 @@ def main() -> None:
         f"  |  Max DD: {overall['max_drawdown']:+.4f}"
     )
 
-    sections: list[tuple[str, list[tuple[str, dict]]]] = []
-    for title, key_fn, order in _DIMENSIONS:
+    sections: list[tuple[str, list[tuple[str, dict]], int]] = []
+    for title, key_fn, order, min_flag in _DIMENSIONS:
         groups = group_by(rows, key_fn, order)
-        print_table(title, groups)
-        sections.append((title, groups))
+        print_table(title, groups, min_flag)
+        sections.append((title, groups, min_flag))
 
     # ── Cross-bucket analysis ─────────────────────────────────────────────────
     print(f"\n{'═' * 96}")

@@ -22,6 +22,7 @@ from typing import Optional
 from app.features import (
     Tick,
     btc_velocity,
+    build_time_features,
     directional_gap as _directional_gap,
     gap as _gap,
     gap_z_score as _gap_z_score,
@@ -82,6 +83,23 @@ class Signal:
     recorded_at:            datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+    # ── time-of-day features (attached by run_all after strategy fires) ────────
+    # All values expressed in the configured SIGNAL_TIMEZONE (default ET).
+    # Stored as None until run_all() calls build_time_features().
+    entry_date:          Optional[str]      = None   # "YYYY-MM-DD"
+    entry_time_local:    Optional[str]      = None   # "HH:MM:SS"
+    entry_hour:          Optional[int]      = None   # 0-23
+    entry_minute:        Optional[int]      = None   # 0-59
+    entry_day_of_week:   Optional[int]      = None   # 0=Mon … 6=Sun
+    entry_day_name:      Optional[str]      = None   # "Monday" … "Sunday"
+    entry_is_weekend:    Optional[bool]     = None
+    entry_15m_block:     Optional[str]      = None   # "HH:MM" e.g. "14:30"
+    entry_30m_block:     Optional[str]      = None   # "HH:MM" e.g. "14:30"
+    entry_hour_block:    Optional[str]      = None   # "HH:00" e.g. "14:00"
+    market_open_time:    Optional[datetime] = None
+    market_close_time:   Optional[datetime] = None
+    timezone_used:       str                = "America/New_York"
 
 
 # ── cheap_reversal_scalp ──────────────────────────────────────────────────────
@@ -711,6 +729,9 @@ def run_all(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    timezone_name: str = "America/New_York",
+    market_open_time: Optional[datetime] = None,
+    market_close_time: Optional[datetime] = None,
 ) -> list[Signal]:
     """
     Evaluate every registered strategy against the current market state.
@@ -718,6 +739,10 @@ def run_all(
     Exceptions in individual strategies are caught and logged so one broken
     rule cannot stall the main loop.  Returns a (possibly empty) list of
     Signal objects for all rules that fired.
+
+    After each strategy fires, time-of-day features are computed from
+    signal.recorded_at in `timezone_name` and attached to the Signal so
+    they are persisted alongside the signal row.
     """
     signals: list[Signal] = []
     kwargs = dict(
@@ -738,6 +763,28 @@ def run_all(
 
         if result is None:
             continue
+
+        # ── Attach time-of-day features ───────────────────────────────────────
+        try:
+            tf = build_time_features(result.recorded_at, tz=timezone_name)
+            result.entry_date        = tf["date"]
+            result.entry_time_local  = tf["time"]
+            result.entry_hour        = tf["hour"]
+            result.entry_minute      = tf["minute"]
+            result.entry_day_of_week = tf["day_of_week"]
+            result.entry_day_name    = tf["day_name"]
+            result.entry_is_weekend  = tf["is_weekend"]
+            result.entry_15m_block   = tf["block_15m"]
+            result.entry_30m_block   = tf["block_30m"]
+            result.entry_hour_block  = tf["hour_block"]
+            result.market_open_time  = market_open_time
+            result.market_close_time = market_close_time
+            result.timezone_used     = timezone_name
+        except Exception:
+            logger.warning(
+                "build_time_features failed for signal %s — time fields will be NULL",
+                result.rule_name, exc_info=True,
+            )
 
         # Apply watch-only status for paused rule/side combinations.
         # Signals are still inserted into the DB for visibility, but the

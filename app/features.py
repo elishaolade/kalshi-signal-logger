@@ -20,7 +20,67 @@ from __future__ import annotations
 import math
 import random
 import statistics
-from typing import NamedTuple, Optional
+from datetime import datetime
+from typing import Any, NamedTuple, Optional
+from zoneinfo import ZoneInfo
+
+
+# ── Time-of-day features ──────────────────────────────────────────────────────
+
+_DAY_NAMES = [
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday",
+]
+
+
+def build_time_features(
+    ts: datetime,
+    tz: str = "America/New_York",
+) -> dict[str, Any]:
+    """
+    Convert a UTC-aware datetime to a set of time-of-day features expressed in
+    the given IANA timezone (default: America/New_York).
+
+    Parameters
+    ----------
+    ts : datetime
+        A timezone-aware datetime (UTC or any zone).  Naive datetimes are
+        treated as UTC.
+    tz : str
+        IANA timezone name.  Requires the ``tzdata`` package on systems that
+        lack /usr/share/zoneinfo.
+
+    Returns
+    -------
+    dict with keys:
+        date        "YYYY-MM-DD"
+        time        "HH:MM:SS"
+        hour        int 0-23
+        minute      int 0-59
+        day_of_week int 0 (Monday) … 6 (Sunday)
+        day_name    "Monday" … "Sunday"
+        is_weekend  bool
+        block_15m   "HH:MM"  (start of the enclosing 15-minute block)
+        block_30m   "HH:MM"  (start of the enclosing 30-minute block)
+        hour_block  "HH:00"
+    """
+    local = ts.astimezone(ZoneInfo(tz))
+    h   = local.hour
+    m   = local.minute
+    dow = local.weekday()          # 0 = Monday, 6 = Sunday
+
+    return {
+        "date":        local.strftime("%Y-%m-%d"),
+        "time":        local.strftime("%H:%M:%S"),
+        "hour":        h,
+        "minute":      m,
+        "day_of_week": dow,
+        "day_name":    _DAY_NAMES[dow],
+        "is_weekend":  dow >= 5,
+        "block_15m":   f"{h:02d}:{(m // 15) * 15:02d}",
+        "block_30m":   f"{h:02d}:{(m // 30) * 30:02d}",
+        "hour_block":  f"{h:02d}:00",
+    }
 
 
 # ── Data type ─────────────────────────────────────────────────────────────────

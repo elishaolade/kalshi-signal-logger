@@ -315,8 +315,17 @@ class PaperTrader:
                 signal_id, market_ticker, rule_name, rule_version, side,
                 entry_price, simulated_entry_price,
                 peak_price, lowest_price,
-                entry_time, position_size, followed_rules, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                entry_time, position_size, followed_rules,
+                entry_date, entry_hour, entry_minute,
+                entry_day_of_week, entry_day_name, entry_is_weekend,
+                entry_15m_block, entry_30m_block, entry_hour_block,
+                timezone_used,
+                status
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'OPEN'
+            )
             """,
             (
                 signal_id,
@@ -331,6 +340,17 @@ class PaperTrader:
                 now,
                 self._position_size,
                 True,
+                # time-of-day features from the signal (None when unavailable)
+                signal.entry_date,
+                signal.entry_hour,
+                signal.entry_minute,
+                signal.entry_day_of_week,
+                signal.entry_day_name,
+                signal.entry_is_weekend,
+                signal.entry_15m_block,
+                signal.entry_30m_block,
+                signal.entry_hour_block,
+                signal.timezone_used,
             ),
         )
 

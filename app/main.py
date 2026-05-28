@@ -35,6 +35,7 @@ from app.config import (
     LIVE_TRADING_ENABLED,
     PAPER_POSITION_SIZE,
     POLL_INTERVAL_SECONDS,
+    SIGNAL_TIMEZONE,
     SLIPPAGE_MODE,
 )
 from app.data_feed import (
@@ -181,7 +182,11 @@ def _insert_signal(sig: Signal) -> int:
             contract_age_seconds, time_remaining_seconds,
             momentum_score, reversal_score, btc_velocity,
             volatility_30s, volatility_60s, volatility_120s,
-            edge, confidence_score, reason, signal_status, recorded_at
+            edge, confidence_score, reason, signal_status, recorded_at,
+            entry_date, entry_time, entry_hour, entry_minute,
+            entry_day_of_week, entry_day_name, entry_is_weekend,
+            entry_15m_block, entry_30m_block, entry_hour_block,
+            market_open_time, market_close_time, timezone_used
         ) VALUES (
             %s, %s, %s, %s,
             %s, %s, %s, %s,
@@ -189,7 +194,11 @@ def _insert_signal(sig: Signal) -> int:
             %s, %s,
             %s, %s, %s,
             %s, %s, %s,
-            %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s
         )
         """,
         (
@@ -202,6 +211,11 @@ def _insert_signal(sig: Signal) -> int:
             sig.volatility_30s, sig.volatility_60s, sig.volatility_120s,
             sig.edge, sig.confidence_score,
             sig.reason, sig.signal_status, sig.recorded_at,
+            # time-of-day fields
+            sig.entry_date, sig.entry_time_local, sig.entry_hour, sig.entry_minute,
+            sig.entry_day_of_week, sig.entry_day_name, sig.entry_is_weekend,
+            sig.entry_15m_block, sig.entry_30m_block, sig.entry_hour_block,
+            sig.market_open_time, sig.market_close_time, sig.timezone_used,
         ),
     )
 
@@ -317,6 +331,9 @@ def _tick(
             contract_age_seconds   = contract_age,
             time_remaining_seconds = time_remaining,
             contract_prices        = contract_prices,
+            timezone_name          = SIGNAL_TIMEZONE,
+            market_open_time       = market.get("open_time"),
+            market_close_time      = market.get("close_time"),
         )
 
         for sig in fired:
