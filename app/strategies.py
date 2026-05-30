@@ -720,6 +720,8 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
 })
 
+_WEEKDAY_NO_TRADE_HOURS: frozenset[int] = frozenset({9, 10})
+
 
 def run_all(
     ticks: list[Tick],
@@ -795,6 +797,21 @@ def run_all(
             result.signal_status = "watch_only"
             logger.debug(
                 "Watch-only signal: %s %s (not paper-traded)", rule_base, result.side,
+            )
+
+        if (
+            result.entry_hour in _WEEKDAY_NO_TRADE_HOURS
+            and result.entry_is_weekend is False
+        ):
+            result.signal_status = "watch_only"
+            logger.info(
+                "Weekday no-trade hour: %s %s at %02d:%02d %s "
+                "(logged watch_only, not paper-traded)",
+                rule_base,
+                result.side,
+                result.entry_hour,
+                result.entry_minute if result.entry_minute is not None else 0,
+                timezone_name,
             )
 
         signals.append(result)
