@@ -720,7 +720,15 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
 })
 
-_WEEKDAY_NO_TRADE_HOURS: frozenset[int] = frozenset({9, 10})
+# ── PMC v1 forward-test filter ────────────────────────────────────────────────
+# In-sample backtest (31 trades, 77.4% WR, +0.6124 PnL, PF 2.63) identified
+# three conditions that improve selectivity.  Applied ONLY to
+# premium_momentum_continuation/v1; all other strategies are unaffected.
+# Signals that fail any condition are stored as watch_only for offline analysis.
+_PMC_FILTER_MIN_PRICE:  float          = 0.65
+_PMC_FILTER_MAX_PRICE:  float          = 0.80
+_PMC_FILTER_MAX_GAP_Z:  float          = 2.0   # reject when raw gap_z_score >= this
+_PMC_FILTER_SKIP_HOURS: frozenset[int] = frozenset({9, 10})  # weekday ET hours blocked
 
 
 def run_all(
@@ -799,20 +807,48 @@ def run_all(
                 "Watch-only signal: %s %s (not paper-traded)", rule_base, result.side,
             )
 
+        # ── PMC v1 forward-test filter ─────────────────────────────────────────
+        # Check only for premium_momentum_continuation/v1 and only when the
+        # signal is not already marked watch_only (e.g. YES-side via _WATCH_ONLY_KEYS).
         if (
-            result.entry_hour in _WEEKDAY_NO_TRADE_HOURS
-            and result.entry_is_weekend is False
+            result.rule_name    == _PMC_RULE_NAME
+            and result.rule_version == _PMC_RULE_VERSION
+            and result.signal_status != "watch_only"
         ):
-            result.signal_status = "watch_only"
-            logger.info(
-                "Weekday no-trade hour: %s %s at %02d:%02d %s "
-                "(logged watch_only, not paper-traded)",
-                rule_base,
-                result.side,
-                result.entry_hour,
-                result.entry_minute if result.entry_minute is not None else 0,
-                timezone_name,
-            )
+            _pmc_reject: Optional[str] = None
+
+            # 1. Contract price must be in [0.65, 0.80]
+            if not (_PMC_FILTER_MIN_PRICE <= result.contract_price <= _PMC_FILTER_MAX_PRICE):
+                _pmc_reject = (
+                    f"price_filter: contract_price={result.contract_price:.4f} "
+                    f"outside [{_PMC_FILTER_MIN_PRICE}, {_PMC_FILTER_MAX_PRICE}]"
+                )
+
+            # 2. Skip weekday 9-10 AM ET
+            elif (
+                result.entry_hour in _PMC_FILTER_SKIP_HOURS
+                and result.entry_is_weekend is False
+            ):
+                _pmc_reject = (
+                    f"time_filter: weekday {result.entry_hour:02d}:xx ET blocked"
+                )
+
+            # 3. Reject if raw gap_z_score >= 2 (too stretched, regardless of side)
+            elif (
+                result.gap_z_score is not None
+                and result.gap_z_score >= _PMC_FILTER_MAX_GAP_Z
+            ):
+                _pmc_reject = (
+                    f"gap_z_filter: gap_z_score={result.gap_z_score:+.4f} "
+                    f">= {_PMC_FILTER_MAX_GAP_Z}"
+                )
+
+            if _pmc_reject is not None:
+                result.signal_status = "watch_only"
+                logger.info(
+                    "PMC v1 forward-test filter: %s %s → watch_only (%s)",
+                    rule_base, result.side, _pmc_reject,
+                )
 
         signals.append(result)
 

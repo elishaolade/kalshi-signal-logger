@@ -5,7 +5,12 @@
       "Bash(python3 -)",
       "Bash(pip install *)",
       "Bash(pip3 install *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/analyze_trades.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/analyze_trades.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import dotenv, numpy; print\\('ok'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(docker compose *)",
+      "Bash(MYSQL_HOST=127.0.0.1 python -c ' *)",
+      "Bash(docker stop *)"
     ]
   }
 }
