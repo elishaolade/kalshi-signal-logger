@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from app.features import (
     Tick,
@@ -32,8 +32,11 @@ from app.features import (
     rolling_stds,
     series_change as _series_change,
     series_min as _series_min,
+    volatility_regime as _volatility_regime,
+    whipsaw_score as _whipsaw_score,
     z_from_target as _z_from_target,
 )
+from app.reversal_probability import setup_type as _setup_type
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,17 @@ _MIN_REVERSAL       = 3.0       # minimum reversal_score to qualify
 _MOMENTUM_N         = 10        # lookback tick count for momentum / reversal
 
 
+def _recent_window(ticks: list[Tick], window_seconds: float) -> list[Tick]:
+    """
+    Return ticks whose ts is within `window_seconds` of the most recent tick.
+    Used to scope "fresh low" checks to a short trailing window.
+    """
+    if not ticks:
+        return []
+    cutoff = ticks[-1].ts - window_seconds
+    return [t for t in ticks if t.ts >= cutoff]
+
+
 def _liquidity_ok(_side_quotes: dict) -> bool:
     # Placeholder: always passes.
     # TODO: gate on minimum volume and open_interest once those fields
@@ -141,6 +155,7 @@ def cheap_reversal_scalp(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -286,6 +301,7 @@ def premium_momentum_continuation(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -455,6 +471,7 @@ def premium_momentum_scalp_v2(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -581,6 +598,7 @@ def premium_no_midrange_scalp(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -738,6 +756,7 @@ def early_overextension_reversal_scalp(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis (WATCH-ONLY RESEARCH — never paper-traded)
@@ -910,6 +929,241 @@ def early_overextension_reversal_scalp(
     )
 
 
+# ── cheap_losing_contract_reversal_trail ──────────────────────────────────────
+
+_CLC_RULE_NAME    = "cheap_losing_contract_reversal_trail"
+_CLC_RULE_VERSION = "v1"
+
+_CLC_STRICT_MAX_AGE_S  = 120.0   # strict early test (first 2 minutes)
+_CLC_COMPARE_MAX_AGE_S = 180.0   # also observe 2–3 min as a comparison bucket
+_CLC_MIN_ASK           = 0.05    # losing-side ask floor
+_CLC_MAX_ASK           = 0.30    # losing-side ask ceiling
+_CLC_PREFERRED_MIN_ASK = 0.10    # "preferred" price bucket flag (0.10–0.30)
+_CLC_MAX_ADVERSE_Z     = 1.5     # BTC not too far against the losing side
+_CLC_MAX_SPREAD        = 0.03    # losing-side spread ceiling
+_CLC_MIN_REVERSAL_PROB = 0.55    # +3c/-2c reversal-prob gate (recorded, see note)
+_CLC_MAX_ADVERSE_MOM   = 2.0     # adverse directional momentum tolerance
+_CLC_MIN_BOUNCE        = 0.01    # losing side ≥ +0.01 off its low since open …
+_CLC_NEW_LOW_WINDOW_S  = 20.0    # … OR no fresh low in the last 20s
+_CLC_Z_WINDOW_S        = 60.0
+_CLC_MOM_N             = 10
+
+
+def cheap_losing_contract_reversal_trail(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Hypothesis (WATCH-ONLY RESEARCH — never paper-traded, no live orders)
+    --------------------------------------------------------------------
+    Early in a BTC 15-minute up/down market, if the *losing* contract is cheap,
+    BTC is not too far against it, adverse momentum is tolerable, volatility is
+    not violent, and historically similar setups reversed often, the losing
+    contract may produce a short reversal move worth riding with a trailing
+    exit.  Outcomes for five exit profiles are simulated live by the
+    CLCReversalTracker (no paper trade is opened).
+
+    Sides
+    -----
+    winning side : YES if btc > target, NO if btc < target
+    losing  side : the opposite — the cheap contract we BUY and track.
+
+    adverse_z_score : how far BTC sits *against* the losing side, in σ.
+                      = z_from_target(btc, target, winning_side, std60)  (≥ 0).
+
+    Structural entry gates (all hard):
+      1. market_age_seconds <= 180   (strict early flag set when <= 120)
+      2. losing-side ask in [0.05, 0.30]
+      3. adverse_z_score <= 1.5
+      4. losing-side spread <= 0.03
+      5. volatility_regime != "violent"
+      6. adverse momentum tolerable:
+            adverse_directional_momentum_score <= 2
+         OR losing side made no fresh low in the last 20s
+         OR losing side bounced >= +0.01 off its low since open
+
+    Historical reversal probability
+    --------------------------------
+    Computed from this strategy's own completed observations via the injected
+    `reversal_prob_fn` (self-referential).  The spec's 0.55 gate is RECORDED
+    (meets_reversal_prob_gate) but is intentionally NOT a hard blocker during
+    the watch-only phase: we must observe low-probability setups too, both to
+    bootstrap the table from cold and to answer "does reversal probability
+    improve expectancy?".  The 0.55 gate is enforced only at promotion time.
+    """
+    # ── 1. Market-age gate (first 3 minutes; strict flag for first 2) ─────────
+    if contract_age_seconds > _CLC_COMPARE_MAX_AGE_S:
+        return None
+    strict_early = contract_age_seconds <= _CLC_STRICT_MAX_AGE_S
+    market_phase = "first_2min" if strict_early else "min_2_to_3"
+
+    # ── 2. Winning / losing side ──────────────────────────────────────────────
+    if btc_price > target_price:
+        winning, losing = "YES", "NO"
+    elif btc_price < target_price:
+        winning, losing = "NO", "YES"
+    else:
+        return None
+
+    # ── 3. Losing-side quotes: cheap-ask band + spread ────────────────────────
+    lq       = contract_prices.get(losing, {})
+    l_ask    = lq.get("ask_price", 0.0)
+    l_bid    = lq.get("bid_price", 0.0)
+    l_mid    = lq.get("mid_price", 0.0)
+    l_spread = lq.get("spread",    0.0)
+
+    if not (_CLC_MIN_ASK <= l_ask <= _CLC_MAX_ASK):
+        return None
+    if l_spread > _CLC_MAX_SPREAD:
+        return None
+    preferred_bucket = l_ask >= _CLC_PREFERRED_MIN_ASK
+
+    # ── 4. Adverse z-score (BTC against the losing side, in σ) ────────────────
+    std60     = _rolling_std(ticks, _CLC_Z_WINDOW_S)
+    adverse_z = _z_from_target(btc_price, target_price, winning, std60)
+    if adverse_z is None or adverse_z > _CLC_MAX_ADVERSE_Z:
+        return None
+
+    # ── 5. Volatility regime must not be violent ──────────────────────────────
+    vol_regime = _volatility_regime(std60)
+    if vol_regime == "violent":
+        logger.debug("%s: skip — volatility regime violent (std60=%s)",
+                     _CLC_RULE_NAME, std60)
+        return None
+    whip = _whipsaw_score(ticks, n=20)
+
+    # ── 6. Adverse-momentum tolerance ─────────────────────────────────────────
+    adverse_mom = reversal_score(ticks, winning, n=_CLC_MOM_N)   # momentum AGAINST losing side
+
+    history   = contract_history or {}
+    los_hist  = history.get(losing, [])
+    los_low   = _series_min(los_hist)
+    bounce    = (l_mid - los_low) if los_low is not None else None
+    bounced   = bounce is not None and bounce >= _CLC_MIN_BOUNCE
+
+    # "no fresh low in the last 20s": the window-low sits above the session low.
+    recent_low = _series_min(_recent_window(los_hist, _CLC_NEW_LOW_WINDOW_S))
+    no_new_low = (
+        recent_low is not None and los_low is not None and recent_low > los_low
+    )
+
+    momentum_tolerable = (adverse_mom <= _CLC_MAX_ADVERSE_MOM) or no_new_low or bounced
+    if not momentum_tolerable:
+        logger.debug(
+            "%s: skip — adverse momentum intolerable (adv_mom=%.1f, no_new_low=%s, bounced=%s)",
+            _CLC_RULE_NAME, adverse_mom, no_new_low, bounced,
+        )
+        return None
+
+    # ── 7. Historical reversal probability (self-referential lookup) ──────────
+    # hour_block is unavailable at strategy time (time features are attached by
+    # run_all afterwards), so the lookup starts broadening from the no-hour
+    # level — acceptable, since hour is the first dimension dropped anyway.
+    rp = (
+        reversal_prob_fn(
+            losing_ask         = l_ask,
+            market_age_seconds = contract_age_seconds,
+            adverse_z          = adverse_z,
+            spread             = l_spread,
+            volatility_regime  = vol_regime,
+            hour_block         = None,
+        )
+        if reversal_prob_fn is not None
+        else None
+    )
+    p3 = rp.get("p_plus_3c_before_minus_2c") if rp else None
+    similar_n        = rp.get("similar_sample_count", 0) if rp else 0
+    confidence_label = rp.get("confidence_label", "insufficient_data") if rp else "insufficient_data"
+    meets_prob_gate  = p3 is not None and p3 >= _CLC_MIN_REVERSAL_PROB
+
+    # ── Features for the signals row ──────────────────────────────────────────
+    mom  = momentum_score(ticks, n=_CLC_MOM_N)
+    rev  = reversal_score(ticks, losing, n=_CLC_MOM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, losing)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    s_type = _setup_type(l_ask, contract_age_seconds, adverse_z)
+    p3_s   = f"{p3:.3f}" if p3 is not None else "n/a"
+    reason = (
+        f"{_CLC_RULE_NAME} {_CLC_RULE_VERSION}: BUY losing={losing} @ ask={l_ask:.4f} "
+        f"(winning={winning}) | adv_z={adverse_z:+.2f} adv_mom={adverse_mom:+.1f} "
+        f"spread={l_spread:.4f} regime={vol_regime} | "
+        f"revprob(+3c/-2c)={p3_s} n={similar_n} ({confidence_label}) "
+        f"gate={'pass' if meets_prob_gate else 'below'} | "
+        f"phase={market_phase} age={contract_age_seconds:.0f}s setup[{s_type}]"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _CLC_RULE_NAME,
+        rule_version           = _CLC_RULE_VERSION,
+        side                   = losing,          # BUY and track the cheap losing side
+
+        contract_price         = l_mid,
+        bid_price              = l_bid,
+        ask_price              = l_ask,
+        spread                 = l_spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        # Context for the CLCReversalTracker (not persisted to the signals table).
+        extra = {
+            "setup_type":                          s_type,
+            "market_phase":                        market_phase,
+            "strict_early":                        strict_early,
+            "winning_side":                        winning,
+            "losing_side":                         losing,
+            "adverse_z_score":                     round(adverse_z, 6),
+            "adverse_directional_momentum_score":  round(adverse_mom, 4),
+            "raw_gap_z_score":                     round(gz, 6) if gz is not None else None,
+            "raw_momentum_score":                  round(mom, 4),
+            "losing_contract_ask":                 round(l_ask, 6),
+            "losing_contract_bid":                 round(l_bid, 6),
+            "losing_contract_spread":              round(l_spread, 6),
+            "losing_contract_low_since_open":      round(los_low, 6) if los_low is not None else None,
+            "losing_contract_bounce_from_low":     round(bounce, 6) if bounce is not None else None,
+            "historical_reversal_probability":     p3,
+            "p_plus_2c_before_minus_2c":           rp.get("p_plus_2c_before_minus_2c") if rp else None,
+            "p_plus_3c_before_minus_2c":           p3,
+            "p_plus_4c_before_minus_3c":           rp.get("p_plus_4c_before_minus_3c") if rp else None,
+            "similar_sample_count":                similar_n,
+            "confidence_label":                    confidence_label,
+            "meets_reversal_prob_gate":            meets_prob_gate,
+            "preferred_price_bucket":              preferred_bucket,
+            "volatility_regime":                   vol_regime,
+            "whipsaw_score":                       round(whip, 4) if whip is not None else None,
+            "market_age_seconds":                  round(contract_age_seconds, 3),
+        },
+    )
+
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 #
 # Active strategies are evaluated every poll cycle.
@@ -917,11 +1171,12 @@ def early_overextension_reversal_scalp(
 # to the signals table but will NOT open paper trades.
 
 _STRATEGIES = [
-    premium_momentum_continuation,      # NO-side active; YES-side watch_only (see below)
-    premium_no_midrange_scalp,          # paper_active — NO only, 0.65–0.80
-    premium_momentum_scalp_v2,          # watch_only — conflicts with PNMS in 240-300s/NO band
-    early_overextension_reversal_scalp, # watch_only research — never paper-traded
-    # cheap_reversal_scalp              # disabled — removed from registry 2026-05-28
+    premium_momentum_continuation,        # NO-side active; YES-side watch_only (see below)
+    premium_no_midrange_scalp,            # paper_active — NO only, 0.65–0.80
+    premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
+    early_overextension_reversal_scalp,   # watch_only research — never paper-traded
+    cheap_losing_contract_reversal_trail, # watch_only research — never paper-traded
+    # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
 ]
 
 # Keys that produce signals for the DB log but must NOT open paper trades.
@@ -931,6 +1186,7 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_continuation/v1/YES",  # YES-side PMC: watch-only
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
     "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
+    "cheap_losing_contract_reversal_trail/v1", # research only — 5 exit profiles simulated, not traded
 })
 
 # ── PMC v1 forward-test filter ────────────────────────────────────────────────
@@ -953,6 +1209,7 @@ def run_all(
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
     contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
     timezone_name: str = "America/New_York",
     market_open_time: Optional[datetime] = None,
     market_close_time: Optional[datetime] = None,
@@ -978,6 +1235,7 @@ def run_all(
         time_remaining_seconds = time_remaining_seconds,
         contract_prices        = contract_prices,
         contract_history       = contract_history,
+        reversal_prob_fn       = reversal_prob_fn,
     )
     for fn in _STRATEGIES:
         try:

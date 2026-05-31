@@ -317,6 +317,68 @@ def gap_z_score(
     return gap(btc_price, target_price) / std
 
 
+# ── Volatility regime & whipsaw ───────────────────────────────────────────────
+#
+# These classify BTC price behaviour for strategies that need to *avoid* violent
+# or choppy conditions (e.g. cheap_losing_contract_reversal_trail/v1).
+
+# Thresholds expressed in USD of 60-second rolling standard deviation.
+# Tunable; chosen to align with the buckets used in research reports.
+VOL_REGIME_CALM     = 15.0    # < this  → "calm"
+VOL_REGIME_NORMAL   = 40.0    # < this  → "normal"
+VOL_REGIME_ELEVATED = 80.0    # < this  → "elevated"; >= this → "violent"
+
+
+def volatility_regime(std: Optional[float]) -> str:
+    """
+    Classify volatility from a rolling standard deviation (USD).
+
+        None              → "unknown"   (insufficient data)
+        std <  15         → "calm"
+        15 <= std < 40    → "normal"
+        40 <= std < 80    → "elevated"
+        std >= 80         → "violent"
+
+    "violent" is the regime strategies should refuse to enter / exit out of.
+    """
+    if std is None:
+        return "unknown"
+    if std < VOL_REGIME_CALM:
+        return "calm"
+    if std < VOL_REGIME_NORMAL:
+        return "normal"
+    if std < VOL_REGIME_ELEVATED:
+        return "elevated"
+    return "violent"
+
+
+def whipsaw_score(ticks: list[Tick], n: int = 20) -> Optional[float]:
+    """
+    Choppiness of the last `n` ticks: the fraction of consecutive price moves
+    that *reverse* direction relative to the previous move.
+
+        0.0  → perfectly trending (no direction changes)
+        1.0  → alternates direction on every tick (maximally whippy)
+
+    Only non-zero moves are considered direction-bearing.  Returns None when
+    fewer than three direction-bearing moves are available (can't measure a
+    reversal from < 2 deltas).
+    """
+    sample = ticks[-n:] if len(ticks) >= n else ticks
+    # Signs of non-zero consecutive deltas.
+    signs: list[int] = []
+    for i in range(1, len(sample)):
+        delta = sample[i].price - sample[i - 1].price
+        if delta > 0:
+            signs.append(1)
+        elif delta < 0:
+            signs.append(-1)
+    if len(signs) < 2:
+        return None
+    flips = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
+    return flips / (len(signs) - 1)
+
+
 # ── Demo / smoke-test ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

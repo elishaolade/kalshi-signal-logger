@@ -313,3 +313,106 @@ CREATE TABLE IF NOT EXISTS signal_observations (
         FOREIGN KEY (signal_id) REFERENCES signals (id)
         ON DELETE SET NULL ON UPDATE CASCADE
 );
+
+
+-- ---------------------------------------------------------------
+-- 9. clc_reversal_observations
+--    Live shadow-tracking for cheap_losing_contract_reversal_trail/v1
+--    (WATCH-ONLY research — NO paper trade, NO live order is opened).
+--
+--    One row per (signal x exit_profile): the strategy buys the cheap
+--    *losing* contract and we simulate FIVE exit profiles (2 fixed +
+--    3 ride-then-trail) against the same observed price path.
+--
+--    Fill model (NOT mid):  entry = ask + slippage,  exit = bid - slippage.
+--    Path-level fields (race outcomes, MFE/MAE, peak) are identical across
+--    the 5 profile rows of one signal; the row with is_primary_path_row = 1
+--    is the canonical one used by the self-referential reversal-probability
+--    lookup.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS clc_reversal_observations (
+    id                              BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    signal_id                       BIGINT        NULL,
+    market_ticker                   VARCHAR(100)  NOT NULL,
+    rule_name                       VARCHAR(100)  NOT NULL,
+    rule_version                    VARCHAR(20)   NOT NULL,
+
+    -- setup classification
+    setup_type                      VARCHAR(80)   NOT NULL,   -- bucketed setup signature
+    market_phase                    VARCHAR(20),              -- early | mid | late
+    market_age_seconds              INT,
+    time_remaining_seconds          INT,
+
+    -- sides
+    side_bought                     ENUM('YES', 'NO') NOT NULL,  -- the losing (cheap) side
+    winning_side                    ENUM('YES', 'NO'),
+    losing_side                     ENUM('YES', 'NO'),
+
+    -- BTC context at signal
+    btc_price                       DECIMAL(14, 2),
+    target_price                    DECIMAL(14, 2),
+    raw_gap_z_score                 DECIMAL(10, 6),
+    adverse_z_score                 DECIMAL(10, 6),
+    raw_momentum_score              DECIMAL(8, 4),
+    adverse_directional_momentum_score DECIMAL(8, 4),
+
+    -- losing-contract quotes at signal
+    losing_contract_ask             DECIMAL(6, 4),
+    losing_contract_bid             DECIMAL(6, 4),
+    losing_contract_spread          DECIMAL(6, 4),
+    losing_contract_low_since_open  DECIMAL(6, 4),
+    losing_contract_bounce_from_low DECIMAL(8, 4),
+
+    -- historical reversal probability (self-referential lookup)
+    historical_reversal_probability DECIMAL(6, 4)  NULL,
+    similar_sample_count            INT            DEFAULT 0,
+    confidence_label                VARCHAR(20),              -- insufficient_data | weak_sample | usable_sample | stronger_sample
+
+    -- regime
+    volatility_regime               VARCHAR(12),              -- calm | normal | elevated | violent | unknown
+    whipsaw_score                   DECIMAL(6, 4)  NULL,
+    hour_block                      VARCHAR(8),               -- "HH:00"
+    day_name                        VARCHAR(12),
+
+    -- fill model
+    slippage_mode                   VARCHAR(12),
+    entry_price_simulated           DECIMAL(6, 4),            -- ask + slippage
+
+    -- per-profile exit
+    exit_profile                    VARCHAR(40)   NOT NULL,   -- fixed_20pct_stop_15pct | ... | ride_then_trail_20pct_1c
+    is_primary_path_row             BOOLEAN       DEFAULT 0,  -- 1 on exactly one profile row per signal
+    trail_activated                 BOOLEAN       NULL,
+    peak_contract_price             DECIMAL(6, 4),            -- highest bid seen (path-level)
+    max_favorable_excursion         DECIMAL(8, 4),            -- max(bid - entry)
+    max_adverse_excursion           DECIMAL(8, 4),            -- min(bid - entry)
+    time_to_peak                    DECIMAL(8, 3)  NULL,
+    exit_price_simulated            DECIMAL(6, 4)  NULL,      -- bid - slippage at exit
+    exit_reason                     VARCHAR(40)    NULL,      -- take_profit | stop_loss | hard_stop | trailing_stop | timeout | violent_vol_exit | near_expiry | market_rollover | recovered_after_restart
+    pnl                             DECIMAL(8, 4)  NULL,      -- exit_sim - entry_sim (dollars)
+    pnl_percent                     DECIMAL(8, 4)  NULL,      -- pnl / entry_sim
+
+    -- path-level race outcomes (duplicated across profiles; read from primary row)
+    hit_plus_2c_before_minus_2c     BOOLEAN        NULL,
+    hit_plus_3c_before_minus_2c     BOOLEAN        NULL,
+    hit_plus_4c_before_minus_3c     BOOLEAN        NULL,
+
+    n_updates                       INT            DEFAULT 0,
+
+    -- lifecycle
+    status                          ENUM('ACTIVE', 'COMPLETE') DEFAULT 'ACTIVE',
+    complete_reason                 VARCHAR(50)    NULL,
+    recorded_at                     DATETIME(3)    NOT NULL,
+    completed_at                    DATETIME(3)    NULL,
+    created_at                      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_clc_signal  (signal_id),
+    INDEX idx_clc_rule    (rule_name, rule_version),
+    INDEX idx_clc_status  (status),
+    INDEX idx_clc_profile (exit_profile),
+    INDEX idx_clc_setup   (setup_type),
+    INDEX idx_clc_primary (is_primary_path_row, status),
+
+    CONSTRAINT fk_clc_signal
+        FOREIGN KEY (signal_id) REFERENCES signals (id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);

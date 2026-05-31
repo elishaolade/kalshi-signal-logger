@@ -43,10 +43,12 @@ from app.data_feed import (
     get_btc_price,
     get_mock_contract_prices,
 )
+from app.clc_reversal_tracker import CLCReversalTracker
 from app.db import execute_query, fetch_all, insert_and_get_id, get_pool
-from app.features import Tick
+from app.features import Tick, rolling_std, volatility_regime
 from app.observation_tracker import ObservationTracker
 from app.paper_trader import PaperTrader
+from app.reversal_probability import ReversalProbabilityProvider
 from app.strategies import Signal, run_all
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -328,6 +330,8 @@ def _tick(
     trader: PaperTrader,
     contract_hist: _ContractHistory,
     obs_tracker: ObservationTracker,
+    clc_tracker: CLCReversalTracker,
+    reversal_prob: ReversalProbabilityProvider,
 ) -> None:
     now = datetime.now(timezone.utc)
 
@@ -382,6 +386,7 @@ def _tick(
             time_remaining_seconds = time_remaining,
             contract_prices        = contract_prices,
             contract_history       = contract_history,
+            reversal_prob_fn       = reversal_prob.lookup,
             timezone_name          = SIGNAL_TIMEZONE,
             market_open_time       = market.get("open_time"),
             market_close_time      = market.get("close_time"),
@@ -411,13 +416,16 @@ def _tick(
             # Research signals that opt into shadow-tracking are registered with
             # the ObservationTracker here (still NO paper trade is opened).
             if sig.signal_status == "watch_only":
-                try:
-                    obs_tracker.register(sig, signal_id, contract_prices)
-                except Exception as exc:
-                    logger.error(
-                        "Failed to register observation for signal #%d: %s",
-                        signal_id, exc,
-                    )
+                # Each tracker no-ops for rules it does not track, so we offer
+                # the signal to both.  Still NO paper trade is opened.
+                for _tracker in (obs_tracker, clc_tracker):
+                    try:
+                        _tracker.register(sig, signal_id, contract_prices)
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to register observation (%s) for signal #%d: %s",
+                            type(_tracker).__name__, signal_id, exc,
+                        )
                 logger.debug(
                     "Watch-only signal #%d — recorded but no trade opened", signal_id,
                 )
@@ -454,6 +462,18 @@ def _tick(
         )
     except Exception as exc:
         logger.error("Observation update error: %s", exc, exc_info=True)
+
+    # ── 12c. Advance CLC reversal observations (5 exit profiles, no trades) ───
+    try:
+        vol_regime = volatility_regime(rolling_std(ticks, 60.0))
+        clc_tracker.update(
+            market_ticker          = market_ticker,
+            contract_prices        = contract_prices,
+            time_remaining_seconds = time_remaining,
+            volatility_regime      = vol_regime,
+        )
+    except Exception as exc:
+        logger.error("CLC observation update error: %s", exc, exc_info=True)
 
     # ── Periodic cooldown eviction ────────────────────────────────────────────
     if n % 60 == 0:
@@ -503,6 +523,8 @@ def run() -> None:
     cooldown      = _Cooldown(SIGNAL_COOLDOWN_SECONDS)
     contract_hist = _ContractHistory(CONTRACT_TICK_BUFFER)
     obs_tracker   = ObservationTracker()
+    clc_tracker   = CLCReversalTracker(slippage_mode=SLIPPAGE_MODE)
+    reversal_prob = ReversalProbabilityProvider()
 
     _warm_up(btc_ticks)
 
@@ -520,7 +542,8 @@ def run() -> None:
         tick_start = time.monotonic()
 
         try:
-            _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker)
+            _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker,
+                  clc_tracker, reversal_prob)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
 
