@@ -45,6 +45,7 @@ from app.data_feed import (
 )
 from app.db import execute_query, fetch_all, insert_and_get_id, get_pool
 from app.features import Tick
+from app.observation_tracker import ObservationTracker
 from app.paper_trader import PaperTrader
 from app.strategies import Signal, run_all
 
@@ -65,6 +66,11 @@ SIGNAL_COOLDOWN_SECONDS = int(30)
 # In-memory BTC tick buffer depth.  120s features + overhead at 2s polling ≈ 90
 # ticks minimum; 600 gives ~20 minutes of history for restarts and analysis.
 BTC_TICK_BUFFER = 600
+
+# Per-side contract mid buffer depth.  ~16 minutes at 2s polling — enough to
+# cover a full 15-minute window so "low since open" and windowed contract
+# changes are scoped to one market.  Reset automatically on market rollover.
+CONTRACT_TICK_BUFFER = 500
 
 # How far back to pre-load BTC ticks from the DB on startup.
 WARMUP_LOOKBACK_SECONDS = 180
@@ -106,6 +112,45 @@ class _Cooldown:
         expired = [k for k, v in self._last.items() if now - v >= self._window]
         for k in expired:
             del self._last[k]
+
+
+# ── Contract-mid history ──────────────────────────────────────────────────────
+
+class _ContractHistory:
+    """
+    Per-side rolling buffer of contract mid prices for the *current* market.
+
+    Buffers are cleared automatically when the active market_ticker changes, so
+    "low since open" and windowed price changes are always scoped to a single
+    15-minute window.  Mirrors the in-memory btc_ticks buffer pattern.
+    """
+
+    def __init__(self, maxlen: int) -> None:
+        self._maxlen = maxlen
+        self._ticker: Optional[str] = None
+        self._bufs: dict[str, collections.deque] = {
+            "YES": collections.deque(maxlen=maxlen),
+            "NO":  collections.deque(maxlen=maxlen),
+        }
+
+    def observe(
+        self,
+        market_ticker: str,
+        contract_prices: dict[str, dict],
+        ts: float,
+    ) -> dict[str, list[Tick]]:
+        """Append this cycle's mids and return {side: list[Tick]} history."""
+        if market_ticker != self._ticker:
+            self._ticker = market_ticker
+            for buf in self._bufs.values():
+                buf.clear()
+
+        for side in ("YES", "NO"):
+            mid = contract_prices.get(side, {}).get("mid_price")
+            if mid is not None:
+                self._bufs[side].append(Tick(price=float(mid), ts=ts))
+
+        return {side: list(buf) for side, buf in self._bufs.items()}
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -281,6 +326,8 @@ def _tick(
     btc_ticks: collections.deque,
     cooldown: _Cooldown,
     trader: PaperTrader,
+    contract_hist: _ContractHistory,
+    obs_tracker: ObservationTracker,
 ) -> None:
     now = datetime.now(timezone.utc)
 
@@ -318,6 +365,9 @@ def _tick(
     btc_ticks.append(Tick(price=btc_price, ts=now.timestamp()))
     ticks = list(btc_ticks)
 
+    # ── 7b. Update per-side contract-mid history (scoped to this market) ──────
+    contract_history = contract_hist.observe(market_ticker, contract_prices, now.timestamp())
+
     # ── 8–11. Strategy evaluation, dedup, insert, trade open ─────────────────
     signals_fired  = 0
     trades_opened  = 0
@@ -331,6 +381,7 @@ def _tick(
             contract_age_seconds   = contract_age,
             time_remaining_seconds = time_remaining,
             contract_prices        = contract_prices,
+            contract_history       = contract_history,
             timezone_name          = SIGNAL_TIMEZONE,
             market_open_time       = market.get("open_time"),
             market_close_time      = market.get("close_time"),
@@ -357,7 +408,16 @@ def _tick(
             )
 
             # watch_only signals are logged to the DB but must not open trades.
+            # Research signals that opt into shadow-tracking are registered with
+            # the ObservationTracker here (still NO paper trade is opened).
             if sig.signal_status == "watch_only":
+                try:
+                    obs_tracker.register(sig, signal_id, contract_prices)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to register observation for signal #%d: %s",
+                        signal_id, exc,
+                    )
                 logger.debug(
                     "Watch-only signal #%d — recorded but no trade opened", signal_id,
                 )
@@ -384,6 +444,16 @@ def _tick(
         )
     except Exception as exc:
         logger.error("Trade update error: %s", exc, exc_info=True)
+
+    # ── 12b. Advance watch-only shadow observations (no trades) ───────────────
+    try:
+        obs_tracker.update(
+            market_ticker          = market_ticker,
+            contract_prices        = contract_prices,
+            time_remaining_seconds = time_remaining,
+        )
+    except Exception as exc:
+        logger.error("Observation update error: %s", exc, exc_info=True)
 
     # ── Periodic cooldown eviction ────────────────────────────────────────────
     if n % 60 == 0:
@@ -428,9 +498,11 @@ def run() -> None:
         raise SystemExit(1) from exc
 
     # ── Initialise stateful components ────────────────────────────────────────
-    trader    = PaperTrader(slippage_mode=SLIPPAGE_MODE, position_size=PAPER_POSITION_SIZE)
+    trader        = PaperTrader(slippage_mode=SLIPPAGE_MODE, position_size=PAPER_POSITION_SIZE)
     btc_ticks: collections.deque[Tick] = collections.deque(maxlen=BTC_TICK_BUFFER)
-    cooldown  = _Cooldown(SIGNAL_COOLDOWN_SECONDS)
+    cooldown      = _Cooldown(SIGNAL_COOLDOWN_SECONDS)
+    contract_hist = _ContractHistory(CONTRACT_TICK_BUFFER)
+    obs_tracker   = ObservationTracker()
 
     _warm_up(btc_ticks)
 
@@ -448,7 +520,7 @@ def run() -> None:
         tick_start = time.monotonic()
 
         try:
-            _tick(n, btc_ticks, cooldown, trader)
+            _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
 

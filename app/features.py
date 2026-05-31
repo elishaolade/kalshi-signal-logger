@@ -238,6 +238,43 @@ def directional_gap(btc_price: float, target_price: float, side: str) -> float:
     return raw if side.upper() == "YES" else -raw
 
 
+# ── Generic price-series helpers (BTC or contract ticks) ──────────────────────
+#
+# These operate on any list[Tick] — BTC ticks OR a per-side contract mid series.
+# Used by early_overextension_reversal_scalp/v1 to read contract history.
+
+def series_change(
+    ticks: list[Tick],
+    window_seconds: float,
+    reference_ts: Optional[float] = None,
+) -> Optional[float]:
+    """
+    Net price change over the last `window_seconds`:
+
+        change = price[now] - price[earliest tick within window]
+
+    Positive → series rose over the window.  Negative → it fell.
+    Returns None when fewer than 2 ticks fall inside the window (can't measure
+    a change from a single point).
+    """
+    w = _window(ticks, window_seconds, reference_ts)
+    if len(w) < 2:
+        return None
+    return w[-1].price - w[0].price
+
+
+def series_min(ticks: list[Tick]) -> Optional[float]:
+    """
+    Minimum price across all supplied ticks.
+
+    When the caller passes a buffer that was reset at market open, this is the
+    low-since-open.  Returns None for an empty list.
+    """
+    if not ticks:
+        return None
+    return min(t.price for t in ticks)
+
+
 # ── Z-scores ──────────────────────────────────────────────────────────────────
 
 def z_from_target(

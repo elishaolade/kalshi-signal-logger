@@ -243,3 +243,73 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
 
     UNIQUE KEY uq_rule_version (rule_name, rule_version)
 );
+
+-- ---------------------------------------------------------------
+-- 8. signal_observations
+--    Live shadow-tracking of watch-only research signals
+--    (e.g. early_overextension_reversal_scalp/v1).  NO paper trade
+--    is opened; the losing-side contract is followed for ~60s and
+--    hypothetical outcomes + exit simulations are recorded here.
+--    Reference price is the losing-side MID at signal time; all
+--    excursions/exits are measured against it (no fill/slippage
+--    assumption — this is observation, not trading).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_observations (
+    id                          BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    signal_id                   BIGINT        NULL,
+    market_ticker               VARCHAR(100)  NOT NULL,
+    rule_name                   VARCHAR(100)  NOT NULL,
+    rule_version                VARCHAR(20)   NOT NULL,
+    side                        ENUM('YES', 'NO') NOT NULL,   -- tracked (losing) side
+
+    -- entry context (from the firing signal)
+    winning_side                ENUM('YES', 'NO'),
+    losing_side                 ENUM('YES', 'NO'),
+    winning_change_60s          DECIMAL(8, 4),
+    winning_dir_z               DECIMAL(10, 6),
+    losing_bounce_from_low      DECIMAL(8, 4)  NULL,
+    losing_mom_10s              DECIMAL(8, 4)  NULL,
+    losing_ask_at_signal        DECIMAL(6, 4),
+    market_age_seconds          INT,
+
+    -- tracking reference + watermarks (measured on losing-side MID)
+    entry_ref_price             DECIMAL(6, 4),
+    entry_time                  DATETIME(3),
+    peak_price                  DECIMAL(6, 4),
+    low_price                   DECIMAL(6, 4),
+    last_price                  DECIMAL(6, 4),
+    n_updates                   INT            DEFAULT 0,
+
+    -- hypothetical outcomes
+    max_favorable_excursion     DECIMAL(8, 4),
+    max_adverse_excursion       DECIMAL(8, 4),
+    hit_plus_3c_before_minus_2c BOOLEAN,
+    hit_plus_4c_before_minus_2c BOOLEAN,
+    hit_plus_5c_before_minus_3c BOOLEAN,
+    time_to_peak_s              DECIMAL(8, 3)  NULL,
+    time_to_plus_3c_s           DECIMAL(8, 3)  NULL,
+    time_to_stop_s              DECIMAL(8, 3)  NULL,   -- first time hit -2c
+    did_make_new_low_after_signal BOOLEAN,
+
+    -- exit simulations
+    sim_tp3_sl2_outcome         VARCHAR(12)    NULL,   -- take_profit | stop_loss | timeout
+    sim_tp3_sl2_pnl             DECIMAL(8, 4)  NULL,
+    sim_tp5_sl3_outcome         VARCHAR(12)    NULL,
+    sim_tp5_sl3_pnl             DECIMAL(8, 4)  NULL,
+    sim_timeout60_pnl           DECIMAL(8, 4)  NULL,
+
+    -- lifecycle
+    status                      ENUM('ACTIVE', 'COMPLETE') DEFAULT 'ACTIVE',
+    complete_reason             VARCHAR(50)    NULL,   -- timeout_60s | near_expiry | market_rollover | recovered_after_restart
+    recorded_at                 DATETIME(3)    NOT NULL,  -- signal time
+    completed_at                DATETIME(3)    NULL,
+    created_at                  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_so_signal (signal_id),
+    INDEX idx_so_rule   (rule_name, rule_version),
+    INDEX idx_so_status (status),
+
+    CONSTRAINT fk_so_signal
+        FOREIGN KEY (signal_id) REFERENCES signals (id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);

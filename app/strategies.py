@@ -28,7 +28,11 @@ from app.features import (
     gap_z_score as _gap_z_score,
     momentum_score,
     reversal_score,
+    rolling_std as _rolling_std,
     rolling_stds,
+    series_change as _series_change,
+    series_min as _series_min,
+    z_from_target as _z_from_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,11 @@ class Signal:
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
+    # Strategy-specific extras NOT persisted to the `signals` table.
+    # Used to hand richer context (e.g. early_overextension_reversal_scalp metrics)
+    # to the ObservationTracker without widening the signals schema.
+    extra:                  Optional[dict] = None
+
     # ── time-of-day features (attached by run_all after strategy fires) ────────
     # All values expressed in the configured SIGNAL_TIMEZONE (default ET).
     # Stored as None until run_all() calls build_time_features().
@@ -131,6 +140,7 @@ def cheap_reversal_scalp(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -275,6 +285,7 @@ def premium_momentum_continuation(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -443,6 +454,7 @@ def premium_momentum_scalp_v2(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -568,6 +580,7 @@ def premium_no_midrange_scalp(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
 ) -> Optional[Signal]:
     """
     Hypothesis
@@ -699,6 +712,204 @@ def premium_no_midrange_scalp(
     )
 
 
+# ── early_overextension_reversal_scalp ────────────────────────────────────────
+
+_EOR_RULE_NAME    = "early_overextension_reversal_scalp"
+_EOR_RULE_VERSION = "v1"
+
+_EOR_MAX_MARKET_AGE_S      = 120     # only the first 2 minutes of the window
+_EOR_MIN_LOSING_ASK        = 0.05    # losing-side ask floor
+_EOR_MAX_LOSING_ASK        = 0.25    # losing-side ask ceiling
+_EOR_MIN_WIN_CHANGE_60S    = 0.15    # winning side must have jumped ≥ +0.15 in 60s
+_EOR_MIN_WIN_DIR_Z         = 2.5     # winning-side directional z-score ≥ 2.5
+_EOR_MAX_LOSING_SPREAD     = 0.03    # losing-side spread ≤ 0.03
+_EOR_MIN_BOUNCE            = 0.01    # losing side ≥ +0.01 off its low since open …
+_EOR_WIN_CHANGE_WINDOW_S   = 60.0
+_EOR_CONTRACT_MOM_WINDOW_S = 10.0    # … OR losing-side 10s momentum > 0
+_EOR_Z_WINDOW_S            = 60.0
+
+
+def early_overextension_reversal_scalp(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+) -> Optional[Signal]:
+    """
+    Hypothesis (WATCH-ONLY RESEARCH — never paper-traded)
+    -----------------------------------------------------
+    In the first two minutes of a BTC 15-minute up/down market, if the
+    winning-side contract rapidly gains value while BTC moves several standard
+    deviations away from the target, the losing-side contract may become
+    temporarily underpriced and produce a 3¢–5¢ reversal bounce.
+
+    Sides
+    -----
+    winning side : YES if btc_price > target_price, NO if btc_price < target_price
+    losing  side : the opposite.  The SIGNAL is recorded on the *losing* side —
+                   that is the contract whose hypothetical reversal we track.
+
+    Entry observation conditions
+    ----------------------------
+    1. contract_age_seconds <= 120
+    2. losing-side ask in [0.05, 0.25]
+    3. winning-side contract price change over last 60s >= +0.15
+    4. winning-side directional z-score >= 2.5
+    5. losing-side spread <= 0.03
+    6. losing side has bounced >= +0.01 off its low since market open
+       OR losing-side contract momentum over last 10s > 0
+
+    Outcome tracking and exit simulation are performed live by the
+    ObservationTracker (no paper trade is opened).
+    """
+    # ── 1. Market-age gate (only the first 2 minutes) ─────────────────────────
+    if contract_age_seconds > _EOR_MAX_MARKET_AGE_S:
+        logger.debug(
+            "%s: skip — age %.0fs > %ds",
+            _EOR_RULE_NAME, contract_age_seconds, _EOR_MAX_MARKET_AGE_S,
+        )
+        return None
+
+    # ── 2. Determine winning / losing side ────────────────────────────────────
+    if btc_price > target_price:
+        winning, losing = "YES", "NO"
+    elif btc_price < target_price:
+        winning, losing = "NO", "YES"
+    else:
+        logger.debug("%s: skip — btc_price == target_price", _EOR_RULE_NAME)
+        return None
+
+    # ── 3. Losing-side quotes: ask band + spread ──────────────────────────────
+    lq       = contract_prices.get(losing, {})
+    l_ask    = lq.get("ask_price", 0.0)
+    l_bid    = lq.get("bid_price", 0.0)
+    l_mid    = lq.get("mid_price", 0.0)
+    l_spread = lq.get("spread",    0.0)
+
+    if not (_EOR_MIN_LOSING_ASK <= l_ask <= _EOR_MAX_LOSING_ASK):
+        logger.debug(
+            "%s: skip — losing(%s) ask=%.4f outside [%.2f, %.2f]",
+            _EOR_RULE_NAME, losing, l_ask, _EOR_MIN_LOSING_ASK, _EOR_MAX_LOSING_ASK,
+        )
+        return None
+
+    if l_spread > _EOR_MAX_LOSING_SPREAD:
+        logger.debug(
+            "%s: skip — losing spread=%.4f > %.2f",
+            _EOR_RULE_NAME, l_spread, _EOR_MAX_LOSING_SPREAD,
+        )
+        return None
+
+    # ── 4. Winning-side rapid gain over last 60s ──────────────────────────────
+    history  = contract_history or {}
+    win_hist = history.get(winning, [])
+    win_change = _series_change(win_hist, _EOR_WIN_CHANGE_WINDOW_S)
+    if win_change is None or win_change < _EOR_MIN_WIN_CHANGE_60S:
+        logger.debug(
+            "%s: skip — winning(%s) 60s change=%s < %.2f",
+            _EOR_RULE_NAME, winning,
+            f"{win_change:+.4f}" if win_change is not None else "N/A",
+            _EOR_MIN_WIN_CHANGE_60S,
+        )
+        return None
+
+    # ── 5. Winning-side directional z-score (overextension) ───────────────────
+    std60     = _rolling_std(ticks, _EOR_Z_WINDOW_S)
+    win_dir_z = _z_from_target(btc_price, target_price, winning, std60)
+    if win_dir_z is None or win_dir_z < _EOR_MIN_WIN_DIR_Z:
+        logger.debug(
+            "%s: skip — winning(%s) dir_z=%s < %.1f",
+            _EOR_RULE_NAME, winning,
+            f"{win_dir_z:+.4f}" if win_dir_z is not None else "N/A",
+            _EOR_MIN_WIN_DIR_Z,
+        )
+        return None
+
+    # ── 6. Losing-side bounce-from-low OR short-term momentum ─────────────────
+    los_hist  = history.get(losing, [])
+    los_low   = _series_min(los_hist)
+    bounce    = (l_mid - los_low) if los_low is not None else None
+    los_mom10 = _series_change(los_hist, _EOR_CONTRACT_MOM_WINDOW_S)
+
+    bounced     = bounce is not None and bounce >= _EOR_MIN_BOUNCE
+    momentum_up = los_mom10 is not None and los_mom10 > 0.0
+    if not (bounced or momentum_up):
+        logger.debug(
+            "%s: skip — losing(%s) no bounce (%.4f) and 10s mom (%s) not > 0",
+            _EOR_RULE_NAME, losing,
+            bounce if bounce is not None else float("nan"),
+            f"{los_mom10:+.4f}" if los_mom10 is not None else "N/A",
+        )
+        return None
+
+    # ── Build (watch-only) signal on the LOSING side ──────────────────────────
+    mom  = momentum_score(ticks, n=10)
+    rev  = reversal_score(ticks, losing, n=10)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, losing)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    bounce_s = f"{bounce:+.4f}"   if bounce   is not None else "n/a"
+    mom10_s  = f"{los_mom10:+.4f}" if los_mom10 is not None else "n/a"
+    reason = (
+        f"{_EOR_RULE_NAME} {_EOR_RULE_VERSION}: losing={losing} @ ask={l_ask:.4f} "
+        f"(winning={winning}) | win_chg60={win_change:+.4f} win_dir_z={win_dir_z:+.2f} "
+        f"| losing bounce={bounce_s} mom10={mom10_s} spread={l_spread:.4f} | "
+        f"btc={btc_price:,.2f} target={target_price:,.2f} gap={g:+.2f} "
+        f"age={contract_age_seconds:.0f}s remaining={time_remaining_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _EOR_RULE_NAME,
+        rule_version           = _EOR_RULE_VERSION,
+        side                   = losing,        # track the losing-side contract
+
+        contract_price         = l_mid,
+        bid_price              = l_bid,
+        ask_price              = l_ask,
+        spread                 = l_spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        # EOR-specific context for the ObservationTracker (not persisted to signals)
+        extra = {
+            "winning_side":          winning,
+            "losing_side":           losing,
+            "winning_change_60s":    round(win_change, 6),
+            "winning_dir_z":         round(win_dir_z, 6),
+            "losing_bounce_from_low": round(bounce, 6) if bounce is not None else None,
+            "losing_mom_10s":        round(los_mom10, 6) if los_mom10 is not None else None,
+            "losing_ask_at_signal":  round(l_ask, 6),
+            "losing_mid_at_signal":  round(l_mid, 6),
+            "market_age_seconds":    round(contract_age_seconds, 3),
+        },
+    )
+
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 #
 # Active strategies are evaluated every poll cycle.
@@ -706,10 +917,11 @@ def premium_no_midrange_scalp(
 # to the signals table but will NOT open paper trades.
 
 _STRATEGIES = [
-    premium_momentum_continuation,   # NO-side active; YES-side watch_only (see below)
-    premium_no_midrange_scalp,       # paper_active — NO only, 0.65–0.80
-    premium_momentum_scalp_v2,       # watch_only — conflicts with PNMS in 240-300s/NO band
-    # cheap_reversal_scalp           # disabled — removed from registry 2026-05-28
+    premium_momentum_continuation,      # NO-side active; YES-side watch_only (see below)
+    premium_no_midrange_scalp,          # paper_active — NO only, 0.65–0.80
+    premium_momentum_scalp_v2,          # watch_only — conflicts with PNMS in 240-300s/NO band
+    early_overextension_reversal_scalp, # watch_only research — never paper-traded
+    # cheap_reversal_scalp              # disabled — removed from registry 2026-05-28
 ]
 
 # Keys that produce signals for the DB log but must NOT open paper trades.
@@ -718,6 +930,7 @@ _STRATEGIES = [
 _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_continuation/v1/YES",  # YES-side PMC: watch-only
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
+    "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
 })
 
 # ── PMC v1 forward-test filter ────────────────────────────────────────────────
@@ -739,6 +952,7 @@ def run_all(
     contract_age_seconds: float,
     time_remaining_seconds: float,
     contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
     timezone_name: str = "America/New_York",
     market_open_time: Optional[datetime] = None,
     market_close_time: Optional[datetime] = None,
@@ -763,6 +977,7 @@ def run_all(
         contract_age_seconds   = contract_age_seconds,
         time_remaining_seconds = time_remaining_seconds,
         contract_prices        = contract_prices,
+        contract_history       = contract_history,
     )
     for fn in _STRATEGIES:
         try:
