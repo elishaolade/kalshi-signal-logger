@@ -936,10 +936,16 @@ _CLC_RULE_VERSION = "v1"
 
 _CLC_STRICT_MAX_AGE_S  = 120.0   # strict early test (first 2 minutes)
 _CLC_COMPARE_MAX_AGE_S = 180.0   # also observe 2–3 min as a comparison bucket
+_CLC_NEARMISS_MAX_AGE_S = 360.0  # only count "age" near-misses up to here (else ignore)
 _CLC_MIN_ASK           = 0.05    # losing-side ask floor
 _CLC_MAX_ASK           = 0.30    # losing-side ask ceiling
 _CLC_PREFERRED_MIN_ASK = 0.10    # "preferred" price bucket flag (0.10–0.30)
-_CLC_MAX_ADVERSE_Z     = 1.5     # BTC not too far against the losing side
+# Adverse-z ceiling relaxed 1.5 → 3.0 (2026-05-31): cheap losing contracts are
+# usually cheap *because* BTC is already meaningfully against them, so a tight
+# z gate was filtering out the exact stretched setups this strategy exists to
+# study.  Still watch-only; the z bucket is recorded so we can see where
+# reversals actually happen (0–1.5 / 1.5–2.5 / 2.5–3.5 / 3.5+).
+_CLC_MAX_ADVERSE_Z     = 3.0     # BTC may be well against the losing side
 _CLC_MAX_SPREAD        = 0.03    # losing-side spread ceiling
 _CLC_MIN_REVERSAL_PROB = 0.55    # +3c/-2c reversal-prob gate (recorded, see note)
 _CLC_MAX_ADVERSE_MOM   = 2.0     # adverse directional momentum tolerance
@@ -947,6 +953,47 @@ _CLC_MIN_BOUNCE        = 0.01    # losing side ≥ +0.01 off its low since open 
 _CLC_NEW_LOW_WINDOW_S  = 20.0    # … OR no fresh low in the last 20s
 _CLC_Z_WINDOW_S        = 60.0
 _CLC_MOM_N             = 10
+
+
+class _CLCSkipStats:
+    """
+    Funnel counter for cheap_losing_contract_reversal_trail (watch-only
+    diagnostics).  Each candidate evaluation is attributed to the FIRST gate it
+    fails (or ``fired`` when a signal is emitted), so the tallies form a strict
+    rejection funnel.  ``age`` only counts *near*-misses (market just past the
+    180s window, up to _CLC_NEARMISS_MAX_AGE_S); markets far past the window are
+    not plausible candidates and are ignored entirely.
+
+    Purely in-memory; flushed to the log periodically by main.py.  Touches no
+    DB and opens no trades.
+    """
+
+    _GATES = ("age", "no_side", "ask_band", "spread",
+              "adverse_z", "violent_vol", "momentum", "fired")
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {g: 0 for g in self._GATES}
+
+    def record(self, gate: str) -> None:
+        self._counts[gate] = self._counts.get(gate, 0) + 1
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self._counts)
+
+    def total(self) -> int:
+        return sum(self._counts.values())
+
+    def reset(self) -> None:
+        for g in self._counts:
+            self._counts[g] = 0
+
+    def format_summary(self) -> str:
+        parts = "  ".join(f"{g}={self._counts[g]}" for g in self._GATES)
+        return f"CLC near-miss funnel (since last flush):  {parts}"
+
+
+# Module-level singleton, instrumented inside the strategy and flushed by main.py.
+clc_skip_stats = _CLCSkipStats()
 
 
 def cheap_losing_contract_reversal_trail(
@@ -981,7 +1028,7 @@ def cheap_losing_contract_reversal_trail(
     Structural entry gates (all hard):
       1. market_age_seconds <= 180   (strict early flag set when <= 120)
       2. losing-side ask in [0.05, 0.30]
-      3. adverse_z_score <= 1.5
+      3. adverse_z_score <= 3.0       (relaxed from 1.5 — see _CLC_MAX_ADVERSE_Z)
       4. losing-side spread <= 0.03
       5. volatility_regime != "violent"
       6. adverse momentum tolerable:
@@ -1000,6 +1047,10 @@ def cheap_losing_contract_reversal_trail(
     """
     # ── 1. Market-age gate (first 3 minutes; strict flag for first 2) ─────────
     if contract_age_seconds > _CLC_COMPARE_MAX_AGE_S:
+        # Only count as a near-miss if the market just missed the window; markets
+        # far past 180s are not plausible candidates, so they are ignored.
+        if contract_age_seconds <= _CLC_NEARMISS_MAX_AGE_S:
+            clc_skip_stats.record("age")
         return None
     strict_early = contract_age_seconds <= _CLC_STRICT_MAX_AGE_S
     market_phase = "first_2min" if strict_early else "min_2_to_3"
@@ -1010,6 +1061,7 @@ def cheap_losing_contract_reversal_trail(
     elif btc_price < target_price:
         winning, losing = "NO", "YES"
     else:
+        clc_skip_stats.record("no_side")
         return None
 
     # ── 3. Losing-side quotes: cheap-ask band + spread ────────────────────────
@@ -1020,8 +1072,10 @@ def cheap_losing_contract_reversal_trail(
     l_spread = lq.get("spread",    0.0)
 
     if not (_CLC_MIN_ASK <= l_ask <= _CLC_MAX_ASK):
+        clc_skip_stats.record("ask_band")
         return None
     if l_spread > _CLC_MAX_SPREAD:
+        clc_skip_stats.record("spread")
         return None
     preferred_bucket = l_ask >= _CLC_PREFERRED_MIN_ASK
 
@@ -1029,11 +1083,13 @@ def cheap_losing_contract_reversal_trail(
     std60     = _rolling_std(ticks, _CLC_Z_WINDOW_S)
     adverse_z = _z_from_target(btc_price, target_price, winning, std60)
     if adverse_z is None or adverse_z > _CLC_MAX_ADVERSE_Z:
+        clc_skip_stats.record("adverse_z")
         return None
 
     # ── 5. Volatility regime must not be violent ──────────────────────────────
     vol_regime = _volatility_regime(std60)
     if vol_regime == "violent":
+        clc_skip_stats.record("violent_vol")
         logger.debug("%s: skip — volatility regime violent (std60=%s)",
                      _CLC_RULE_NAME, std60)
         return None
@@ -1056,6 +1112,7 @@ def cheap_losing_contract_reversal_trail(
 
     momentum_tolerable = (adverse_mom <= _CLC_MAX_ADVERSE_MOM) or no_new_low or bounced
     if not momentum_tolerable:
+        clc_skip_stats.record("momentum")
         logger.debug(
             "%s: skip — adverse momentum intolerable (adv_mom=%.1f, no_new_low=%s, bounced=%s)",
             _CLC_RULE_NAME, adverse_mom, no_new_low, bounced,
@@ -1103,6 +1160,7 @@ def cheap_losing_contract_reversal_trail(
         f"phase={market_phase} age={contract_age_seconds:.0f}s setup[{s_type}]"
     )
     logger.info("Signal — %s", reason)
+    clc_skip_stats.record("fired")
 
     return Signal(
         market_ticker          = market_ticker,

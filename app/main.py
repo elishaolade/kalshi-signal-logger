@@ -49,7 +49,7 @@ from app.features import Tick, rolling_std, volatility_regime
 from app.observation_tracker import ObservationTracker
 from app.paper_trader import PaperTrader
 from app.reversal_probability import ReversalProbabilityProvider
-from app.strategies import Signal, run_all
+from app.strategies import Signal, clc_skip_stats, run_all
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +76,9 @@ CONTRACT_TICK_BUFFER = 500
 
 # How far back to pre-load BTC ticks from the DB on startup.
 WARMUP_LOOKBACK_SECONDS = 180
+
+# How often to flush the CLC near-miss funnel counter to the log (seconds).
+CLC_SKIP_FLUSH_SECONDS = 600
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
@@ -537,6 +540,7 @@ def run() -> None:
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     n = 0
+    last_clc_flush = time.monotonic()
     while not _stop_event:
         n += 1
         tick_start = time.monotonic()
@@ -546,6 +550,14 @@ def run() -> None:
                   clc_tracker, reversal_prob)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
+
+        # Periodically flush the CLC near-miss funnel so we can see which gate is
+        # choking the watch-only strategy (logged, then reset).
+        if tick_start - last_clc_flush >= CLC_SKIP_FLUSH_SECONDS:
+            if clc_skip_stats.total() > 0:
+                logger.info(clc_skip_stats.format_summary())
+                clc_skip_stats.reset()
+            last_clc_flush = tick_start
 
         elapsed = time.monotonic() - tick_start
         sleep_for = max(0.0, POLL_INTERVAL_SECONDS - elapsed)
@@ -558,6 +570,11 @@ def run() -> None:
         deadline = time.monotonic() + sleep_for
         while not _stop_event and time.monotonic() < deadline:
             time.sleep(min(0.1, deadline - time.monotonic()))
+
+    # Final flush of any unreported CLC near-misses before exiting.
+    if clc_skip_stats.total() > 0:
+        logger.info(clc_skip_stats.format_summary())
+        clc_skip_stats.reset()
 
     logger.info("Signal logger stopped cleanly after %d tick(s)", n)
 

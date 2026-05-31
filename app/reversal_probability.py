@@ -62,8 +62,10 @@ def _bounds(value: float, edges: list[float]) -> tuple[float, float]:
 _PRICE_EDGES        = [0.05, 0.10, 0.20, 0.30]
 _PRICE_EDGES_COARSE = [0.05, 0.15, 0.30]
 _AGE_EDGES          = [0.0, 60.0, 120.0, 180.0]
-_Z_EDGES            = [0.0, 0.5, 1.0, 1.5]
-_Z_EDGES_COARSE     = [0.0, 0.75, 1.5]
+# Adverse-z gate relaxed 1.5 → 3.0 (2026-05-31), so the bucket grid is extended
+# to keep the self-referential lookup meaningful across the wider range.
+_Z_EDGES            = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+_Z_EDGES_COARSE     = [0.0, 1.0, 2.0, 3.0]
 _SPREAD_EDGES       = [0.0, 0.01, 0.02, 0.03]
 
 
@@ -80,10 +82,11 @@ def age_bucket_label(age_s: float) -> str:
 
 
 def adverse_z_bucket_label(z: float) -> str:
-    if z < 0:        return "<0.0"
-    if z < 0.5:      return "0.0-0.5"
-    if z < 1.0:      return "0.5-1.0"
-    return                  "1.0-1.5"
+    if z < 0.0:      return "<0.0"
+    if z < 1.5:      return "0.0-1.5"
+    if z < 2.5:      return "1.5-2.5"
+    if z < 3.5:      return "2.5-3.5"
+    return                  "3.5+"
 
 
 def setup_type(ask: float, age_s: float, adverse_z: float) -> str:

@@ -69,7 +69,7 @@ _PROFILE_ORDER = [
 _PHASE_ORDER  = ["first_2min", "min_2_to_3", "N/A"]
 _AGE_ORDER    = ["0-60s", "60-120s", "120-180s", "180s+", "N/A"]
 _PRICE_ORDER  = ["0.05-0.10", "0.10-0.20", "0.20-0.30", "N/A"]
-_Z_ORDER      = ["<0.0", "0.0-0.5", "0.5-1.0", "1.0-1.5", "N/A"]
+_Z_ORDER      = ["<0.0", "0.0-1.5", "1.5-2.5", "2.5-3.5", "3.5+", "N/A"]
 _PROB_ORDER   = ["none", "<0.45", "0.45-0.55", "0.55-0.65", "0.65+", "N/A"]
 _SPREAD_ORDER = ["<0.01", "0.01-0.02", "0.02-0.03", "N/A"]
 _VOL_ORDER    = ["calm", "normal", "elevated", "violent", "unknown", "N/A"]
@@ -214,9 +214,10 @@ def _b_z(r: dict) -> str:
     z = _fv(r, "adverse_z_score")
     if z is None:  return "N/A"
     if z < 0.0:    return "<0.0"
-    if z < 0.5:    return "0.0-0.5"
-    if z < 1.0:    return "0.5-1.0"
-    return                "1.0-1.5"
+    if z < 1.5:    return "0.0-1.5"
+    if z < 2.5:    return "1.5-2.5"
+    if z < 3.5:    return "2.5-3.5"
+    return                "3.5+"
 
 
 def _b_prob(r: dict) -> str:
