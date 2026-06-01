@@ -49,7 +49,7 @@ from app.features import Tick, rolling_std, volatility_regime
 from app.observation_tracker import ObservationTracker
 from app.paper_trader import PaperTrader
 from app.reversal_probability import ReversalProbabilityProvider
-from app.strategies import Signal, clc_skip_stats, run_all
+from app.strategies import Signal, clc_late_skip_stats, clc_skip_stats, run_all
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -554,9 +554,10 @@ def run() -> None:
         # Periodically flush the CLC near-miss funnel so we can see which gate is
         # choking the watch-only strategy (logged, then reset).
         if tick_start - last_clc_flush >= CLC_SKIP_FLUSH_SECONDS:
-            if clc_skip_stats.total() > 0:
-                logger.info(clc_skip_stats.format_summary())
-                clc_skip_stats.reset()
+            for _stats in (clc_skip_stats, clc_late_skip_stats):
+                if _stats.total() > 0:
+                    logger.info(_stats.format_summary())
+                    _stats.reset()
             last_clc_flush = tick_start
 
         elapsed = time.monotonic() - tick_start
@@ -575,9 +576,10 @@ def run() -> None:
             time.sleep(min(0.1, remaining))
 
     # Final flush of any unreported CLC near-misses before exiting.
-    if clc_skip_stats.total() > 0:
-        logger.info(clc_skip_stats.format_summary())
-        clc_skip_stats.reset()
+    for _stats in (clc_skip_stats, clc_late_skip_stats):
+        if _stats.total() > 0:
+            logger.info(_stats.format_summary())
+            _stats.reset()
 
     logger.info("Signal logger stopped cleanly after %d tick(s)", n)
 

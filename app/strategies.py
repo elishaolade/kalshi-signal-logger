@@ -952,6 +952,36 @@ _CLC_Z_WINDOW_S        = 60.0
 _CLC_MOM_N             = 10
 
 
+# ── cheap_losing_contract_late_reversal (late-window variant) ──────────────────
+#
+# Separate watch-only research strategy (NOT a replacement for the early v1).
+# Hypothesis: a cheap-but-not-dead losing contract reverses better in the last
+# few minutes, after repricing has mostly happened and the losing side shows
+# actual bounce/stall confirmation.  Raises the ask floor to 0.10 (never study
+# near-dead 5-cent contracts) and requires positive short-term confirmation so
+# we do not sit in a contract that is still collapsing.
+_CLC_LATE_RULE_NAME      = "cheap_losing_contract_late_reversal"
+_CLC_LATE_RULE_VERSION   = "v1"
+_CLC_LATE_PHASE          = "late_1_to_5min"
+
+_CLC_LATE_MIN_TR_S       = 60.0    # entry only when 60s <= time_remaining <= 300s
+_CLC_LATE_MAX_TR_S       = 300.0
+# Only count "time_window" near-misses just outside the entry window; markets
+# far from the last-5-minutes window are not plausible candidates and ignored.
+_CLC_LATE_NEARMISS_TR_LO = 30.0
+_CLC_LATE_NEARMISS_TR_HI = 360.0
+
+_CLC_LATE_MIN_ASK        = 0.10    # ask floor RAISED to 0.10 (no near-dead 5c)
+_CLC_LATE_MAX_ASK        = 0.30    # ask ceiling
+_CLC_LATE_MAX_SPREAD     = 0.03    # losing-side spread ceiling
+# No hard adverse-z cap (record + bucket it in reports); z must only be measurable.
+_CLC_LATE_MIN_BOUNCE     = 0.02    # losing side >= +0.02 off its low since open
+_CLC_LATE_MIN_MOM10      = 0.00    # losing-contract 10s change >= 0.00 (stall/up)
+_CLC_LATE_MOM_WINDOW_S   = 10.0
+_CLC_LATE_Z_WINDOW_S     = 60.0
+_CLC_LATE_MOM_N          = 10
+
+
 class _CLCSkipStats:
     """
     Funnel counter for cheap_losing_contract_reversal_trail (watch-only
@@ -968,8 +998,16 @@ class _CLCSkipStats:
     _GATES = ("age", "no_side", "ask_band", "spread",
               "adverse_z", "violent_vol", "momentum", "fired")
 
-    def __init__(self) -> None:
-        self._counts: dict[str, int] = {g: 0 for g in self._GATES}
+    def __init__(
+        self,
+        gates: Optional[tuple[str, ...]] = None,
+        label: str = "CLC near-miss funnel",
+    ) -> None:
+        # Per-instance gate list so the early and late variants can keep
+        # different funnels (e.g. "age" vs "time_window"/"confirmation").
+        self._gates: tuple[str, ...] = tuple(gates) if gates else self._GATES
+        self._label = label
+        self._counts: dict[str, int] = {g: 0 for g in self._gates}
 
     def record(self, gate: str) -> None:
         self._counts[gate] = self._counts.get(gate, 0) + 1
@@ -985,12 +1023,23 @@ class _CLCSkipStats:
             self._counts[g] = 0
 
     def format_summary(self) -> str:
-        parts = "  ".join(f"{g}={self._counts[g]}" for g in self._GATES)
-        return f"CLC near-miss funnel (since last flush):  {parts}"
+        parts = "  ".join(f"{g}={self._counts[g]}" for g in self._gates)
+        return f"{self._label} (since last flush):  {parts}"
 
 
-# Module-level singleton, instrumented inside the strategy and flushed by main.py.
-clc_skip_stats = _CLCSkipStats()
+# Module-level singletons, instrumented inside the strategies and flushed by
+# main.py.  The early and late CLC variants keep separate funnels.
+clc_skip_stats = _CLCSkipStats(label="CLC near-miss funnel (early)")
+
+# Late-window CLC variant funnel.  Gates mirror the order they are checked in
+# cheap_losing_contract_late_reversal so the tallies form a strict rejection
+# funnel.  "time_window" only counts *near*-misses (time_remaining close to the
+# 60–300s window); markets far outside are not plausible candidates.
+clc_late_skip_stats = _CLCSkipStats(
+    gates=("time_window", "no_side", "ask_band", "spread",
+           "adverse_z_missing", "violent_vol", "confirmation", "fired"),
+    label="CLC near-miss funnel (late)",
+)
 
 
 def cheap_losing_contract_reversal_trail(
@@ -1219,6 +1268,195 @@ def cheap_losing_contract_reversal_trail(
     )
 
 
+def cheap_losing_contract_late_reversal(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Late-window cheap-losing-contract reversal (WATCH-ONLY RESEARCH).
+
+    NEVER paper-traded, NO live orders.  Tracked by the shared
+    CLCReversalTracker, which simulates the same FIVE exit profiles against the
+    observed bid path and writes rows to `clc_reversal_observations`.  This is a
+    *separate* strategy from cheap_losing_contract_reversal_trail/v1 (kept live
+    for early-vs-late comparison), distinguished by rule_name/rule_version.
+
+    Hypothesis
+    ----------
+    The early variant entered while the losing contract was still falling
+    (first live sample: 0% win, 100% stop, 0% trail activation).  This looks
+    like an entry-timing problem.  In the last few minutes — after repricing has
+    mostly happened — a cheap-but-not-dead losing contract that shows actual
+    bounce/stall confirmation may reverse.  If it instead resumes making new
+    lows after the signal, the normal stop / hard-stop logic records that as a
+    loss; nothing is hidden.
+
+    Entry gates (all hard, checked in order)
+    ----------------------------------------
+      1. time_remaining_seconds in [60, 300]   (the last 1–5 minutes)
+      2. losing side = opposite of current BTC winner
+      3. losing-side ask in [0.10, 0.30]        (floor RAISED from 0.05)
+      4. losing-side spread <= 0.03
+      5. adverse_z_score is measurable          (recorded/bucketed, NOT capped)
+      6. volatility_regime != "violent"
+      7. confirmation: bounce_from_low >= 0.02  AND  losing 10s change >= 0.00
+    """
+    # ── 1. Time-window gate (last 1–5 minutes) ────────────────────────────────
+    if not (_CLC_LATE_MIN_TR_S <= time_remaining_seconds <= _CLC_LATE_MAX_TR_S):
+        # Only count near-misses just outside the window; ignore the rest.
+        if _CLC_LATE_NEARMISS_TR_LO <= time_remaining_seconds <= _CLC_LATE_NEARMISS_TR_HI:
+            clc_late_skip_stats.record("time_window")
+        return None
+    market_phase = _CLC_LATE_PHASE
+
+    # ── 2. Winning / losing side ──────────────────────────────────────────────
+    if btc_price > target_price:
+        winning, losing = "YES", "NO"
+    elif btc_price < target_price:
+        winning, losing = "NO", "YES"
+    else:
+        clc_late_skip_stats.record("no_side")
+        return None
+
+    # ── 3. Losing-side quotes: cheap-ask band + spread ────────────────────────
+    lq       = contract_prices.get(losing, {})
+    l_ask    = lq.get("ask_price", 0.0)
+    l_bid    = lq.get("bid_price", 0.0)
+    l_mid    = lq.get("mid_price", 0.0)
+    l_spread = lq.get("spread",    0.0)
+
+    if not (_CLC_LATE_MIN_ASK <= l_ask <= _CLC_LATE_MAX_ASK):
+        clc_late_skip_stats.record("ask_band")
+        return None
+    if l_spread > _CLC_LATE_MAX_SPREAD:
+        clc_late_skip_stats.record("spread")
+        return None
+    preferred_bucket = l_ask >= _CLC_LATE_MIN_ASK   # whole band is the preferred 0.10+ band
+
+    # ── 4. Adverse z-score (BTC against the losing side, in σ) — recorded only ─
+    std60     = _rolling_std(ticks, _CLC_LATE_Z_WINDOW_S)
+    adverse_z = _z_from_target(btc_price, target_price, winning, std60)
+    if adverse_z is None:
+        clc_late_skip_stats.record("adverse_z_missing")
+        return None
+
+    # ── 5. Volatility regime must not be violent ──────────────────────────────
+    vol_regime = _volatility_regime(std60)
+    if vol_regime == "violent":
+        clc_late_skip_stats.record("violent_vol")
+        logger.debug("%s: skip — volatility regime violent (std60=%s)",
+                     _CLC_LATE_RULE_NAME, std60)
+        return None
+    whip = _whipsaw_score(ticks, n=20)
+
+    # ── 6. Confirmation: actual bounce off the low AND a non-falling last 10s ──
+    history   = contract_history or {}
+    los_hist  = history.get(losing, [])
+    los_low   = _series_min(los_hist)
+    bounce    = (l_mid - los_low) if los_low is not None else None
+    los_mom10 = _series_change(los_hist, _CLC_LATE_MOM_WINDOW_S)
+
+    bounced     = bounce    is not None and bounce    >= _CLC_LATE_MIN_BOUNCE
+    not_falling = los_mom10 is not None and los_mom10 >= _CLC_LATE_MIN_MOM10
+    if not (bounced and not_falling):
+        clc_late_skip_stats.record("confirmation")
+        logger.debug(
+            "%s: skip — no confirmation (bounce=%s>=%.2f? %s, mom10=%s>=%.2f? %s)",
+            _CLC_LATE_RULE_NAME, bounce, _CLC_LATE_MIN_BOUNCE, bounced,
+            los_mom10, _CLC_LATE_MIN_MOM10, not_falling,
+        )
+        return None
+
+    # ── Features for the signals row ──────────────────────────────────────────
+    adverse_mom = reversal_score(ticks, winning, n=_CLC_LATE_MOM_N)
+    mom  = momentum_score(ticks, n=_CLC_LATE_MOM_N)
+    rev  = reversal_score(ticks, losing, n=_CLC_LATE_MOM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, losing)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    s_type = _setup_type(l_ask, contract_age_seconds, adverse_z)
+    reason = (
+        f"{_CLC_LATE_RULE_NAME} {_CLC_LATE_RULE_VERSION}: BUY losing={losing} "
+        f"@ ask={l_ask:.4f} (winning={winning}) | adv_z={adverse_z:+.2f} "
+        f"bounce={bounce:+.4f} mom10={los_mom10:+.4f} spread={l_spread:.4f} "
+        f"regime={vol_regime} | phase={market_phase} "
+        f"t_remain={time_remaining_seconds:.0f}s setup[{s_type}]"
+    )
+    logger.info("Signal — %s", reason)
+    clc_late_skip_stats.record("fired")
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _CLC_LATE_RULE_NAME,
+        rule_version           = _CLC_LATE_RULE_VERSION,
+        side                   = losing,          # BUY and track the cheap losing side
+
+        contract_price         = l_mid,
+        bid_price              = l_bid,
+        ask_price              = l_ask,
+        spread                 = l_spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        # Context for the shared CLCReversalTracker (mirrors the early variant's
+        # extra keys so the tracker is rule-agnostic).  No reversal-probability
+        # lookup here — left as insufficient_data on purpose.
+        extra = {
+            "setup_type":                          s_type,
+            "market_phase":                        market_phase,
+            "strict_early":                        False,
+            "winning_side":                        winning,
+            "losing_side":                         losing,
+            "adverse_z_score":                     round(adverse_z, 6),
+            "adverse_directional_momentum_score":  round(adverse_mom, 4),
+            "raw_gap_z_score":                     round(gz, 6) if gz is not None else None,
+            "raw_momentum_score":                  round(mom, 4),
+            "losing_contract_ask":                 round(l_ask, 6),
+            "losing_contract_bid":                 round(l_bid, 6),
+            "losing_contract_spread":              round(l_spread, 6),
+            "losing_contract_low_since_open":      round(los_low, 6) if los_low is not None else None,
+            "losing_contract_bounce_from_low":     round(bounce, 6) if bounce is not None else None,
+            "historical_reversal_probability":     None,
+            "p_plus_2c_before_minus_2c":           None,
+            "p_plus_3c_before_minus_2c":           None,
+            "p_plus_4c_before_minus_3c":           None,
+            "similar_sample_count":                0,
+            "confidence_label":                    "insufficient_data",
+            "meets_reversal_prob_gate":            False,
+            "preferred_price_bucket":              preferred_bucket,
+            "volatility_regime":                   vol_regime,
+            "whipsaw_score":                       round(whip, 4) if whip is not None else None,
+            "market_age_seconds":                  round(contract_age_seconds, 3),
+        },
+    )
+
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 #
 # Active strategies are evaluated every poll cycle.
@@ -1230,7 +1468,8 @@ _STRATEGIES = [
     premium_no_midrange_scalp,            # paper_active — NO only, 0.65–0.80
     premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
     early_overextension_reversal_scalp,   # watch_only research — never paper-traded
-    cheap_losing_contract_reversal_trail, # watch_only research — never paper-traded
+    cheap_losing_contract_reversal_trail, # watch_only research — never paper-traded (early)
+    cheap_losing_contract_late_reversal,  # watch_only research — never paper-traded (late)
     # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
 ]
 
@@ -1242,6 +1481,7 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
     "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
     "cheap_losing_contract_reversal_trail/v1", # research only — 5 exit profiles simulated, not traded
+    "cheap_losing_contract_late_reversal/v1",  # research only — late-window variant, not traded
 })
 
 # ── PMC v1 forward-test filter ────────────────────────────────────────────────

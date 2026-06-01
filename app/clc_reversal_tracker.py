@@ -1,6 +1,8 @@
 """
-clc_reversal_tracker.py — Live shadow-tracking for
-cheap_losing_contract_reversal_trail/v1.
+clc_reversal_tracker.py — Live shadow-tracking for the cheap-losing-contract
+reversal research family: cheap_losing_contract_reversal_trail/v1 (early window)
+and cheap_losing_contract_late_reversal/v1 (last 1–5 minutes).  Both rules share
+the identical five-profile exit simulation; see _TRACKED_RULES.
 
 WATCH-ONLY RESEARCH.  NO paper trade and NO real order is ever placed.  For each
 watch-only signal of this rule, the tracker buys (hypothetically) the cheap
@@ -67,7 +69,8 @@ _R43_TP, _R43_SL = 0.04, 0.03
 _PRIMARY_PROFILE = "fixed_20pct_stop_15pct"
 
 _TRACKED_RULES: frozenset[str] = frozenset({
-    "cheap_losing_contract_reversal_trail/v1",
+    "cheap_losing_contract_reversal_trail/v1",  # early-window variant
+    "cheap_losing_contract_late_reversal/v1",   # late-window variant (last 1–5 min)
 })
 
 # Slippage (mirrors app.paper_trader; kept local to avoid importing the trader).

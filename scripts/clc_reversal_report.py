@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-clc_reversal_report.py — Research report for
-cheap_losing_contract_reversal_trail/v1.
+clc_reversal_report.py — Research report for the cheap-losing-contract reversal
+family: cheap_losing_contract_reversal_trail/v1 (early window) and
+cheap_losing_contract_late_reversal/v1 (last 1–5 minutes).
 
-This strategy is **watch-only**.  No paper trade and no live order is ever
+Both strategies are **watch-only**.  No paper trade and no live order is ever
 opened.  The CLCReversalTracker buys (hypothetically) the cheap *losing*
 contract and simulates FIVE exit profiles against the same observed bid path,
 writing one row per (signal x exit_profile) into `clc_reversal_observations`.
+
+By default the report covers ALL CLC rules and leads with an early-vs-late
+breakdown so the two entry-timing hypotheses can be compared directly.  Pass
+`--rule <rule_name>` to scope the report to a single variant.
 
 Row semantics
 -------------
@@ -35,6 +40,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import defaultdict
 from datetime import date
@@ -48,8 +54,6 @@ from app.db import fetch_all
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-_RULE = "cheap_losing_contract_reversal_trail"
-_VER  = "v1"
 _W    = 116
 
 _SAMPLE_STEPS = [
@@ -66,7 +70,8 @@ _PROFILE_ORDER = [
     "ride_then_trail_15pct_2c",
     "ride_then_trail_20pct_1c",
 ]
-_PHASE_ORDER  = ["first_2min", "min_2_to_3", "N/A"]
+_PHASE_ORDER  = ["first_2min", "min_2_to_3", "late_1_to_5min", "N/A"]
+_RULE_ORDER   = ["early (trail/v1)", "late (late_rev/v1)"]
 _AGE_ORDER    = ["0-60s", "60-120s", "120-180s", "180s+", "N/A"]
 _PRICE_ORDER  = ["0.05-0.10", "0.10-0.20", "0.20-0.30", "N/A"]
 _Z_ORDER      = ["<0.0", "0.0-1.5", "1.5-2.5", "2.5-3.5", "3.5+", "N/A"]
@@ -81,6 +86,9 @@ _DAY_ORDER    = ["Monday", "Tuesday", "Wednesday", "Thursday",
 
 _QUERY = """
     SELECT
+        signal_id,
+        rule_name,
+        rule_version,
         exit_profile,
         market_phase,
         CAST(market_age_seconds         AS DOUBLE) AS market_age_seconds,
@@ -97,17 +105,21 @@ _QUERY = """
         CAST(pnl                        AS DOUBLE) AS pnl,
         exit_reason
     FROM clc_reversal_observations
-    WHERE rule_name = %s
-      AND rule_version = %s
-      AND status = 'COMPLETE'
+    WHERE status = 'COMPLETE'
       AND complete_reason IN ('timeout', 'near_expiry', 'market_rollover')
       AND pnl IS NOT NULL
+      {rule_filter}
     ORDER BY recorded_at ASC
 """
 
 
-def _load() -> list[dict]:
-    return fetch_all(_QUERY, (_RULE, _VER))
+def _load(rule: Optional[str], version: Optional[str]) -> list[dict]:
+    """Load completed observations.  When rule is None, load ALL rules so the
+    report can compare early vs late side by side."""
+    if rule is None:
+        return fetch_all(_QUERY.format(rule_filter=""), ())
+    sql = _QUERY.format(rule_filter="AND rule_name = %s AND rule_version = %s")
+    return fetch_all(sql, (rule, version))
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -187,6 +199,21 @@ def compute_metrics(rows: list[dict]) -> dict[str, Any]:
 
 def _b_profile(r: dict) -> str:
     return str(r.get("exit_profile") or "N/A")
+
+
+_RULE_LABELS = {
+    "cheap_losing_contract_reversal_trail/v1": "early (trail/v1)",
+    "cheap_losing_contract_late_reversal/v1":  "late (late_rev/v1)",
+}
+
+
+def _b_rule(r: dict) -> str:
+    rn = r.get("rule_name")
+    rv = r.get("rule_version")
+    if not rn:
+        return "N/A"
+    key = f"{rn}/{rv}"
+    return _RULE_LABELS.get(key, key)
 
 
 def _b_phase(r: dict) -> str:
@@ -349,14 +376,14 @@ def _print_bd_table(
 
 # ── Markdown writer ─────────────────────────────────────────────────────────────
 
-def write_md(lines: list[str]) -> Path:
+def write_md(lines: list[str], title: str, scope_tag: str) -> Path:
     today   = date.today()
     out_dir = Path(__file__).parent.parent / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"clc_reversal_report_{today.strftime('%Y_%m_%d')}.md"
+    out_path = out_dir / f"clc_reversal_report_{scope_tag}_{today.strftime('%Y_%m_%d')}.md"
 
     header = [
-        f"# cheap_losing_contract_reversal_trail/v1 — Research Report  {today.isoformat()}",
+        f"# {title} — Research Report  {today.isoformat()}",
         "",
         "> ⚠ **WATCH-ONLY RESEARCH** — no paper trades and no live trading.",
         "> Each row is one (signal × exit_profile) outcome; P&L uses",
@@ -374,12 +401,37 @@ def write_md(lines: list[str]) -> Path:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    rows = _load()
+    ap = argparse.ArgumentParser(
+        description="Research report for the cheap-losing-contract reversal family "
+                    "(watch-only; early and late variants)."
+    )
+    ap.add_argument(
+        "--rule", default=None,
+        help="rule_name to scope to (e.g. cheap_losing_contract_late_reversal). "
+             "Default: ALL CLC rules, with an early-vs-late breakdown.",
+    )
+    ap.add_argument("--version", default="v1", help="rule_version (default: v1)")
+    ap.add_argument("--all", action="store_true",
+                    help="Force all-rules report (default when --rule omitted).")
+    args = ap.parse_args()
+
+    rule    = None if args.all else args.rule
+    version = args.version if rule else None
+    rows    = _load(rule, version)
+
+    if rule:
+        scope_label = f"{rule}/{version}"
+        scope_tag   = rule.replace("cheap_losing_contract_", "")
+    else:
+        scope_label = "all CLC rules (early vs late)"
+        scope_tag   = "all"
+    title = f"cheap-losing-contract reversal — {scope_label}"
+
     n_rows    = len(rows)
     n_signals = len({r.get("signal_id") for r in rows if r.get("signal_id") is not None})
 
     print(f"\n{'═' * _W}")
-    print("  cheap_losing_contract_reversal_trail/v1 — Research Report")
+    print(f"  {title} — Research Report")
     print(f"{'═' * _W}")
     print(
         "  ⚠  WATCH-ONLY RESEARCH — no paper trades, no live trading.\n"
@@ -390,6 +442,7 @@ def main() -> None:
     print(f"  Distinct signals:     {n_signals}   ›  {maturity(n_signals)}")
 
     md: list[str] = [
+        f"**Scope:** {scope_label}",
         f"**Profile-outcome rows:** {n_rows} — {maturity(n_rows)}",
         f"**Distinct signals:** {n_signals} — {maturity(n_signals)}",
         "",
@@ -398,9 +451,17 @@ def main() -> None:
     if n_rows == 0:
         print("\n  No completed observations yet.\n")
         md += ["_No completed observations yet._", ""]
-        path = write_md(md)
+        path = write_md(md, title, scope_tag)
         print(f"Report written → {path}\n")
         return
+
+    # When reporting all rules, lead with the early-vs-late comparison.
+    if rule is None:
+        md += _print_bd_table(
+            "By Rule Name  (early-window vs late-window entry timing)",
+            breakdown(rows, _b_rule, _RULE_ORDER),
+            "Aggregated across all 5 exit profiles (≈5 rows per signal).",
+        )
 
     # Headline: compare the five exit profiles (Q2–Q4).
     md += _print_bd_table(
@@ -409,7 +470,7 @@ def main() -> None:
     )
 
     blended_note = "Aggregated across all 5 exit profiles (≈5 rows per signal)."
-    md += _print_bd_table("By Market Phase  (Q6: first 2 min vs 2–3 min)",
+    md += _print_bd_table("By Market Phase  (Q6: first 2 min / 2–3 min / late 1–5 min)",
                           breakdown(rows, _b_phase, _PHASE_ORDER), blended_note)
     md += _print_bd_table("By Market Age", breakdown(rows, _b_age, _AGE_ORDER), blended_note)
     md += _print_bd_table("By Losing-Contract Price  (Q5)",
@@ -433,7 +494,7 @@ def main() -> None:
     print("  post-cost expectancy, profit factor > 1.20, acceptable drawdown.")
     print(f"{'═' * _W}\n")
 
-    path = write_md(md)
+    path = write_md(md, title, scope_tag)
     print(f"Report written → {path}\n")
 
 
