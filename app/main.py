@@ -569,7 +569,10 @@ def run() -> None:
         # Interruptible sleep — wakes immediately on shutdown signal.
         deadline = time.monotonic() + sleep_for
         while not _stop_event and time.monotonic() < deadline:
-            time.sleep(min(0.1, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
 
     # Final flush of any unreported CLC near-misses before exiting.
     if clc_skip_stats.total() > 0:
