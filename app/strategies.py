@@ -940,12 +940,9 @@ _CLC_NEARMISS_MAX_AGE_S = 360.0  # only count "age" near-misses up to here (else
 _CLC_MIN_ASK           = 0.05    # losing-side ask floor
 _CLC_MAX_ASK           = 0.30    # losing-side ask ceiling
 _CLC_PREFERRED_MIN_ASK = 0.10    # "preferred" price bucket flag (0.10–0.30)
-# Adverse-z ceiling relaxed 1.5 → 3.0 (2026-05-31): cheap losing contracts are
-# usually cheap *because* BTC is already meaningfully against them, so a tight
-# z gate was filtering out the exact stretched setups this strategy exists to
-# study.  Still watch-only; the z bucket is recorded so we can see where
-# reversals actually happen (0–1.5 / 1.5–2.5 / 2.5–3.5 / 3.5+).
-_CLC_MAX_ADVERSE_Z     = 3.0     # BTC may be well against the losing side
+# No hard adverse-z ceiling while watch-only: cheap losing contracts are usually
+# cheap *because* BTC is already meaningfully against them.  Record the z bucket
+# and let the observations tell us where reversals actually happen.
 _CLC_MAX_SPREAD        = 0.03    # losing-side spread ceiling
 _CLC_MIN_REVERSAL_PROB = 0.55    # +3c/-2c reversal-prob gate (recorded, see note)
 _CLC_MAX_ADVERSE_MOM   = 2.0     # adverse directional momentum tolerance
@@ -1011,7 +1008,7 @@ def cheap_losing_contract_reversal_trail(
     Hypothesis (WATCH-ONLY RESEARCH — never paper-traded, no live orders)
     --------------------------------------------------------------------
     Early in a BTC 15-minute up/down market, if the *losing* contract is cheap,
-    BTC is not too far against it, adverse momentum is tolerable, volatility is
+    BTC displacement is measured, adverse momentum is tolerable, volatility is
     not violent, and historically similar setups reversed often, the losing
     contract may produce a short reversal move worth riding with a trailing
     exit.  Outcomes for five exit profiles are simulated live by the
@@ -1028,7 +1025,7 @@ def cheap_losing_contract_reversal_trail(
     Structural entry gates (all hard):
       1. market_age_seconds <= 180   (strict early flag set when <= 120)
       2. losing-side ask in [0.05, 0.30]
-      3. adverse_z_score <= 3.0       (relaxed from 1.5 — see _CLC_MAX_ADVERSE_Z)
+      3. adverse_z_score is measurable  (recorded/bucketed, not hard-capped)
       4. losing-side spread <= 0.03
       5. volatility_regime != "violent"
       6. adverse momentum tolerable:
@@ -1082,7 +1079,7 @@ def cheap_losing_contract_reversal_trail(
     # ── 4. Adverse z-score (BTC against the losing side, in σ) ────────────────
     std60     = _rolling_std(ticks, _CLC_Z_WINDOW_S)
     adverse_z = _z_from_target(btc_price, target_price, winning, std60)
-    if adverse_z is None or adverse_z > _CLC_MAX_ADVERSE_Z:
+    if adverse_z is None:
         clc_skip_stats.record("adverse_z")
         return None
 

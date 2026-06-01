@@ -62,8 +62,8 @@ def _bounds(value: float, edges: list[float]) -> tuple[float, float]:
 _PRICE_EDGES        = [0.05, 0.10, 0.20, 0.30]
 _PRICE_EDGES_COARSE = [0.05, 0.15, 0.30]
 _AGE_EDGES          = [0.0, 60.0, 120.0, 180.0]
-# Adverse-z gate relaxed 1.5 → 3.0 (2026-05-31), so the bucket grid is extended
-# to keep the self-referential lookup meaningful across the wider range.
+# CLC no longer hard-caps adverse z while watch-only, so the bucket grid extends
+# into stretched regimes and the final bucket is open-ended.
 _Z_EDGES            = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 _Z_EDGES_COARSE     = [0.0, 1.0, 2.0, 3.0]
 _SPREAD_EDGES       = [0.0, 0.01, 0.02, 0.03]
@@ -192,15 +192,22 @@ class ReversalProbabilityProvider:
         zc_lo, zc_hi = _bounds(adverse_z,          _Z_EDGES_COARSE)
         s_lo, s_hi   = _bounds(spread,             _SPREAD_EDGES)
 
-        price_cond = ("losing_contract_ask >= %s AND losing_contract_ask < %s", [p_lo, p_hi])
-        age_cond   = ("market_age_seconds  >= %s AND market_age_seconds  < %s", [a_lo, a_hi])
-        z_cond     = ("adverse_z_score     >= %s AND adverse_z_score     < %s", [z_lo, z_hi])
-        spread_cond= ("losing_contract_spread >= %s AND losing_contract_spread < %s", [s_lo, s_hi])
+        def range_cond(column: str, lo: float, hi: float) -> tuple[str, list]:
+            if hi == float("inf"):
+                return (f"{column} >= %s", [lo])
+            if lo == float("-inf"):
+                return (f"{column} < %s", [hi])
+            return (f"{column} >= %s AND {column} < %s", [lo, hi])
+
+        price_cond = range_cond("losing_contract_ask", p_lo, p_hi)
+        age_cond   = range_cond("market_age_seconds", a_lo, a_hi)
+        z_cond     = range_cond("adverse_z_score", z_lo, z_hi)
+        spread_cond= range_cond("losing_contract_spread", s_lo, s_hi)
         vol_cond   = ("volatility_regime = %s", [volatility_regime])
         hour_cond  = ("hour_block = %s", [hour_block]) if hour_block else None
 
-        price_coarse = ("losing_contract_ask >= %s AND losing_contract_ask < %s", [pc_lo, pc_hi])
-        z_coarse     = ("adverse_z_score     >= %s AND adverse_z_score     < %s", [zc_lo, zc_hi])
+        price_coarse = range_cond("losing_contract_ask", pc_lo, pc_hi)
+        z_coarse     = range_cond("adverse_z_score", zc_lo, zc_hi)
 
         # Ordered broadening levels: each is a list of (sql_fragment, params).
         levels: list[tuple[str, list]] = [
