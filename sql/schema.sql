@@ -416,3 +416,118 @@ CREATE TABLE IF NOT EXISTS clc_reversal_observations (
         FOREIGN KEY (signal_id) REFERENCES signals (id)
         ON DELETE SET NULL ON UPDATE CASCADE
 );
+
+
+-- ---------------------------------------------------------------
+-- 10. backtest_runs
+--     One row per historical-replay invocation.  Backtest results are
+--     stored ENTIRELY SEPARATELY from live paper_trades — these tables
+--     never mix with the live trading lifecycle.
+--
+--     PAPER-ONLY RESEARCH.  Replay never places or enables real orders;
+--     it re-derives strategy decisions from stored market snapshots and
+--     simulates fills (entry = ask + slippage, exit = bid - slippage).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id              BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    rule_name       VARCHAR(100) NOT NULL,
+    rule_version    VARCHAR(20)  NOT NULL,
+    slippage_mode   VARCHAR(12)  NOT NULL,          -- optimistic | realistic | harsh
+    exit_profiles   JSON,                           -- profile names + params simulated
+    params          JSON,                           -- cooldown, timezone, gates, limits …
+    timezone_used   VARCHAR(40),
+
+    -- coverage of the replayed snapshot window
+    data_start      DATETIME(3),
+    data_end        DATETIME(3),
+    n_markets       INT          DEFAULT 0,
+    n_snapshots     INT          DEFAULT 0,
+    n_signals       INT          DEFAULT 0,         -- distinct entries taken
+    n_trades        INT          DEFAULT 0,         -- rows written to backtest_trades
+
+    notes           TEXT,
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_btr_rule    (rule_name, rule_version),
+    INDEX idx_btr_created (created_at)
+);
+
+-- ---------------------------------------------------------------
+-- 11. backtest_trades
+--     One row per (replayed signal x exit_profile).  Each entry is
+--     simulated independently under every exit profile against the same
+--     forward bid path, so profiles can be compared on identical entries.
+--
+--     Fill model (NOT mid):  entry = ask + slippage,  exit = bid - slippage.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id                          BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    run_id                      BIGINT        NOT NULL,
+    rule_name                   VARCHAR(100)  NOT NULL,
+    rule_version                VARCHAR(20)   NOT NULL,
+    market_ticker               VARCHAR(100)  NOT NULL,
+    signal_seq                  INT,                       -- nth entry within this run
+
+    -- setup classification (mirrors clc_reversal_observations where applicable)
+    setup_type                  VARCHAR(80),
+    market_phase                VARCHAR(20),
+    market_age_seconds          INT,
+    time_remaining_seconds      INT,
+
+    -- sides
+    side_bought                 ENUM('YES', 'NO') NOT NULL,  -- the losing (cheap) side
+    winning_side                ENUM('YES', 'NO'),
+    losing_side                 ENUM('YES', 'NO'),
+
+    -- BTC context at entry
+    btc_price                   DECIMAL(14, 2),
+    target_price                DECIMAL(14, 2),
+    raw_gap_z_score             DECIMAL(10, 6),
+    adverse_z_score             DECIMAL(10, 6),
+
+    -- losing-contract quotes at entry
+    losing_contract_ask         DECIMAL(6, 4),
+    losing_contract_bid         DECIMAL(6, 4),
+    losing_contract_spread      DECIMAL(6, 4),
+
+    -- regime
+    volatility_regime           VARCHAR(12),
+    whipsaw_score               DECIMAL(6, 4)  NULL,
+
+    -- time-of-day (computed from entry timestamp in timezone_used)
+    entry_time                  DATETIME(3),
+    entry_date                  VARCHAR(10),
+    entry_hour                  INT,
+    entry_day_of_week           INT,
+    entry_day_name              VARCHAR(12),
+    entry_hour_block            VARCHAR(8),
+
+    -- fill model
+    slippage_mode               VARCHAR(12),
+    entry_price_simulated       DECIMAL(6, 4),            -- ask + slippage
+    entry_bid                   DECIMAL(6, 4),            -- bid at entry (path reference)
+
+    -- per-profile exit
+    exit_profile                VARCHAR(40)   NOT NULL,
+    trail_activated             BOOLEAN       NULL,
+    peak_contract_price         DECIMAL(6, 4),            -- highest bid seen
+    max_favorable_excursion     DECIMAL(8, 4),
+    max_adverse_excursion       DECIMAL(8, 4),
+    time_to_peak                DECIMAL(8, 3)  NULL,
+    exit_time                   DATETIME(3)    NULL,
+    exit_price_simulated        DECIMAL(6, 4)  NULL,      -- bid - slippage at exit
+    exit_reason                 VARCHAR(40)    NULL,
+    pnl                         DECIMAL(8, 4)  NULL,      -- exit_sim - entry_sim
+    pnl_percent                 DECIMAL(8, 4)  NULL,      -- pnl / entry_sim
+
+    n_updates                   INT            DEFAULT 0,
+    created_at                  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_btt_run     (run_id),
+    INDEX idx_btt_profile (run_id, exit_profile),
+    INDEX idx_btt_market  (market_ticker),
+
+    CONSTRAINT fk_btt_run
+        FOREIGN KEY (run_id) REFERENCES backtest_runs (id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
