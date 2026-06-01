@@ -285,6 +285,7 @@ _PMC_RULE_VERSION = "v1"
 _PMC_MIN_TIME_REMAINING = 180   # seconds — only fire in the last 5 minutes …
 _PMC_MAX_TIME_REMAINING = 300   # … but not closer than 3 minutes to expiry
 _PMC_MIN_LEADING_ASK    = 0.76  # leading side ask must be at least $0.76
+_PMC_NO_MAX_ENTRY_PRICE = 0.90  # NO entries priced ≥ $0.90 are skipped (watch-only research gate)
 _PMC_MIN_GAP_Z          = 1.0   # directional gap must be ≥ 1 std away from target
 _PMC_MIN_MOMENTUM_YES   = 3.0   # YES entry: raw momentum_score must be ≥ +3
 _PMC_MAX_MOMENTUM_NO    = -3.0  # NO  entry: raw momentum_score must be ≤ −3
@@ -366,6 +367,13 @@ def premium_momentum_continuation(
             "%s: skip — %s ask=%.4f < %.2f",
             _PMC_RULE_NAME, side, ask, _PMC_MIN_LEADING_ASK,
         )
+        return None
+
+    # ── 4b. NO-side rich-price rejection gate ─────────────────────────────────
+    # Skip NO entries priced at or above 0.90 (near-certain winners: poor
+    # risk/reward).  Entry price = the leading-side ask we would pay.
+    if side == "NO" and ask >= _PMC_NO_MAX_ENTRY_PRICE:
+        logger.info("SKIP: NO entry price %.4f >= 0.90 threshold", ask)
         return None
 
     if spread > _PMC_MAX_SPREAD:
