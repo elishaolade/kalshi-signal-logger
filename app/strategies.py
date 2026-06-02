@@ -1610,6 +1610,194 @@ def cheap_losing_contract_late_reversal(
     )
 
 
+# ── post_move_continuation_scalp (watch-only research) ─────────────────────────
+#
+# Hypothesis
+# ----------
+# A contract can be profitable to scalp if it begins trending UPWARD and the move
+# continues long enough that the exit bid clears the entry ask after spread and
+# slippage.  The goal is NOT to predict expiry — only to capture a short
+# continuation move once the contract starts repricing upward.
+#
+# WATCH-ONLY: registered below and keyed into _WATCH_ONLY_KEYS, so signals are
+# logged to the `signals` table but NEVER open a paper trade.  Forward exit-test
+# simulation + reporting live in scripts/post_move_continuation_backtest.py and
+# scripts/post_move_continuation_report.py (lookahead-safe replay, paper-only).
+
+_PMCS_RULE_NAME    = "post_move_continuation_scalp"
+_PMCS_RULE_VERSION = "v1"
+
+_PMCS_MIN_TIME_REMAINING = 120     # seconds
+_PMCS_MAX_TIME_REMAINING = 300     # seconds
+_PMCS_MIN_ASK            = 0.55    # scalp candidate ask floor
+_PMCS_MAX_SCALP_ASK      = 0.85    # ask >= this → 0.85+ context only (NOT scalped)
+_PMCS_MAX_SPREAD         = 0.03
+_PMCS_MIN_CHANGE_10S     = 0.02    # +2c over 10s …
+_PMCS_MIN_CHANGE_30S     = 0.04    # … OR +4c over 30s confirms upward move
+_PMCS_MIN_DIR_MOMENTUM   = 3.0     # directional (YES = raw, NO = -raw)
+_PMCS_MIN_DIR_GAP_Z      = 1.5     # directional (YES = raw, NO = -raw)
+_PMCS_MOMENTUM_N         = 10
+
+
+def _pmcs_price_bucket(ask: Optional[float]) -> str:
+    """Contract-ask price bucket for the post-move continuation thesis."""
+    if ask is None:
+        return "N/A"
+    if ask < 0.55:
+        return "below_range"
+    if ask < 0.65:
+        return "early_momentum"          # 0.55–0.65
+    if ask < 0.80:
+        return "premium_midrange"        # 0.65–0.80
+    if ask < 0.85:
+        return "late_premium_caution"    # 0.80–0.85
+    return "no_scalp_or_expiry_hold_only"  # 0.85+ — watch-only context, never scalped
+
+
+def post_move_continuation_scalp(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Watch-only continuation scalp: log entries where a contract has just started
+    trending upward, with directional momentum + gap-z confirming the side.
+
+    Entry observation conditions
+    ----------------------------
+    1. 120 ≤ time_remaining_seconds ≤ 300
+    2. Side chosen from BTC position (YES: btc>target, NO: btc<target)
+    3. Side's contract ask ≥ 0.55  (upper handling: ask in [0.55,0.85) = scalp
+       candidate by bucket; ask ≥ 0.85 logged as watch-only context only)
+    4. Spread ≤ 0.03
+    5. Upward move: contract_price_change_10s ≥ +0.02 OR _30s ≥ +0.04
+    6. directional_momentum_score ≥ 3   (YES = raw_mom,  NO = −raw_mom)
+    7. directional_gap_z_score   ≥ 1.5  (YES = raw_gz,   NO = −raw_gz)
+
+    Side-normalised values are stored in `extra` for the research report.  This
+    function NEVER trades — it is registered watch-only.
+    """
+    # ── 1. Time-window gate ───────────────────────────────────────────────────
+    if not (_PMCS_MIN_TIME_REMAINING <= time_remaining_seconds <= _PMCS_MAX_TIME_REMAINING):
+        return None
+
+    # ── 2. Side from BTC position relative to target ──────────────────────────
+    if btc_price > target_price:
+        side = "YES"
+    elif btc_price < target_price:
+        side = "NO"
+    else:
+        return None
+
+    # ── 3. Side contract quotes ───────────────────────────────────────────────
+    quotes = contract_prices.get(side, {})
+    ask    = quotes.get("ask_price")
+    bid    = quotes.get("bid_price")
+    mid    = quotes.get("mid_price", 0.0)
+    spread = quotes.get("spread")
+    if ask is None or bid is None or ask <= 0:
+        return None
+    if ask < _PMCS_MIN_ASK:
+        return None
+    if spread is not None and spread > _PMCS_MAX_SPREAD:
+        return None
+
+    # ── 4. Upward-move confirmation from this side's contract-mid history ──────
+    side_hist = (contract_history or {}).get(side, []) or []
+    ref_ts    = side_hist[-1].ts if side_hist else None
+    chg5  = _series_change(side_hist, 5.0,  ref_ts)
+    chg10 = _series_change(side_hist, 10.0, ref_ts)
+    chg30 = _series_change(side_hist, 30.0, ref_ts)
+    chg60 = _series_change(side_hist, 60.0, ref_ts)
+
+    moving_up = (
+        (chg10 is not None and chg10 >= _PMCS_MIN_CHANGE_10S)
+        or (chg30 is not None and chg30 >= _PMCS_MIN_CHANGE_30S)
+    )
+    if not moving_up:
+        return None
+
+    # ── 5. Directional momentum & gap-z (side-normalised) ─────────────────────
+    mom  = momentum_score(ticks, n=_PMCS_MOMENTUM_N)
+    rev  = reversal_score(ticks, side, n=_PMCS_MOMENTUM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, side)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    dir_mom = mom if side == "YES" else -mom
+    if dir_mom < _PMCS_MIN_DIR_MOMENTUM:
+        return None
+
+    dir_gz = gz if side == "YES" else (-gz if gz is not None else None)
+    if dir_gz is None or dir_gz < _PMCS_MIN_DIR_GAP_Z:
+        return None
+
+    # ── 6. Build watch-only signal ────────────────────────────────────────────
+    price_bucket    = _pmcs_price_bucket(ask)
+    scalp_candidate = ask < _PMCS_MAX_SCALP_ASK   # 0.85+ = context only, not scalped
+
+    reason = (
+        f"{_PMCS_RULE_NAME} {_PMCS_RULE_VERSION}: {side} @ ask={ask:.4f} "
+        f"[{price_bucket}{'' if scalp_candidate else ' / context-only'}] | "
+        f"chg10={chg10 if chg10 is None else round(chg10, 4)} "
+        f"chg30={chg30 if chg30 is None else round(chg30, 4)} | "
+        f"dir_mom={dir_mom:+.0f} dir_gz={dir_gz:+.4f} | "
+        f"remaining={time_remaining_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _PMCS_RULE_NAME,
+        rule_version           = _PMCS_RULE_VERSION,
+        side                   = side,
+
+        contract_price         = mid,
+        bid_price              = bid,
+        ask_price              = ask,
+        spread                 = spread if spread is not None else 0.0,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        extra                  = {
+            "price_bucket":              price_bucket,
+            "scalp_candidate":           scalp_candidate,
+            "raw_momentum_score":        round(mom, 4),
+            "directional_momentum_score": round(dir_mom, 4),
+            "raw_gap_z_score":           round(gz, 4) if gz is not None else None,
+            "directional_gap_z_score":   round(dir_gz, 4) if dir_gz is not None else None,
+            "contract_price_change_5s":  round(chg5,  4) if chg5  is not None else None,
+            "contract_price_change_10s": round(chg10, 4) if chg10 is not None else None,
+            "contract_price_change_30s": round(chg30, 4) if chg30 is not None else None,
+            "contract_price_change_60s": round(chg60, 4) if chg60 is not None else None,
+        },
+    )
+
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 #
 # Active strategies are evaluated every poll cycle.
@@ -1622,6 +1810,7 @@ _STRATEGIES = [
     premium_no_midrange_scalp_v2,         # paper_active — NO only, 0.65–0.80 (v2, mid-gated + trail)
     premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
     early_overextension_reversal_scalp,   # watch_only research — never paper-traded
+    post_move_continuation_scalp,         # watch_only research — continuation scalp, never paper-traded
     # cheap_losing_contract_reversal_trail # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_losing_contract_late_reversal  # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
@@ -1634,6 +1823,7 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_continuation/v1/YES",  # YES-side PMC: watch-only
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
     "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
+    "post_move_continuation_scalp/v1",       # research only — continuation scalp hypothesis, not traded
     "cheap_losing_contract_reversal_trail/v1", # research only — 5 exit profiles simulated, not traded
     "cheap_losing_contract_late_reversal/v1",  # research only — late-window variant, not traded
 })

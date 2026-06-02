@@ -96,6 +96,28 @@ FOLLOWTHROUGH_PROFILES: dict[str, ExitProfile] = {
 FOLLOWTHROUGH_PROFILE_NAMES: list[str] = [FIXED_4C_STOP_6C.name, FIXED_5C_STOP_6C.name]
 
 
+# ── Absolute-cent exit tests for the post-move continuation hypothesis ─────────
+#
+#   test_a : take_profit +0.03, stop_loss -0.02, timeout 30s
+#   test_b : take_profit +0.04, stop_loss -0.03, timeout 45s
+#   test_c : take_profit +0.05, stop_loss -0.03, timeout 60s
+#   test_d : take_profit +0.06, stop_loss -0.04, timeout 60s
+#
+# ABSOLUTE dollar thresholds (cents of contract price); simulated via
+# simulate_exit_fixed_abs.  Used by scripts/post_move_continuation_backtest.py.
+POST_MOVE_TEST_A = ExitProfile("test_a", "fixed_abs", tp_abs=0.03, sl_abs=0.02, timeout_s=30.0)
+POST_MOVE_TEST_B = ExitProfile("test_b", "fixed_abs", tp_abs=0.04, sl_abs=0.03, timeout_s=45.0)
+POST_MOVE_TEST_C = ExitProfile("test_c", "fixed_abs", tp_abs=0.05, sl_abs=0.03, timeout_s=60.0)
+POST_MOVE_TEST_D = ExitProfile("test_d", "fixed_abs", tp_abs=0.06, sl_abs=0.04, timeout_s=60.0)
+
+POST_MOVE_PROFILES: dict[str, ExitProfile] = {
+    p.name: p for p in (POST_MOVE_TEST_A, POST_MOVE_TEST_B, POST_MOVE_TEST_C, POST_MOVE_TEST_D)
+}
+POST_MOVE_PROFILE_NAMES: list[str] = [
+    POST_MOVE_TEST_A.name, POST_MOVE_TEST_B.name, POST_MOVE_TEST_C.name, POST_MOVE_TEST_D.name,
+]
+
+
 @dataclass
 class PathPoint:
     """One post-entry observation of the bought (losing) side."""
