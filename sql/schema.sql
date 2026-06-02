@@ -531,3 +531,120 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
         FOREIGN KEY (run_id) REFERENCES backtest_runs (id)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+-- ---------------------------------------------------------------
+-- 12. followthrough_backtest_runs / followthrough_backtest_trades
+--     Dedicated tables for the follow-through filter hypothesis test
+--     (scripts/followthrough_backtest.py).  Stored ENTIRELY SEPARATELY
+--     from live paper_trades and from the generic backtest_* tables.
+--
+--     One backtest produces ALL base entries (premium NO continuation,
+--     0.65–0.80) with a followthrough_confirmed flag; the report derives
+--     Variant A (all base entries) vs Variant B (followthrough_confirmed only).
+--     One trade row per (base entry x exit_profile).
+--
+--     Fill model (NOT mid):  entry = ask + slippage,  exit = bid - slippage.
+--     PAPER-ONLY / BACKTEST-ONLY RESEARCH — no live trading, no order execution.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS followthrough_backtest_runs (
+    id                  BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    rule_name           VARCHAR(100) NOT NULL,          -- premium_no_continuation_065_080_v2
+    rule_version        VARCHAR(20)  NOT NULL,
+    slippage_mode       VARCHAR(12)  NOT NULL,          -- optimistic | realistic | harsh
+    exit_profiles       JSON,                           -- profile names + params simulated
+    params              JSON,                           -- gates, baseline, limits, windows …
+    timezone_used       VARCHAR(40),
+    baseline_volume_60s DECIMAL(14, 4) NULL,            -- run-level volume baseline (if used)
+
+    data_start          DATETIME(3),
+    data_end            DATETIME(3),
+    n_markets           INT          DEFAULT 0,
+    n_snapshots         INT          DEFAULT 0,
+    n_base_entries      INT          DEFAULT 0,         -- Variant A entry count
+    n_confirmed_entries INT          DEFAULT 0,         -- Variant B entry count
+    n_trades            INT          DEFAULT 0,         -- rows written (entries x profiles)
+
+    notes               TEXT,
+    created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_ftr_rule    (rule_name, rule_version),
+    INDEX idx_ftr_created (created_at)
+);
+
+CREATE TABLE IF NOT EXISTS followthrough_backtest_trades (
+    id                          BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    run_id                      BIGINT        NOT NULL,
+    rule_name                   VARCHAR(100)  NOT NULL,
+    rule_version                VARCHAR(20)   NOT NULL,
+    market_ticker               VARCHAR(100)  NOT NULL,
+    signal_seq                  INT,                       -- nth base entry within this run
+
+    -- base entry context
+    side_bought                 ENUM('YES', 'NO') NOT NULL,
+    market_phase                VARCHAR(20),
+    market_age_seconds          INT,
+    time_remaining_seconds      INT,
+    btc_price                   DECIMAL(14, 2),
+    target_price                DECIMAL(14, 2),
+    raw_gap_z_score             DECIMAL(10, 6),
+    directional_momentum        DECIMAL(10, 4),
+
+    -- NO contract quotes at entry
+    no_ask                      DECIMAL(6, 4),
+    no_bid                      DECIMAL(6, 4),
+    no_mid                      DECIMAL(6, 4),
+    spread                      DECIMAL(6, 4),
+    spread_bucket               VARCHAR(12),
+    volatility_regime           VARCHAR(12),
+
+    -- follow-through features (lookahead-safe, computed up to entry ts)
+    no_price_change_10s          DECIMAL(8, 4)  NULL,
+    no_price_change_30s          DECIMAL(8, 4)  NULL,
+    no_recent_high_30s           DECIMAL(6, 4)  NULL,
+    no_pullback_from_recent_high DECIMAL(8, 4)  NULL,
+    quote_update_count_60s       INT            NULL,
+    volume_60s                   DECIMAL(14, 4) NULL,
+    baseline_volume_60s          DECIMAL(14, 4) NULL,
+    participation_basis          VARCHAR(12)    NULL,    -- volume | quote_count
+    followthrough_confirmed      BOOLEAN        NOT NULL,
+    followthrough_failed         BOOLEAN        NOT NULL,
+    scalping_valid_window        BOOLEAN        NULL,
+
+    -- time-of-day (computed from entry timestamp in timezone_used)
+    entry_time                  DATETIME(3),
+    entry_date                  VARCHAR(10),
+    entry_hour                  INT,
+    entry_day_of_week           INT,
+    entry_day_name              VARCHAR(12),
+    entry_hour_block            VARCHAR(8),
+    entry_is_weekend            BOOLEAN        NULL,
+
+    -- fill model
+    slippage_mode               VARCHAR(12),
+    entry_price_simulated       DECIMAL(6, 4),            -- ask + slippage
+    entry_bid                   DECIMAL(6, 4),            -- bid at entry (path reference)
+
+    -- per-profile exit
+    exit_profile                VARCHAR(40)   NOT NULL,
+    peak_contract_price         DECIMAL(6, 4),
+    max_favorable_excursion     DECIMAL(8, 4),
+    max_adverse_excursion       DECIMAL(8, 4),
+    time_to_peak                DECIMAL(8, 3)  NULL,
+    exit_time                   DATETIME(3)    NULL,
+    exit_price_simulated        DECIMAL(6, 4)  NULL,      -- bid - slippage at exit
+    exit_reason                 VARCHAR(40)    NULL,
+    pnl                         DECIMAL(8, 4)  NULL,      -- exit_sim - entry_sim
+    pnl_percent                 DECIMAL(8, 4)  NULL,
+
+    n_updates                   INT            DEFAULT 0,
+    created_at                  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_ftt_run        (run_id),
+    INDEX idx_ftt_profile    (run_id, exit_profile),
+    INDEX idx_ftt_confirmed  (run_id, followthrough_confirmed),
+    INDEX idx_ftt_market     (market_ticker),
+
+    CONSTRAINT fk_ftt_run
+        FOREIGN KEY (run_id) REFERENCES followthrough_backtest_runs (id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
