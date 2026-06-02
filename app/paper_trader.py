@@ -130,6 +130,14 @@ _PNMS_TP_ABS        = 0.05   # take profit: +5 cents from simulated entry
 _PNMS_SL_ABS        = 0.03   # stop loss:   -3 cents from simulated entry
 # trailing stop disabled for v1
 
+# premium_no_midrange_scalp_v2 (NO side only) — trailing stop arms after +4c
+_PNMS_V2_TIMEOUT_S     = 60
+_PNMS_V2_NEAR_EXPIRY_S = 30
+_PNMS_V2_TP_ABS        = 0.05   # take profit:   +5 cents
+_PNMS_V2_SL_ABS        = 0.04   # stop loss:     -4 cents
+_PNMS_V2_TRAIL_ARM     = 0.04   # trailing arms once up +4 cents
+_PNMS_V2_TRAIL_DIST    = 0.02   # trailing gives back 2 cents from peak
+
 ExitFn = Callable[["OpenTrade", float, float, float], Optional[str]]
 
 
@@ -224,11 +232,40 @@ def _exit_premium_no_midrange_scalp(
     return None
 
 
+def _exit_premium_no_midrange_scalp_v2(
+    trade: OpenTrade,
+    mid: float,
+    time_remaining_seconds: float,
+    elapsed_seconds: float,
+) -> Optional[str]:
+    """
+    Exit rules for premium_no_midrange_scalp_v2/v2 (NO side only).
+    Priority: near_expiry → take_profit → stop_loss → trailing_stop → timeout_60s.
+    Trailing stop only arms after the position is up at least +4c (peak >= entry+0.04).
+    Fills use ask+slip at entry and bid-slip at exit (never mid).
+    """
+    entry = trade.entry_price
+    peak  = trade.peak_price
+
+    if time_remaining_seconds <= _PNMS_V2_NEAR_EXPIRY_S:
+        return "near_expiry"
+    if mid >= entry + _PNMS_V2_TP_ABS:
+        return "take_profit"
+    if mid <= entry - _PNMS_V2_SL_ABS:
+        return "stop_loss"
+    if peak >= entry + _PNMS_V2_TRAIL_ARM and mid <= peak - _PNMS_V2_TRAIL_DIST:
+        return "trailing_stop"
+    if elapsed_seconds >= _PNMS_V2_TIMEOUT_S:
+        return "timeout_60s"
+    return None
+
+
 _EXIT_DISPATCH: dict[str, ExitFn] = {
     "cheap_reversal_scalp/v1":           _exit_cheap_reversal_scalp,
     "premium_momentum_continuation/v1":  _exit_premium_momentum_continuation,
     "premium_momentum_scalp/v2":         _exit_premium_momentum_scalp_v2,
     "premium_no_midrange_scalp/v1":      _exit_premium_no_midrange_scalp,
+    "premium_no_midrange_scalp_v2/v2":   _exit_premium_no_midrange_scalp_v2,
 }
 
 

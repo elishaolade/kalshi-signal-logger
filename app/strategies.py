@@ -738,6 +738,151 @@ def premium_no_midrange_scalp(
     )
 
 
+# ── premium_no_midrange_scalp_v2 (NO 0.65–0.80, trailing + hour filter) ────────
+#
+# v2 is a CLEAN follow-up test of the only paper branch with positive
+# expectancy: NO contracts priced 0.65–0.80 in the last 3–5 minutes.  It runs
+# in PARALLEL with v1 (both paper_active) so v1 vs v2 can be compared directly.
+# Differences from v1: (a) gate on contract_price (mid) in the 0.65–0.80 band to
+# match the winning bucket exactly; (b) drop the gap_z gate (momentum-only
+# confirmation, per spec); (c) skip weekday 9/10 AM ET (applied in run_all);
+# (d) trailing exit that arms only after +4c (configured in paper_trader).
+# PAPER-ONLY: no live trading, no order execution.
+_PNMS_V2_RULE_NAME    = "premium_no_midrange_scalp_v2"
+_PNMS_V2_RULE_VERSION = "v2"
+
+_PNMS_V2_MIN_TIME_REMAINING = 180   # seconds
+_PNMS_V2_MAX_TIME_REMAINING = 300   # seconds
+_PNMS_V2_MIN_PRICE          = 0.65  # contract_price (mid) floor
+_PNMS_V2_MAX_PRICE          = 0.80  # contract_price (mid) ceiling
+_PNMS_V2_MAX_SPREAD         = 0.03
+_PNMS_V2_MIN_DIR_MOMENTUM   = 3.0   # NO confirmation: −raw_momentum_score ≥ 3
+_PNMS_V2_MOMENTUM_N         = 10
+_PNMS_V2_SKIP_HOURS: frozenset[int] = frozenset({9, 10})  # weekday ET hours blocked
+
+
+def premium_no_midrange_scalp_v2(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Premium NO mid-range scalp, v2 (PAPER-ONLY — no live trading).
+
+    Focuses on the single paper branch with positive expectancy in the live
+    sample: NO side, contract_price 0.65–0.80, last 3–5 minutes.  Kept as a
+    separate rule_name/version so v1 and v2 run in parallel for comparison.
+
+    Entry conditions
+    ----------------
+    1. Side = NO only (YES never entered)
+    2. 180 ≤ time_remaining_seconds ≤ 300
+    3. Momentum confirms NO: −raw_momentum_score ≥ 3
+    4. contract_price (mid) in [0.65, 0.80]   (avoid <0.65 or >0.80)
+    5. Spread ≤ 0.03
+    6. (run_all) skip weekday 9/10 AM ET → marked watch_only, not traded
+
+    Exit conditions live in app.paper_trader (_exit_premium_no_midrange_scalp_v2):
+    take-profit +5c, stop −4c, trailing arms only after +4c, timeout/near-expiry.
+    """
+    side = "NO"
+
+    # ── 1. Time-window gate ───────────────────────────────────────────────────
+    if not (_PNMS_V2_MIN_TIME_REMAINING <= time_remaining_seconds <= _PNMS_V2_MAX_TIME_REMAINING):
+        logger.debug(
+            "%s: skip — remaining=%.0fs outside [%d, %d]",
+            _PNMS_V2_RULE_NAME, time_remaining_seconds,
+            _PNMS_V2_MIN_TIME_REMAINING, _PNMS_V2_MAX_TIME_REMAINING,
+        )
+        return None
+
+    # ── 2. Feature computation ────────────────────────────────────────────────
+    mom  = momentum_score(ticks, n=_PNMS_V2_MOMENTUM_N)
+    rev  = reversal_score(ticks, side, n=_PNMS_V2_MOMENTUM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, side)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+
+    # ── 3. Momentum confirmation (NO side: flip sign) ─────────────────────────
+    dir_mom = -mom
+    if dir_mom < _PNMS_V2_MIN_DIR_MOMENTUM:
+        logger.debug(
+            "%s: skip — directional_mom=%.2f < %.1f  (raw_mom=%.2f)",
+            _PNMS_V2_RULE_NAME, dir_mom, _PNMS_V2_MIN_DIR_MOMENTUM, mom,
+        )
+        return None
+
+    # ── 4. NO contract price (mid) and spread ─────────────────────────────────
+    quotes = contract_prices.get(side, {})
+    ask    = quotes.get("ask_price", 0.0)
+    bid    = quotes.get("bid_price", 0.0)
+    mid    = quotes.get("mid_price", 0.0)
+    spread = quotes.get("spread",    0.0)
+
+    if not (_PNMS_V2_MIN_PRICE <= mid <= _PNMS_V2_MAX_PRICE):
+        logger.debug(
+            "%s: skip — NO contract_price=%.4f outside [%.2f, %.2f]",
+            _PNMS_V2_RULE_NAME, mid, _PNMS_V2_MIN_PRICE, _PNMS_V2_MAX_PRICE,
+        )
+        return None
+
+    if spread > _PNMS_V2_MAX_SPREAD:
+        logger.debug(
+            "%s: skip — spread=%.4f > %.2f", _PNMS_V2_RULE_NAME, spread, _PNMS_V2_MAX_SPREAD,
+        )
+        return None
+
+    # ── 5. Build signal ───────────────────────────────────────────────────────
+    vel_s  = f"{vel:+.2f}$/s" if vel is not None else "n/a"
+    gz_s   = f"{gz:+.4f}"     if gz  is not None else "n/a"
+    reason = (
+        f"{_PNMS_V2_RULE_NAME} {_PNMS_V2_RULE_VERSION}: {side} @ mid={mid:.4f} "
+        f"ask={ask:.4f} | dir_mom={dir_mom:+.0f} gz_raw={gz_s} vel={vel_s} | "
+        f"btc={btc_price:,.2f} target={target_price:,.2f} gap={g:+.2f} "
+        f"remaining={time_remaining_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _PNMS_V2_RULE_NAME,
+        rule_version           = _PNMS_V2_RULE_VERSION,
+        side                   = side,
+
+        contract_price         = mid,
+        bid_price              = bid,
+        ask_price              = ask,
+        spread                 = spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "paper_active",
+    )
+
+
 # ── early_overextension_reversal_scalp ────────────────────────────────────────
 
 _EOR_RULE_NAME    = "early_overextension_reversal_scalp"
@@ -1473,11 +1618,12 @@ def cheap_losing_contract_late_reversal(
 
 _STRATEGIES = [
     premium_momentum_continuation,        # NO-side active; YES-side watch_only (see below)
-    premium_no_midrange_scalp,            # paper_active — NO only, 0.65–0.80
+    premium_no_midrange_scalp,            # paper_active — NO only, 0.65–0.80 (v1, ask-gated)
+    premium_no_midrange_scalp_v2,         # paper_active — NO only, 0.65–0.80 (v2, mid-gated + trail)
     premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
     early_overextension_reversal_scalp,   # watch_only research — never paper-traded
-    cheap_losing_contract_reversal_trail, # watch_only research — never paper-traded (early)
-    cheap_losing_contract_late_reversal,  # watch_only research — never paper-traded (late)
+    # cheap_losing_contract_reversal_trail # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
+    # cheap_losing_contract_late_reversal  # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
 ]
 
@@ -1625,6 +1771,23 @@ def run_all(
                     "PMC v1 forward-test filter: %s %s → watch_only (%s)",
                     rule_base, result.side, _pmc_reject,
                 )
+
+        # ── PNMS v2 weekday 9/10 AM ET skip ────────────────────────────────────
+        # entry_hour / entry_is_weekend are attached above (not available inside
+        # the strategy fn), so the hour skip is applied here.  Signal is still
+        # logged for offline analysis but marked watch_only → not paper-traded.
+        if (
+            result.rule_name    == _PNMS_V2_RULE_NAME
+            and result.rule_version == _PNMS_V2_RULE_VERSION
+            and result.signal_status != "watch_only"
+            and result.entry_hour in _PNMS_V2_SKIP_HOURS
+            and result.entry_is_weekend is False
+        ):
+            result.signal_status = "watch_only"
+            logger.info(
+                "PNMS v2 hour filter: weekday %02d:xx ET blocked → watch_only",
+                result.entry_hour,
+            )
 
         signals.append(result)
 

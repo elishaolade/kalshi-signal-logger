@@ -2,11 +2,12 @@
 """
 pnms_report.py — Performance report focused on premium_no_midrange_scalp/v1.
 
-Proves or disproves the PNMS hypothesis against three comparison baselines:
-  1. PNMS v1                    premium_no_midrange_scalp / v1
-  2. PMC NO 0.65–0.80           premium_momentum_continuation / NO / ask 0.65–0.80
-  3. PMC YES                    premium_momentum_continuation / YES
-  4. CRS                        cheap_reversal_scalp
+Proves or disproves the PNMS hypothesis and compares v1 vs v2:
+  1. PNMS v1                    premium_no_midrange_scalp / v1     (ask-gated)
+  2. PNMS v2                    premium_no_midrange_scalp_v2 / v2  (mid-gated + trail)
+  3. PMC NO 0.65–0.80           premium_momentum_continuation / NO / ask 0.65–0.80
+  4. PMC YES                    premium_momentum_continuation / YES
+  5. CRS                        cheap_reversal_scalp
 
 Directional metrics (momentum_score, gap_z_score) are sign-flipped for NO
 trades so that positive always means "confirms the traded direction."
@@ -62,6 +63,9 @@ _DAY_ORDER = [
 _DIR_MOM_ORDER = ["≤-5", "-5 to -3", "-3 to 0", "0", "0 to 3", "3 to 5", ">5", "N/A"]
 _DIR_GZ_ORDER  = ["≤-2", "-2 to -1", "-1 to 0", "0 to 1", "1 to 2", "≥2", "N/A"]
 _SPREAD_ORDER  = ["<0.01", "0.01-0.02", "0.02-0.03", "0.03+", "N/A"]
+_SIDE_ORDER    = ["NO", "YES", "N/A"]
+_PRICE_ORDER   = ["<0.65", "0.65-0.70", "0.70-0.75", "0.75-0.80", "0.80+", "N/A"]
+_TR_ORDER      = ["<180", "180-240", "240-300", "300+", "N/A"]
 
 
 # ── SQL ────────────────────────────────────────────────────────────────────────
@@ -78,7 +82,8 @@ _QUERY = """
         CAST(s.contract_price AS DOUBLE)  AS contract_price,
         CAST(s.spread         AS DOUBLE)  AS spread,
         CAST(s.momentum_score AS DOUBLE)  AS momentum_score,
-        CAST(s.gap_z_score    AS DOUBLE)  AS gap_z_score
+        CAST(s.gap_z_score    AS DOUBLE)  AS gap_z_score,
+        s.time_remaining_seconds          AS time_remaining_seconds
     FROM paper_trades pt
     LEFT JOIN signals s ON pt.signal_id = s.id
     WHERE pt.exit_time IS NOT NULL
@@ -102,10 +107,18 @@ def _fv(row: dict, key: str) -> Optional[float]:
 _GROUPS: list[dict[str, Any]] = [
     {
         "label": "PNMS v1",
-        "desc":  "premium_no_midrange_scalp / v1",
+        "desc":  "premium_no_midrange_scalp / v1 (ask-gated)",
         "filter": lambda r: (
             r.get("rule_name") == _PNMS_RULE
             and r.get("rule_version") == _PNMS_VER
+        ),
+    },
+    {
+        "label": "PNMS v2",
+        "desc":  "premium_no_midrange_scalp_v2 / v2 (mid-gated + trailing stop)",
+        "filter": lambda r: (
+            r.get("rule_name") == "premium_no_midrange_scalp_v2"
+            and r.get("rule_version") == "v2"
         ),
     },
     {
@@ -207,6 +220,30 @@ def _b_hour(r: dict) -> str:
 
 def _b_day(r: dict) -> str:
     return str(r.get("entry_day_name") or "N/A")
+
+
+def _b_side(r: dict) -> str:
+    return str(r.get("side") or "N/A")
+
+
+def _b_price(r: dict) -> str:
+    p = _fv(r, "contract_price")
+    if p is None:  return "N/A"
+    if p < 0.65:   return "<0.65"
+    if p < 0.70:   return "0.65-0.70"
+    if p < 0.75:   return "0.70-0.75"
+    if p < 0.80:   return "0.75-0.80"
+    return                "0.80+"
+
+
+def _b_time_remaining(r: dict) -> str:
+    t = r.get("time_remaining_seconds")
+    if t is None:  return "N/A"
+    t = float(t)
+    if t < 180:    return "<180"
+    if t < 240:    return "180-240"
+    if t < 300:    return "240-300"
+    return                "300+"
 
 
 def _b_spread(r: dict) -> str:
@@ -441,6 +478,22 @@ def print_group_report(
     md += _print_core(m)
 
     md += _print_bd_table(
+        "Side",
+        breakdown(rows, _b_side, _SIDE_ORDER),
+    )
+
+    md += _print_bd_table(
+        "Contract Price Bucket",
+        breakdown(rows, _b_price, _PRICE_ORDER),
+    )
+
+    md += _print_bd_table(
+        "Time Remaining Bucket (seconds)",
+        breakdown(rows, _b_time_remaining, _TR_ORDER),
+        note="N/A = signals without time_remaining_seconds recorded.",
+    )
+
+    md += _print_bd_table(
         "Exit Reason",
         breakdown(rows, _b_exit, _EXIT_ORDER),
     )
@@ -573,7 +626,7 @@ def write_md(lines: list[str]) -> Path:
     out_path = out_dir / f"pnms_report_{today.strftime('%Y_%m_%d')}.md"
 
     header = [
-        f"# PNMS v1 — Performance Report  {today.isoformat()}",
+        f"# PNMS v1 vs v2 — Performance Report  {today.isoformat()}",
         "",
         "> ⚠ **PAPER TRADING ONLY** — this report makes no live trading recommendations.",
         "",
@@ -590,7 +643,7 @@ def main() -> None:
     all_rows = _load()
 
     print(f"\n{'═' * _W}")
-    print("  PNMS v1 — Performance Report")
+    print("  PNMS v1 vs v2 — Performance Report")
     print(f"{'═' * _W}")
     print(
         "  ⚠  PAPER TRADING ONLY — no live trading recommendations are made.\n"
