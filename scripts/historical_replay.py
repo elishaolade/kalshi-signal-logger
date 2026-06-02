@@ -26,8 +26,19 @@ Fill model (NOT mid):  entry = ask + slippage,  exit = bid - slippage.
 PAPER-ONLY RESEARCH.  This script never trades and never enables order
 execution; it only reads snapshots and writes simulated results.
 
+Supported rules (--rule): cheap_losing_contract_reversal_trail,
+premium_no_midrange_scalp, premium_no_midrange_scalp_v2,
+premium_momentum_continuation.  For the premium/momentum rules the replayer
+re-applies run_all's post-signal gating (watch-only keys, PNMS v2 weekday
+9/10 AM ET skip, PMC v1 price/hour/gap_z filter) so the backtest only counts
+entries that would actually be paper-traded live — all lookahead-safe.
+
 Usage
 -----
+    # Backtest the promising bucket (NO, 0.65–0.80, spread<=0.03, 180–300s,
+    # momentum-confirmed, weekday 9/10 AM ET skipped):
+    python scripts/historical_replay.py --rule premium_no_midrange_scalp_v2
+
     python scripts/historical_replay.py \
         [--rule cheap_losing_contract_reversal_trail] [--version v1] \
         [--slippage realistic] [--profiles a,b,c] \
@@ -57,7 +68,26 @@ from app.exit_simulator import (
     simulate_exit,
 )
 from app.features import Tick, build_time_features, rolling_std, volatility_regime
-from app.strategies import Signal, cheap_losing_contract_reversal_trail
+from app.strategies import (
+    Signal,
+    cheap_losing_contract_reversal_trail,
+    premium_momentum_continuation,
+    premium_no_midrange_scalp,
+    premium_no_midrange_scalp_v2,
+    # filter constants — replicated below so the backtest only counts entries
+    # that would actually be paper-traded live (run_all applies these AFTER the
+    # strategy fn returns; the replayer drives the raw fn so it must re-apply them).
+    _PMC_FILTER_MAX_GAP_Z,
+    _PMC_FILTER_MAX_PRICE,
+    _PMC_FILTER_MIN_PRICE,
+    _PMC_FILTER_SKIP_HOURS,
+    _PMC_RULE_NAME,
+    _PMC_RULE_VERSION,
+    _PNMS_V2_RULE_NAME,
+    _PNMS_V2_RULE_VERSION,
+    _PNMS_V2_SKIP_HOURS,
+    _WATCH_ONLY_KEYS,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("historical_replay")
@@ -69,11 +99,23 @@ _SLIPPAGE: dict[str, tuple[float, float]] = {
     "harsh":      (0.02, 0.02),
 }
 
-# Strategies the replayer knows how to drive (entry fn + the side it buys).
-# Only cheap_losing_contract_reversal_trail is supported for now — its Signal
-# already carries the bought (losing) side and a rich `extra` context dict.
+# Strategies the replayer knows how to drive.  Each entry fn returns a Signal
+# whose `side` is the bought side; the forward path is simulated against that
+# side's observed bid.  CLC carries a rich `extra` context dict; the premium
+# scalp / momentum rules do not — _insert_trade falls back to Signal fields.
 _STRATEGY_FNS = {
     "cheap_losing_contract_reversal_trail": cheap_losing_contract_reversal_trail,
+    "premium_no_midrange_scalp":            premium_no_midrange_scalp,
+    "premium_no_midrange_scalp_v2":         premium_no_midrange_scalp_v2,
+    "premium_momentum_continuation":        premium_momentum_continuation,
+}
+
+# Default rule_version per rule (used when --version is not given on the CLI).
+_RULE_DEFAULT_VERSION = {
+    "cheap_losing_contract_reversal_trail": "v1",
+    "premium_no_midrange_scalp":            "v1",
+    "premium_no_midrange_scalp_v2":         "v2",
+    "premium_momentum_continuation":        "v1",
 }
 
 _DEFAULT_COOLDOWN_S = 30.0
@@ -92,6 +134,48 @@ def _null_reversal_prob(**_kwargs: Any) -> dict[str, Any]:
         "confidence_label":           "insufficient_data",
         "match_level":                "none",
     }
+
+
+# ── run_all-equivalent entry filters (lookahead-safe) ─────────────────────────
+
+def _passes_live_filters(sig: Signal, tf: dict) -> Optional[str]:
+    """
+    Replicate the post-signal gating that app.strategies.run_all applies AFTER a
+    strategy fn returns, so the backtest only counts entries that would actually
+    open a paper trade live.  Returns a reject reason string, or None if the
+    signal would be paper-traded.
+
+    Covers:
+      • watch-only rule/side keys (e.g. PMC YES is watch-only)
+      • PNMS v2 weekday 9/10 AM ET skip
+      • PMC v1 forward-test filter (price 0.65–0.80, weekday 9/10 AM skip,
+        raw gap_z >= 2 rejection)
+
+    Uses only entry-time features (tf from build_time_features) — no lookahead.
+    """
+    rule_base = f"{sig.rule_name}/{sig.rule_version}"
+    rule_side = f"{rule_base}/{sig.side}"
+    if rule_base in _WATCH_ONLY_KEYS or rule_side in _WATCH_ONLY_KEYS:
+        return f"watch_only_key:{rule_side}"
+
+    hour       = tf.get("hour")
+    is_weekend = tf.get("is_weekend")
+
+    # PNMS v2 weekday 9/10 AM ET skip
+    if sig.rule_name == _PNMS_V2_RULE_NAME and sig.rule_version == _PNMS_V2_RULE_VERSION:
+        if hour in _PNMS_V2_SKIP_HOURS and is_weekend is False:
+            return f"pnms_v2_hour_skip:{hour:02d}ET"
+
+    # PMC v1 forward-test filter
+    if sig.rule_name == _PMC_RULE_NAME and sig.rule_version == _PMC_RULE_VERSION:
+        if not (_PMC_FILTER_MIN_PRICE <= sig.contract_price <= _PMC_FILTER_MAX_PRICE):
+            return f"pmc_price_filter:{sig.contract_price:.4f}"
+        if hour in _PMC_FILTER_SKIP_HOURS and is_weekend is False:
+            return f"pmc_hour_skip:{hour:02d}ET"
+        if sig.gap_z_score is not None and sig.gap_z_score >= _PMC_FILTER_MAX_GAP_Z:
+            return f"pmc_gap_z_filter:{sig.gap_z_score:+.4f}"
+
+    return None
 
 
 # ── Reconstructed snapshot ──────────────────────────────────────────────────────
@@ -114,6 +198,7 @@ class _RunCounters:
     n_markets:   int = 0
     n_snapshots: int = 0
     n_signals:   int = 0
+    n_filtered:  int = 0          # raw entries rejected by run_all-equivalent filters
     n_trades:    int = 0
     data_start:  Optional[datetime] = None
     data_end:    Optional[datetime] = None
@@ -281,8 +366,18 @@ def _replay_market(
         if sig is None:
             continue
 
+        # Apply run_all-equivalent entry filters (lookahead-safe — uses only the
+        # entry-time features) so the backtest mirrors what would be paper-traded.
+        tf = build_time_features(s.recorded_at, tz=timezone_name)
+        reject = _passes_live_filters(sig, tf)
+        if reject is not None:
+            counters.n_filtered += 1
+            logger.debug("filtered entry %s/%s %s @ %s — %s",
+                         sig.rule_name, sig.rule_version, sig.side, s.recorded_at, reject)
+            continue
+
         latest_exit_ts = _take_signal(
-            sig, s, i, snaps,
+            sig, s, i, snaps, tf,
             entry_add=entry_add, exit_sub=exit_sub, slippage_mode=slippage_mode,
             profile_names=profile_names, timezone_name=timezone_name,
             rule_name=rule_name, rule_version=rule_version,
@@ -297,6 +392,7 @@ def _take_signal(
     entry_snap: _Snapshot,
     entry_idx: int,
     snaps: list[_Snapshot],
+    tf: dict,
     *,
     entry_add: float,
     exit_sub: float,
@@ -333,7 +429,6 @@ def _take_signal(
         ))
 
     extra = sig.extra or {}
-    tf    = build_time_features(entry_snap.recorded_at, tz=timezone_name)
     counters.n_signals += 1
     seq = counters.n_signals
 
@@ -447,13 +542,17 @@ def _insert_trade(
         (
             run_id, rule_name, rule_version, sig.market_ticker, seq,
             extra.get("setup_type"), extra.get("market_phase"),
-            extra.get("market_age_seconds"), sig.time_remaining_seconds,
+            # Fall back to the snapshot/Signal when the strategy carries no `extra`
+            # (premium scalp / momentum rules don't populate the CLC context dict).
+            extra.get("market_age_seconds", sig.contract_age_seconds),
+            sig.time_remaining_seconds,
             sig.side, extra.get("winning_side"), extra.get("losing_side"),
             sig.btc_price, sig.target_price,
-            extra.get("raw_gap_z_score"), extra.get("adverse_z_score"),
-            extra.get("losing_contract_ask"), extra.get("losing_contract_bid"),
-            extra.get("losing_contract_spread"),
-            extra.get("volatility_regime"), extra.get("whipsaw_score"),
+            extra.get("raw_gap_z_score", sig.gap_z_score), extra.get("adverse_z_score"),
+            extra.get("losing_contract_ask", sig.ask_price),
+            extra.get("losing_contract_bid", sig.bid_price),
+            extra.get("losing_contract_spread", sig.spread),
+            extra.get("volatility_regime", snap.vol_regime), extra.get("whipsaw_score"),
             snap.recorded_at, tf["date"], tf["hour"], tf["day_of_week"],
             tf["day_name"], tf["hour_block"],
             slippage_mode, entry_sim, entry_bid,
@@ -469,8 +568,11 @@ def _insert_trade(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Lookahead-safe historical replay backtester")
-    ap.add_argument("--rule", default="cheap_losing_contract_reversal_trail")
-    ap.add_argument("--version", default="v1")
+    ap.add_argument("--rule", default="cheap_losing_contract_reversal_trail",
+                    choices=sorted(_STRATEGY_FNS))
+    ap.add_argument("--version", default=None,
+                    help="rule_version; defaults per-rule (e.g. v2 for "
+                         "premium_no_midrange_scalp_v2)")
     ap.add_argument("--slippage", default=SLIPPAGE_MODE, choices=sorted(_SLIPPAGE))
     ap.add_argument("--profiles", default=",".join(DEFAULT_PROFILE_NAMES),
                     help="comma-separated exit-profile names")
@@ -486,6 +588,8 @@ def main() -> None:
     if strategy_fn is None:
         ap.error(f"Unsupported rule '{args.rule}'. Supported: {sorted(_STRATEGY_FNS)}")
 
+    rule_version = args.version or _RULE_DEFAULT_VERSION.get(args.rule, "v1")
+
     profile_names = [p.strip() for p in args.profiles.split(",") if p.strip()]
     unknown = [p for p in profile_names if p not in BACKTEST_PROFILES]
     if unknown:
@@ -495,7 +599,7 @@ def main() -> None:
 
     markets = _load_markets(args.start, args.end, args.limit_markets)
     logger.info("Replaying %d market(s)  rule=%s/%s  slippage=%s  profiles=%s",
-                len(markets), args.rule, args.version, args.slippage, profile_names)
+                len(markets), args.rule, rule_version, args.slippage, profile_names)
 
     params = {
         "cooldown_seconds": args.cooldown_seconds,
@@ -504,9 +608,11 @@ def main() -> None:
         "min_ticks": _MIN_TICKS, "window_keep_s": _WINDOW_KEEP_S,
         "reversal_prob": "null_provider (lookahead-safe)",
         "fill_model": "entry=ask+slip, exit=bid-slip",
+        "entry_filters": "run_all-equivalent (watch_only keys, PNMS v2 9/10 AM "
+                         "ET skip, PMC v1 price/hour/gap_z filter)",
     }
     run_id = _insert_run(
-        rule_name=args.rule, rule_version=args.version, slippage_mode=args.slippage,
+        rule_name=args.rule, rule_version=rule_version, slippage_mode=args.slippage,
         profile_names=profile_names, params=params, timezone_name=args.timezone,
     )
     counters = _RunCounters()
@@ -518,7 +624,7 @@ def main() -> None:
             snaps = _load_snapshots(ticker, args.start, args.end)
             _replay_market(
                 m, btc, snaps,
-                strategy_fn=strategy_fn, rule_name=args.rule, rule_version=args.version,
+                strategy_fn=strategy_fn, rule_name=args.rule, rule_version=rule_version,
                 entry_add=entry_add, exit_sub=exit_sub, slippage_mode=args.slippage,
                 profile_names=profile_names, cooldown_s=args.cooldown_seconds,
                 timezone_name=args.timezone, run_id=run_id, counters=counters,
@@ -530,9 +636,10 @@ def main() -> None:
     _finalize_run(run_id, counters, args.notes)
 
     logger.info(
-        "Backtest run #%d complete — markets=%d snapshots=%d signals=%d trades=%d",
+        "Backtest run #%d complete — markets=%d snapshots=%d signals=%d "
+        "filtered=%d trades=%d",
         run_id, counters.n_markets, counters.n_snapshots,
-        counters.n_signals, counters.n_trades,
+        counters.n_signals, counters.n_filtered, counters.n_trades,
     )
     print(f"\nBacktest run #{run_id} written.  "
           f"Generate the report with:\n"

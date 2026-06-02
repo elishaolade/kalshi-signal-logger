@@ -105,12 +105,17 @@ def _b_phase(r: dict) -> str:
 
 
 def _b_price(r: dict) -> str:
+    """Entry-side ask price bucket — covers both cheap (CLC) and premium (PNMS/PMC) ranges."""
     a = _fv(r, "losing_contract_ask")
     if a is None:  return "N/A"
     if a < 0.10:   return "0.05-0.10"
     if a < 0.20:   return "0.10-0.20"
     if a < 0.30:   return "0.20-0.30"
-    return                "0.30+"
+    if a < 0.65:   return "0.30-0.65"
+    if a < 0.70:   return "0.65-0.70"
+    if a < 0.75:   return "0.70-0.75"
+    if a < 0.80:   return "0.75-0.80"
+    return                "0.80+"
 
 
 def _b_hour(r: dict) -> str:
@@ -121,8 +126,24 @@ def _b_day(r: dict) -> str:
     return r.get("entry_day_name") or "N/A"
 
 
+def _b_side(r: dict) -> str:
+    return r.get("side_bought") or "N/A"
+
+
+def _b_time_remaining(r: dict) -> str:
+    t = _fv(r, "time_remaining_seconds")
+    if t is None:  return "N/A"
+    if t < 180:    return "<180"
+    if t < 240:    return "180-240"
+    if t < 300:    return "240-300"
+    return                "300+"
+
+
 _PHASE_ORDER = ["first_2min", "min_2_to_3", "unknown"]
-_PRICE_ORDER = ["0.05-0.10", "0.10-0.20", "0.20-0.30", "0.30+", "N/A"]
+_PRICE_ORDER = ["0.05-0.10", "0.10-0.20", "0.20-0.30", "0.30-0.65",
+                "0.65-0.70", "0.70-0.75", "0.75-0.80", "0.80+", "N/A"]
+_SIDE_ORDER  = ["NO", "YES", "N/A"]
+_TR_ORDER    = ["<180", "180-240", "240-300", "300+", "N/A"]
 _DAY_ORDER   = ["Monday", "Tuesday", "Wednesday", "Thursday",
                 "Friday", "Saturday", "Sunday", "N/A"]
 
@@ -274,10 +295,12 @@ def main() -> None:
         print(f"\n{'═' * _W}\n  PROFILE: {p}   (n={len(prows)})\n{'═' * _W}")
         md += [f"## Profile: `{p}`  (n={len(prows)})", ""]
         md += _exit_reason_block(prows)
-        md += _print_table(f"[{p}] by market phase", breakdown(prows, _b_phase, _PHASE_ORDER))
-        md += _print_table(f"[{p}] by price bucket", breakdown(prows, _b_price, _PRICE_ORDER))
-        md += _print_table(f"[{p}] by hour block",   breakdown(prows, _b_hour))
-        md += _print_table(f"[{p}] by day",          breakdown(prows, _b_day, _DAY_ORDER))
+        md += _print_table(f"[{p}] by side",          breakdown(prows, _b_side, _SIDE_ORDER))
+        md += _print_table(f"[{p}] by market phase",   breakdown(prows, _b_phase, _PHASE_ORDER))
+        md += _print_table(f"[{p}] by ask price bucket", breakdown(prows, _b_price, _PRICE_ORDER))
+        md += _print_table(f"[{p}] by time remaining",  breakdown(prows, _b_time_remaining, _TR_ORDER))
+        md += _print_table(f"[{p}] by hour block",     breakdown(prows, _b_hour))
+        md += _print_table(f"[{p}] by day",            breakdown(prows, _b_day, _DAY_ORDER))
 
     print(f"\n{'═' * _W}\n")
     path = write_md(md, run_id)
