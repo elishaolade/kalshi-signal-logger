@@ -757,3 +757,140 @@ CREATE TABLE IF NOT EXISTS post_move_continuation_signals (
         FOREIGN KEY (run_id) REFERENCES post_move_continuation_runs (id)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+
+-- ============================================================================
+-- 14. dcvrb_observations
+--     WATCH-ONLY research for delayed_contract_value_reversal_bounce/v1.
+--     Tracks whether a losing contract that collapsed early into the 0.20–0.40
+--     range produces a short +3¢–+6¢ bounce in contract value after a flush.
+--
+--     One row per (signal × comparison_version × exit_test) = 12 rows per signal.
+--     All 12 rows share the same forward bid path from signal time.
+--
+--     Comparison versions:
+--       v1  immediate   — hypothetical entry at watch_start_contract_ask + slippage
+--       v2  2c+1c       — entry at signal-time ask + slippage (main signal)
+--       v3  5c+2c       — same entry as v2 but only when flush ≥ 5¢ AND bounce ≥ 2¢
+--
+--     Exit tests:
+--       test_a  tp +0.03  sl -0.02  timeout  45s
+--       test_b  tp +0.04  sl -0.03  timeout  60s
+--       test_c  tp +0.05  sl -0.03  timeout  75s
+--       test_d  tp +0.06  sl -0.04  timeout  90s
+--
+--     Fill model: entry = ask + slippage,  exit = bid - slippage.
+--     PAPER-ONLY — no live trading, no order execution.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dcvrb_observations (
+    id                              BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    signal_id                       BIGINT        NULL,
+    market_ticker                   VARCHAR(100)  NOT NULL,
+    rule_name                       VARCHAR(100)  NOT NULL,
+    rule_version                    VARCHAR(20)   NOT NULL,
+    side                            ENUM('YES', 'NO') NOT NULL,  -- losing (tracked) side
+
+    -- Stage 1 watch-state context (from signal.extra)
+    contract_open_price             DECIMAL(6, 4)  NULL,
+    contract_recent_high            DECIMAL(6, 4)  NULL,
+    watch_start_contract_ask        DECIMAL(6, 4)  NULL,
+    watch_start_contract_bid        DECIMAL(6, 4)  NULL,
+    drop_from_open                  DECIMAL(8, 4)  NULL,
+    drop_from_recent_high           DECIMAL(8, 4)  NULL,
+    spread_at_watch                 DECIMAL(6, 4)  NULL,
+    volatility_60s_at_watch         DECIMAL(10, 6) NULL,
+
+    -- Stage 2/3 flush + bounce metrics
+    local_low_since_watch           DECIMAL(6, 4)  NULL,
+    drop_from_watch_start           DECIMAL(8, 4)  NULL,
+    extra_flush                     DECIMAL(8, 4)  NULL,
+    bounce_from_local_low           DECIMAL(8, 4)  NULL,
+    extra_flush_bucket              VARCHAR(12)    NULL,   -- 0.02-0.03 | 0.03-0.05 | 0.05+
+    bounce_bucket                   VARCHAR(12)    NULL,   -- 0.01-0.02 | 0.02+
+    strong_bounce                   BOOLEAN        NULL,
+    price_bucket                    VARCHAR(12)    NULL,   -- 0.20-0.25 | 0.25-0.30 | 0.30-0.35 | 0.35-0.40
+
+    -- Signal-time contract quotes
+    contract_ask                    DECIMAL(6, 4)  NULL,
+    contract_bid                    DECIMAL(6, 4)  NULL,
+    spread                          DECIMAL(6, 4)  NULL,
+
+    -- Contract price changes at signal time (losing-side mid series)
+    contract_price_change_5s        DECIMAL(8, 4)  NULL,
+    contract_price_change_10s       DECIMAL(8, 4)  NULL,
+    contract_price_change_30s       DECIMAL(8, 4)  NULL,
+
+    -- Timing
+    market_age_seconds              INT            NULL,
+    time_remaining_seconds          INT            NULL,
+
+    -- BTC context (secondary / informational)
+    btc_price                       DECIMAL(14, 2) NULL,
+    target_price                    DECIMAL(14, 2) NULL,
+    raw_gap_z_score                 DECIMAL(10, 6) NULL,
+    directional_gap_z_score         DECIMAL(10, 6) NULL,   -- YES=raw, NO=-raw
+    raw_momentum_score              DECIMAL(10, 4) NULL,
+    directional_momentum_score      DECIMAL(10, 4) NULL,   -- YES=raw, NO=-raw
+    btc_velocity_10s                DECIMAL(12, 6) NULL,
+    btc_velocity_30s                DECIMAL(12, 6) NULL,
+    volatility_30s                  DECIMAL(10, 6) NULL,
+    volatility_60s                  DECIMAL(10, 6) NULL,
+    volatility_regime               VARCHAR(12)    NULL,   -- calm | normal | elevated | violent | unknown
+    hour_block                      VARCHAR(8)     NULL,   -- "HH:00"
+    day_name                        VARCHAR(12)    NULL,
+    timezone_used                   VARCHAR(40)    NULL,
+
+    -- Entry timing comparison version
+    comparison_version              VARCHAR(4)     NOT NULL,  -- v1 | v2 | v3
+    v3_qualified                    BOOLEAN        NOT NULL DEFAULT 0,  -- TRUE only when flush≥5c AND bounce≥2c
+
+    -- Fill model
+    slippage_mode                   VARCHAR(12)    NULL,
+    entry_price_simulated           DECIMAL(6, 4)  NULL,   -- ask at entry + slippage
+
+    -- Exit test definition
+    exit_test                       VARCHAR(8)     NOT NULL,  -- test_a | test_b | test_c | test_d
+    tp_abs                          DECIMAL(6, 4)  NULL,      -- take-profit offset (dollars)
+    sl_abs                          DECIMAL(6, 4)  NULL,      -- stop-loss offset   (dollars)
+    timeout_s                       DECIMAL(8, 3)  NULL,      -- max hold time (seconds)
+
+    -- v1 pre-signal fields
+    v1_pre_signal_mae               DECIMAL(8, 4)  NULL,   -- (local_low - exit_slip) - v1_entry
+    v1_stopped_out_pre_signal       BOOLEAN        NULL,   -- TRUE if SL was hit before signal
+
+    -- Exit simulation results (filled by tracker)
+    hit_take_profit_before_stop     BOOLEAN        NULL,
+    hit_stop_before_take_profit     BOOLEAN        NULL,
+    timed_out                       BOOLEAN        NULL,
+    structure_stop_hit              BOOLEAN        NULL,   -- bid broke below local_low after entry
+    max_favorable_excursion         DECIMAL(8, 4)  NULL,   -- max(bid - entry_sim)
+    max_adverse_excursion           DECIMAL(8, 4)  NULL,   -- min(bid - entry_sim)
+    time_to_peak                    DECIMAL(8, 3)  NULL,
+    time_to_profit_target           DECIMAL(8, 3)  NULL,
+    simulated_pnl                   DECIMAL(8, 4)  NULL,   -- exit_sim - entry_sim
+    simulated_pnl_percent           DECIMAL(8, 4)  NULL,   -- pnl / entry_sim
+    exit_price_simulated            DECIMAL(6, 4)  NULL,   -- bid at exit - slippage
+    exit_reason_simulated           VARCHAR(40)    NULL,   -- take_profit | stop_loss | timeout | near_expiry | ... | stopped_out_pre_signal | v3_not_qualified
+
+    n_updates                       INT            DEFAULT 0,
+
+    -- Lifecycle
+    status                          ENUM('ACTIVE', 'COMPLETE') DEFAULT 'ACTIVE',
+    complete_reason                 VARCHAR(50)    NULL,
+    recorded_at                     DATETIME(3)    NOT NULL,
+    completed_at                    DATETIME(3)    NULL,
+    created_at                      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_dcvrb_signal   (signal_id),
+    INDEX idx_dcvrb_rule     (rule_name, rule_version),
+    INDEX idx_dcvrb_status   (status),
+    INDEX idx_dcvrb_version  (comparison_version),
+    INDEX idx_dcvrb_test     (exit_test),
+    INDEX idx_dcvrb_bucket   (price_bucket, extra_flush_bucket),
+    INDEX idx_dcvrb_side     (side, comparison_version, exit_test),
+
+    CONSTRAINT fk_dcvrb_signal
+        FOREIGN KEY (signal_id) REFERENCES signals (id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);
