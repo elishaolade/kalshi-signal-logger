@@ -2387,7 +2387,7 @@ _STRATEGIES = [
     early_overextension_reversal_scalp,         # watch_only research — never paper-traded
     post_move_continuation_scalp,               # watch_only research — continuation scalp, never paper-traded
     delayed_contract_value_reversal_bounce,     # watch_only research — contract-price bounce scalp (3-stage)
-    contract_value_bounce_scalp,                # watch_only research — losing-side contract-bounce scalp, never paper-traded
+    # contract_value_bounce_scalp              # PAUSED 2026-06-03 — falsified (all PFs ≤ 0.20, spread/slippage structural); data retained
     # cheap_losing_contract_reversal_trail      # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_losing_contract_late_reversal       # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_reversal_scalp                      # disabled — removed from registry 2026-05-28
