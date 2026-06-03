@@ -999,3 +999,30 @@ CREATE TABLE IF NOT EXISTS contract_value_bounce_backtest_signals (
         FOREIGN KEY (run_id) REFERENCES contract_value_bounce_backtest_runs (id)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+-- ---------------------------------------------------------------
+-- 17. research_runs
+--     Stores frozen-hypothesis research runs driven by the
+--     registry-backed research tool. Results are JSON snapshots of
+--     SQL-based hypothesis checks and remain separate from live
+--     paper_trades and the dedicated backtest tables.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS research_runs (
+    id                  BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    hypothesis_key      VARCHAR(120)  NOT NULL,
+    hypothesis_name     VARCHAR(200)  NOT NULL,
+    hypothesis_status   VARCHAR(40)   NOT NULL,
+    runner_kind         VARCHAR(40)   NOT NULL,
+    registry_path       VARCHAR(255)  NOT NULL,
+    query_text          LONGTEXT      NULL,
+    query_sha256        CHAR(64)      NULL,
+    sample_thresholds   JSON          NULL,
+    result_rows         JSON          NULL,
+    notes               TEXT          NULL,
+    started_at          DATETIME(3)   NOT NULL,
+    finished_at         DATETIME(3)   NULL,
+    created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_rr_hypothesis (hypothesis_key, created_at),
+    INDEX idx_rr_created    (created_at)
+);

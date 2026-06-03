@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "generated_note": "Frozen hypothesis registry for the research tool. Keep definitions stable while collecting out-of-sample data.",
+  "hypotheses": [
+    {
+      "key": "pmc_no_075_080_5h_high",
+      "name": "PMC NO 0.75-0.80 near 5h high",
+      "status": "frozen",
+      "kind": "sql",
+      "description": "Late premium NO continuation performs best when the NO contract is in the 0.75-0.80 range, spread is manageable, downside momentum still confirms, and the target sits near the rolling 5-hour BTC high.",
+      "reassess_at_trades": [
+        20,
+        30,
+        50
+      ],
+      "sql": "WITH signal_ctx AS (\n  SELECT\n    s.id AS signal_id,\n    s.contract_price,\n    s.spread,\n    s.time_remaining_seconds,\n    s.momentum_score,\n    s.target_price,\n    (\n      SELECT MAX(bt.btc_price)\n      FROM btc_ticks bt\n      WHERE bt.recorded_at <= s.recorded_at\n        AND bt.recorded_at > s.recorded_at - INTERVAL 5 HOUR\n    ) AS rolling_5h_high\n  FROM signals s\n  WHERE s.rule_name = 'premium_momentum_continuation'\n    AND s.rule_version = 'v1'\n    AND s.side = 'NO'\n)\nSELECT\n  CASE\n    WHEN target_price >= rolling_5h_high - 100 THEN 'within_100'\n    WHEN target_price >= rolling_5h_high - 200 THEN 'within_200'\n    WHEN target_price >= rolling_5h_high - 300 THEN 'within_300'\n    ELSE 'more_than_300_below'\n  END AS target_vs_5h_high,\n  COUNT(*) AS trades,\n  ROUND(AVG(pt.pnl > 0) * 100, 1) AS win_rate_pct,\n  ROUND(SUM(pt.pnl), 4) AS total_pnl,\n  ROUND(AVG(pt.pnl), 4) AS avg_pnl,\n  ROUND(AVG(CASE WHEN pt.pnl > 0 THEN pt.pnl END), 4) AS avg_win,\n  ROUND(AVG(CASE WHEN pt.pnl < 0 THEN pt.pnl END), 4) AS avg_loss,\n  ROUND(\n    SUM(CASE WHEN pt.pnl > 0 THEN pt.pnl ELSE 0 END) /\n    NULLIF(ABS(SUM(CASE WHEN pt.pnl < 0 THEN pt.pnl ELSE 0 END)), 0),\n    2\n  ) AS profit_factor,\n  MAX(pt.exit_time) AS latest_exit\nFROM paper_trades pt\nJOIN signal_ctx sc ON sc.signal_id = pt.signal_id\nWHERE pt.status = 'CLOSED'\n  AND pt.followed_rules = TRUE\n  AND pt.pnl IS NOT NULL\n  AND sc.contract_price >= 0.75\n  AND sc.contract_price < 0.80\n  AND sc.spread <= 0.03\n  AND sc.time_remaining_seconds >= 240\n  AND sc.time_remaining_seconds < 300\n  AND sc.momentum_score <= -3\nGROUP BY target_vs_5h_high\nORDER BY target_vs_5h_high;"
+    }
+  ]
+}
