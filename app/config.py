@@ -33,3 +33,7 @@ SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 
 # ── External API ─────────────────────────────────────────────────────────────
 KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")
+
+# ── Research API ─────────────────────────────────────────────────────────────
+RESEARCH_API_TOKEN = os.getenv("RESEARCH_API_TOKEN", "")
+RESEARCH_API_MAX_ROWS = int(os.getenv("RESEARCH_API_MAX_ROWS", "200"))
