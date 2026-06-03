@@ -118,6 +118,30 @@ POST_MOVE_PROFILE_NAMES: list[str] = [
 ]
 
 
+# ── Absolute-cent exit tests for contract_value_bounce_scalp hypothesis ────────
+#
+# Slightly wider stops than the post-move tests: the losing side starts at a
+# higher adverse-z, so a 2¢ stop would be too easily hit on noise.
+#
+#   cvbs_test_a : take_profit +0.03, stop_loss -0.03, timeout 30s
+#   cvbs_test_b : take_profit +0.04, stop_loss -0.03, timeout 45s
+#   cvbs_test_c : take_profit +0.05, stop_loss -0.04, timeout 60s
+#   cvbs_test_d : take_profit +0.06, stop_loss -0.04, timeout 60s
+#
+# Simulated via simulate_exit_fixed_abs.
+CVBS_TEST_A = ExitProfile("cvbs_test_a", "fixed_abs", tp_abs=0.03, sl_abs=0.03, timeout_s=30.0)
+CVBS_TEST_B = ExitProfile("cvbs_test_b", "fixed_abs", tp_abs=0.04, sl_abs=0.03, timeout_s=45.0)
+CVBS_TEST_C = ExitProfile("cvbs_test_c", "fixed_abs", tp_abs=0.05, sl_abs=0.04, timeout_s=60.0)
+CVBS_TEST_D = ExitProfile("cvbs_test_d", "fixed_abs", tp_abs=0.06, sl_abs=0.04, timeout_s=60.0)
+
+CVBS_PROFILES: dict[str, ExitProfile] = {
+    p.name: p for p in (CVBS_TEST_A, CVBS_TEST_B, CVBS_TEST_C, CVBS_TEST_D)
+}
+CVBS_PROFILE_NAMES: list[str] = [
+    CVBS_TEST_A.name, CVBS_TEST_B.name, CVBS_TEST_C.name, CVBS_TEST_D.name,
+]
+
+
 @dataclass
 class PathPoint:
     """One post-entry observation of the bought (losing) side."""

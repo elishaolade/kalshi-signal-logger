@@ -1610,6 +1610,227 @@ def cheap_losing_contract_late_reversal(
     )
 
 
+# ── contract_value_bounce_scalp (watch-only research) ────────────────────────
+#
+# Hypothesis
+# ----------
+# A losing contract that has already sold down and then BOUNCED in contract
+# value can be scalped for a short +3c to +6c gain.  The entry trigger is
+# CONTRACT-LED: the losing-side contract must already be bouncing off its
+# session low.  BTC context (adverse z-score) is RECORDED but not a hard gate.
+# This is intentionally separate from:
+#   - cheap_losing_contract_reversal_trail (fires while contract is falling)
+#   - post_move_continuation_scalp (fires on the WINNING side, after a BTC move)
+#
+# WATCH-ONLY: registered below and keyed into _WATCH_ONLY_KEYS, so signals are
+# logged to the `signals` table but NEVER open a paper trade.  Exit-test
+# simulation lives in scripts/contract_value_bounce_backtest.py.
+
+_CVBS_RULE_NAME    = "contract_value_bounce_scalp"
+_CVBS_RULE_VERSION = "v1"
+
+_CVBS_MIN_MARKET_AGE_S   = 60.0    # entry only after 1 minute of market life
+_CVBS_MAX_MARKET_AGE_S   = 180.0   # stop looking after 3 minutes
+_CVBS_MIN_ASK            = 0.10    # losing-side ask floor (very_cheap bucket)
+_CVBS_MAX_ASK            = 0.30    # losing-side ask ceiling
+_CVBS_PRIMARY_ASK_FLOOR  = 0.20    # primary hypothesis: 0.20–0.30
+_CVBS_MAX_SPREAD         = 0.02    # tighter than CLC: spread ≤ 0.02
+_CVBS_MIN_BOUNCE         = 0.02    # losing side must have bounced ≥ +2c off session low
+_CVBS_MIN_MOM10          = 0.00    # losing-side 10s change >= 0 (not currently falling)
+_CVBS_CALM_REGIMES: frozenset[str] = frozenset({"calm", "normal"})
+_CVBS_Z_WINDOW_S         = 60.0
+_CVBS_MOM_N              = 10
+_CVBS_MOM_WINDOW_S       = 10.0
+
+
+def _cvbs_price_bucket(ask: float) -> str:
+    """Price bucket for the contract_value_bounce_scalp hypothesis."""
+    if ask < 0.20:
+        return "very_cheap"       # 0.10–0.20 (secondary)
+    return "cheap_primary"        # 0.20–0.30 (primary)
+
+
+def _cvbs_bounce_bucket(bounce: float) -> str:
+    """Bounce-from-low size bucket."""
+    if bounce < 0.03:
+        return "bounce_2c_3c"     # 0.02–0.03
+    if bounce < 0.05:
+        return "bounce_3c_5c"     # 0.03–0.05
+    return "bounce_5c_plus"       # >= 0.05
+
+
+def contract_value_bounce_scalp(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Contract-value bounce scalp (WATCH-ONLY RESEARCH — never paper-traded).
+
+    Hypothesis
+    ----------
+    A losing contract that has already sold off and then bounced upward in
+    CONTRACT PRICE (not BTC reversing the strike) can be scalped for a short
+    +3c–+6c gain after realistic spread and slippage.
+
+    This is NOT a BTC-reversal prediction.  BTC stays against the losing side
+    throughout — the setup is purely a contract-value bounce after an overshoot.
+
+    Entry gates (all hard, contract-led)
+    ----------------------------------------
+      1. 60 ≤ market_age_seconds ≤ 180       (1–3 min into the window)
+      2. losing side = opposite of current BTC winner
+      3. losing-side ask in [0.10, 0.30]      (cheap-but-not-dead)
+      4. losing-side spread ≤ 0.02            (tight enough to scalp)
+      5. volatility_regime in {calm, normal}  (not elevated/violent)
+      6. bounce_from_low ≥ 0.02              (already bounced ≥ +2c off session low)
+      7. losing-side 10s contract change ≥ 0  (not currently falling back)
+
+    BTC context recorded (NOT a hard gate)
+    --------------------------------------
+      adverse_z_score : how far BTC sits against the losing side (σ)
+      raw_momentum_score : stored for reporting
+
+    Primary hypothesis bucket: losing_contract_ask in [0.20, 0.30]
+    Secondary bucket:           losing_contract_ask in [0.10, 0.20)
+    """
+    # ── 1. Market-age gate (1–3 minutes) ─────────────────────────────────────
+    if not (_CVBS_MIN_MARKET_AGE_S <= contract_age_seconds <= _CVBS_MAX_MARKET_AGE_S):
+        return None
+
+    # ── 2. Determine winning / losing side from BTC position ─────────────────
+    if btc_price > target_price:
+        winning, losing = "YES", "NO"
+    elif btc_price < target_price:
+        winning, losing = "NO", "YES"
+    else:
+        return None
+
+    # ── 3. Losing-side quotes: ask band + spread ──────────────────────────────
+    lq       = contract_prices.get(losing, {})
+    l_ask    = lq.get("ask_price", 0.0) or 0.0
+    l_bid    = lq.get("bid_price", 0.0) or 0.0
+    l_mid    = lq.get("mid_price", 0.0) or 0.0
+    l_spread = lq.get("spread",    0.0) or 0.0
+
+    if not (_CVBS_MIN_ASK <= l_ask <= _CVBS_MAX_ASK):
+        return None
+    if l_spread > _CVBS_MAX_SPREAD:
+        return None
+
+    # ── 4. Volatility regime must be calm or normal ───────────────────────────
+    std60      = _rolling_std(ticks, _CVBS_Z_WINDOW_S)
+    vol_regime = _volatility_regime(std60)
+    if vol_regime not in _CVBS_CALM_REGIMES:
+        return None
+
+    # ── 5. Bounce-from-low gate (contract-led entry trigger) ─────────────────
+    history  = contract_history or {}
+    los_hist = history.get(losing, [])
+    los_low  = _series_min(los_hist)
+    bounce   = (l_mid - los_low) if los_low is not None else None
+
+    if bounce is None or bounce < _CVBS_MIN_BOUNCE:
+        logger.debug(
+            "%s: skip — losing(%s) bounce=%s < %.2f",
+            _CVBS_RULE_NAME, losing,
+            f"{bounce:+.4f}" if bounce is not None else "N/A",
+            _CVBS_MIN_BOUNCE,
+        )
+        return None
+
+    # ── 6. Not currently falling back (10s contract momentum ≥ 0) ────────────
+    los_mom10 = _series_change(los_hist, _CVBS_MOM_WINDOW_S)
+    if los_mom10 is None or los_mom10 < _CVBS_MIN_MOM10:
+        logger.debug(
+            "%s: skip — losing(%s) 10s change=%s < 0",
+            _CVBS_RULE_NAME, losing,
+            f"{los_mom10:+.4f}" if los_mom10 is not None else "N/A",
+        )
+        return None
+
+    # ── 7. BTC adverse z-score — CONTEXT ONLY, not a hard gate ───────────────
+    adverse_z = _z_from_target(btc_price, target_price, winning, std60)
+
+    # ── Features for the signals row ──────────────────────────────────────────
+    mom  = momentum_score(ticks, n=_CVBS_MOM_N)
+    rev  = reversal_score(ticks, losing, n=_CVBS_MOM_N)
+    vel  = btc_velocity(ticks, window_seconds=30.0)
+    stds = rolling_stds(ticks)
+    g    = _gap(btc_price, target_price)
+    dg   = _directional_gap(btc_price, target_price, losing)
+    gz   = _gap_z_score(btc_price, target_price, ticks, window_seconds=60.0)
+    whip = _whipsaw_score(ticks, n=20)
+
+    price_bucket  = _cvbs_price_bucket(l_ask)
+    bounce_bucket = _cvbs_bounce_bucket(bounce)
+    adverse_z_s   = f"{adverse_z:+.2f}" if adverse_z is not None else "n/a"
+
+    reason = (
+        f"{_CVBS_RULE_NAME} {_CVBS_RULE_VERSION}: BUY losing={losing} "
+        f"@ ask={l_ask:.4f} [{price_bucket}] | "
+        f"bounce={bounce:+.4f} [{bounce_bucket}] mom10={los_mom10:+.4f} "
+        f"spread={l_spread:.4f} regime={vol_regime} | "
+        f"adv_z={adverse_z_s} btc={btc_price:,.2f} target={target_price:,.2f} "
+        f"age={contract_age_seconds:.0f}s remaining={time_remaining_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _CVBS_RULE_NAME,
+        rule_version           = _CVBS_RULE_VERSION,
+        side                   = losing,          # BUY the bouncing losing-side contract
+
+        contract_price         = l_mid,
+        bid_price              = l_bid,
+        ask_price              = l_ask,
+        spread                 = l_spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        extra = {
+            "winning_side":                        winning,
+            "losing_side":                         losing,
+            "losing_contract_ask":                 round(l_ask, 6),
+            "losing_contract_bid":                 round(l_bid, 6),
+            "losing_contract_spread":              round(l_spread, 6),
+            "losing_contract_low_since_open":      round(los_low, 6) if los_low is not None else None,
+            "losing_contract_bounce_from_low":     round(bounce, 6),
+            "losing_contract_mom_10s":             round(los_mom10, 6),
+            "price_bucket":                        price_bucket,
+            "bounce_bucket":                       bounce_bucket,
+            "adverse_z_score":                     round(adverse_z, 6) if adverse_z is not None else None,
+            "raw_momentum_score":                  round(mom, 4),
+            "volatility_regime":                   vol_regime,
+            "whipsaw_score":                       round(whip, 4) if whip is not None else None,
+            "market_age_seconds":                  round(contract_age_seconds, 3),
+        },
+    )
+
+
 # ── post_move_continuation_scalp (watch-only research) ─────────────────────────
 #
 # Hypothesis
@@ -1811,6 +2032,7 @@ _STRATEGIES = [
     premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
     early_overextension_reversal_scalp,   # watch_only research — never paper-traded
     post_move_continuation_scalp,         # watch_only research — continuation scalp, never paper-traded
+    contract_value_bounce_scalp,          # watch_only research — losing-side contract-bounce scalp, never paper-traded
     # cheap_losing_contract_reversal_trail # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_losing_contract_late_reversal  # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
     # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
@@ -1824,6 +2046,7 @@ _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
     "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
     "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
     "post_move_continuation_scalp/v1",       # research only — continuation scalp hypothesis, not traded
+    "contract_value_bounce_scalp/v1",        # research only — losing-side contract-bounce hypothesis, not traded
     "cheap_losing_contract_reversal_trail/v1", # research only — 5 exit profiles simulated, not traded
     "cheap_losing_contract_late_reversal/v1",  # research only — late-window variant, not traded
 })

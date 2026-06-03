@@ -757,3 +757,108 @@ CREATE TABLE IF NOT EXISTS post_move_continuation_signals (
         FOREIGN KEY (run_id) REFERENCES post_move_continuation_runs (id)
         ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+
+-- ---------------------------------------------------------------
+-- 14. contract_value_bounce_backtest_runs
+--     One row per backtest run of the contract_value_bounce_scalp/v1
+--     WATCH-ONLY hypothesis.  Kept entirely separate from paper_trades
+--     and from all prior backtest/followthrough/post-move tables.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS contract_value_bounce_backtest_runs (
+    id                  BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    rule_name           VARCHAR(100) NOT NULL,
+    rule_version        VARCHAR(20)  NOT NULL,
+    slippage_mode       VARCHAR(12)  NOT NULL,
+    exit_tests          JSON,
+    params              JSON,
+    timezone_used       VARCHAR(40),
+
+    data_start          DATETIME(3),
+    data_end            DATETIME(3),
+    n_markets           INT          DEFAULT 0,
+    n_snapshots         INT          DEFAULT 0,
+    n_signals           INT          DEFAULT 0,
+    n_test_rows         INT          DEFAULT 0,
+
+    notes               TEXT,
+    created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_cvbbr_rule    (rule_name, rule_version),
+    INDEX idx_cvbbr_created (created_at)
+);
+
+-- ---------------------------------------------------------------
+-- 15. contract_value_bounce_backtest_signals
+--     One row per (signal × exit_test).  All four exit tests are
+--     simulated for every signal; outcomes stored here.
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS contract_value_bounce_backtest_signals (
+    id                              BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    run_id                          BIGINT        NOT NULL,
+    rule_name                       VARCHAR(100)  NOT NULL,
+    rule_version                    VARCHAR(20)   NOT NULL,
+    market_ticker                   VARCHAR(100)  NOT NULL,
+
+    side_bought                     ENUM('YES','NO') NOT NULL,
+    winning_side                    ENUM('YES','NO') NOT NULL,
+    losing_contract_ask             DECIMAL(6,4),
+    losing_contract_bid             DECIMAL(6,4),
+    losing_contract_spread          DECIMAL(6,4),
+    losing_contract_low_since_open  DECIMAL(6,4)  NULL,
+    losing_contract_bounce_from_low DECIMAL(8,4),
+    losing_contract_mom_10s         DECIMAL(8,4)  NULL,
+    price_bucket                    VARCHAR(20),
+    bounce_bucket                   VARCHAR(20),
+    spread_bucket                   VARCHAR(12),
+    simulated_entry_price           DECIMAL(6,4),
+    slippage_mode                   VARCHAR(12),
+
+    btc_price                       DECIMAL(14,2) NULL,
+    target_price                    DECIMAL(14,2) NULL,
+    adverse_z_score                 DECIMAL(10,6) NULL,
+    raw_momentum_score              DECIMAL(10,4) NULL,
+
+    volatility_regime               VARCHAR(12),
+    volatility_30s                  DECIMAL(14,4) NULL,
+    volatility_60s                  DECIMAL(14,4) NULL,
+    whipsaw_score                   DECIMAL(6,4)  NULL,
+
+    market_age_seconds              INT,
+    time_remaining_seconds          INT,
+    entry_time                      DATETIME(3),
+    hour_block                      VARCHAR(8),
+    day_name                        VARCHAR(12),
+    timezone_used                   VARCHAR(40),
+
+    exit_test                       VARCHAR(20)   NOT NULL,
+    tp_abs                          DECIMAL(6,4)  NULL,
+    sl_abs                          DECIMAL(6,4)  NULL,
+    timeout_s                       DECIMAL(8,3)  NULL,
+
+    hit_take_profit_before_stop     BOOLEAN       NULL,
+    hit_stop_before_take_profit     BOOLEAN       NULL,
+    timed_out                       BOOLEAN       NULL,
+    max_favorable_excursion         DECIMAL(8,4)  NULL,
+    max_adverse_excursion           DECIMAL(8,4)  NULL,
+    time_to_peak                    DECIMAL(8,3)  NULL,
+    time_to_profit_target           DECIMAL(8,3)  NULL,
+    simulated_pnl                   DECIMAL(8,4)  NULL,
+    simulated_pnl_percent           DECIMAL(8,4)  NULL,
+    exit_reason_simulated           VARCHAR(40)   NULL,
+    exit_time                       DATETIME(3)   NULL,
+    n_updates                       INT           DEFAULT 0,
+
+    created_at                      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_cvbbs_run      (run_id),
+    INDEX idx_cvbbs_test     (run_id, exit_test),
+    INDEX idx_cvbbs_side     (run_id, side_bought),
+    INDEX idx_cvbbs_bucket   (run_id, price_bucket),
+    INDEX idx_cvbbs_bounce   (run_id, bounce_bucket),
+    INDEX idx_cvbbs_market   (market_ticker),
+
+    CONSTRAINT fk_cvbbs_run
+        FOREIGN KEY (run_id) REFERENCES contract_value_bounce_backtest_runs (id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
