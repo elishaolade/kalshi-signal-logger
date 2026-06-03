@@ -2019,6 +2019,360 @@ def post_move_continuation_scalp(
     )
 
 
+# ── delayed_contract_value_reversal_bounce (watch-only research) ─────────────────
+#
+# Hypothesis
+# ----------
+# In BTC 15-minute up/down markets, a losing contract that drops sharply early
+# (into the 0.20–0.40 range) may flush a few more cents before producing a short
+# +3¢–+6¢ bounce in contract value.  The goal is to scalp the contract-price
+# bounce — BTC does NOT need to reverse; only the contract ask/bid needs to lift.
+#
+# Three entry timing versions are compared in reports:
+#   v1  immediate   — entered when contract first entered 0.20–0.40 watch band
+#   v2  2c+1c       — entered after extra ≥2¢ flush + ≥1¢ contract bounce (main signal)
+#   v3  5c+2c       — deeper subset: flush ≥5¢ AND bounce ≥2¢ at signal time
+# Four exit tests (A/B/C/D) are simulated by DCVRBTracker (no paper trade opened).
+#
+# WATCH-ONLY / status=watch_only: registered below and keyed into _WATCH_ONLY_KEYS.
+
+_DCVRB_RULE_NAME    = "delayed_contract_value_reversal_bounce"
+_DCVRB_RULE_VERSION = "v1"
+
+# Stage 1: watch trigger gates
+_DCVRB_MIN_AGE_S          = 60.0    # market_age_seconds ∈ [60, 240]
+_DCVRB_MAX_AGE_S          = 240.0
+_DCVRB_MIN_TR_S           = 300.0   # time_remaining_seconds ≥ 300
+_DCVRB_MIN_CONTRACT_ASK   = 0.20    # losing-side ask enters [0.20, 0.40]
+_DCVRB_MAX_CONTRACT_ASK   = 0.40
+_DCVRB_MIN_DROP_FROM_OPEN = 0.15    # dropped ≥ 0.15 from market-open price …
+_DCVRB_MIN_DROP_FROM_HIGH = 0.20    # … OR ≥ 0.20 from recent contract high
+_DCVRB_MAX_SPREAD         = 0.03    # spread ≤ 0.03
+
+# Stage 2: extra flush requirement
+_DCVRB_MIN_EXTRA_FLUSH    = 0.02    # contract must flush ≥ 2¢ below watch_start_ask
+
+# Stage 3: bounce confirmation
+_DCVRB_MIN_BOUNCE         = 0.01    # ask/bid bounced ≥ 1¢ from local_low
+_DCVRB_STRONG_BOUNCE      = 0.02    # strong-bounce flag threshold (≥ 2¢)
+
+# V3 comparison thresholds (deep flush + strong bounce subset)
+_DCVRB_V3_MIN_FLUSH       = 0.05    # flush ≥ 5¢ required for v3 qualification
+_DCVRB_V3_MIN_BOUNCE      = 0.02    # bounce ≥ 2¢ required for v3 qualification
+
+# Contract price change windows (applied to losing-side mid history)
+_DCVRB_CHG_5S    =  5.0
+_DCVRB_CHG_10S   = 10.0
+_DCVRB_CHG_30S   = 30.0
+_DCVRB_MOM_N     = 10
+_DCVRB_Z_WIN_S   = 60.0
+
+
+@dataclass
+class _DCVRBWatchState:
+    """In-memory watch state for a single market/losing-side."""
+    market_ticker:            str
+    side:                     str    # losing side ("YES" or "NO")
+    watch_start_time:         float  # Unix epoch seconds
+    watch_start_contract_ask: float
+    watch_start_contract_bid: float
+    contract_open_price:      float  # earliest mid/ask seen in contract history
+    contract_recent_high:     float  # highest mid seen in contract history
+    spread_at_watch:          float
+    volatility_60s_at_watch:  Optional[float]
+    local_low_since_watch:    float  # lowest ask seen since watch started
+    signal_fired:             bool = False
+
+
+# Module-level watch states keyed by "market_ticker/losing_side".
+# Cleared automatically on market rollover (old ticker prefix).
+_dcvrb_watch_states: dict[str, _DCVRBWatchState] = {}
+
+
+def _dcvrb_price_bucket(ask: float) -> str:
+    if ask < 0.25:
+        return "0.20-0.25"
+    if ask < 0.30:
+        return "0.25-0.30"
+    if ask < 0.35:
+        return "0.30-0.35"
+    return "0.35-0.40"
+
+
+def _dcvrb_flush_bucket(extra_flush: float) -> str:
+    if extra_flush < 0.03:
+        return "0.02-0.03"
+    if extra_flush < 0.05:
+        return "0.03-0.05"
+    return "0.05+"
+
+
+def _dcvrb_bounce_bucket(bounce: float) -> str:
+    if bounce < 0.02:
+        return "0.01-0.02"
+    return "0.02+"
+
+
+def delayed_contract_value_reversal_bounce(
+    ticks: list[Tick],
+    market_ticker: str,
+    btc_price: float,
+    target_price: float,
+    contract_age_seconds: float,
+    time_remaining_seconds: float,
+    contract_prices: dict[str, dict],
+    contract_history: Optional[dict[str, list[Tick]]] = None,
+    reversal_prob_fn: Optional[Callable[..., dict]] = None,
+) -> Optional[Signal]:
+    """
+    Hypothesis (WATCH-ONLY RESEARCH — never paper-traded, no live orders)
+    ----------------------------------------------------------------------
+    In BTC 15-minute up/down markets, a losing contract that drops sharply
+    early (Stage 1: ask enters 0.20–0.40 with ≥15¢ drop from open) may flush
+    a few more cents (Stage 2: ≥2¢ below watch start) before producing a short
+    +3¢–+6¢ bounce in contract value (Stage 3: ≥1¢ lift from local low).
+
+    This strategy fires once per market/side when Stage 3 is first confirmed.
+    The DCVRBTracker then simulates four exit tests (A/B/C/D) × three entry
+    timing comparison versions (v1 immediate, v2 main, v3 deep flush).
+
+    BTC price, velocity, and z-score are logged as context only — they are NOT
+    hard requirements for the v1 watch-only signal.
+    """
+    global _dcvrb_watch_states
+
+    # ── Clear stale states from previous markets ──────────────────────────────
+    stale = [k for k in list(_dcvrb_watch_states.keys())
+             if not k.startswith(f"{market_ticker}/")]
+    for k in stale:
+        del _dcvrb_watch_states[k]
+
+    # ── Timing gates ──────────────────────────────────────────────────────────
+    if not (_DCVRB_MIN_AGE_S <= contract_age_seconds <= _DCVRB_MAX_AGE_S):
+        return None
+    if time_remaining_seconds < _DCVRB_MIN_TR_S:
+        return None
+
+    # ── Determine losing side ──────────────────────────────────────────────────
+    if btc_price > target_price:
+        winning, losing = "YES", "NO"
+    elif btc_price < target_price:
+        winning, losing = "NO", "YES"
+    else:
+        return None
+
+    # ── Losing-side quotes ────────────────────────────────────────────────────
+    lq       = contract_prices.get(losing, {})
+    l_ask    = lq.get("ask_price")
+    l_bid    = lq.get("bid_price")
+    l_mid    = lq.get("mid_price", 0.0)
+    l_spread = lq.get("spread", 0.0)
+
+    if not l_ask or not l_bid or l_ask <= 0:
+        return None
+
+    state_key = f"{market_ticker}/{losing}"
+    ws = _dcvrb_watch_states.get(state_key)
+
+    # ── If already fired this market/side, suppress ───────────────────────────
+    if ws is not None and ws.signal_fired:
+        return None
+
+    # ── Losing-side contract history (mid series, same market window) ──────────
+    hist = (contract_history or {}).get(losing, [])
+
+    # ── Stage 1: Create watch state when conditions first met ─────────────────
+    if ws is None:
+        # Ask must be in the 0.20–0.40 band
+        if not (_DCVRB_MIN_CONTRACT_ASK <= l_ask <= _DCVRB_MAX_CONTRACT_ASK):
+            return None
+        if l_spread > _DCVRB_MAX_SPREAD:
+            return None
+
+        # Compute drop from market-open price and from recent contract high.
+        # contract_history holds mid prices; use them for drop measurement.
+        contract_open_price  = hist[0].price  if hist else l_mid
+        contract_recent_high = max((t.price for t in hist), default=l_mid)
+
+        drop_from_open = contract_open_price - l_ask
+        drop_from_high = contract_recent_high - l_ask
+
+        if drop_from_open < _DCVRB_MIN_DROP_FROM_OPEN and drop_from_high < _DCVRB_MIN_DROP_FROM_HIGH:
+            return None
+
+        # Compute volatility context at watch time (logged, not a hard gate)
+        std60 = _rolling_std(ticks, _DCVRB_Z_WIN_S)
+        vol60 = std60
+
+        now_ts = ticks[-1].ts if ticks else contract_age_seconds
+        ws = _DCVRBWatchState(
+            market_ticker            = market_ticker,
+            side                     = losing,
+            watch_start_time         = now_ts,
+            watch_start_contract_ask = l_ask,
+            watch_start_contract_bid = l_bid,
+            contract_open_price      = contract_open_price,
+            contract_recent_high     = contract_recent_high,
+            spread_at_watch          = l_spread,
+            volatility_60s_at_watch  = vol60,
+            local_low_since_watch    = l_ask,
+        )
+        _dcvrb_watch_states[state_key] = ws
+        logger.debug(
+            "DCVRB: watch_state created — %s losing=%s ask=%.4f "
+            "drop_from_open=%.4f drop_from_high=%.4f",
+            market_ticker, losing, l_ask, drop_from_open, drop_from_high,
+        )
+        return None   # Stage 1 only — wait for flush + bounce
+
+    # ── Stage 2 + 3: Update watch state ───────────────────────────────────────
+    # Track the lowest ask seen since watch started (flush depth)
+    if l_ask < ws.local_low_since_watch:
+        ws.local_low_since_watch = l_ask
+
+    extra_flush           = ws.watch_start_contract_ask - ws.local_low_since_watch
+    drop_from_watch_start = ws.watch_start_contract_ask - l_ask
+    bounce_from_local_low = l_ask - ws.local_low_since_watch  # positive when bounced
+
+    # Stage 2: must have flushed at least 2¢ below watch_start_ask
+    if extra_flush < _DCVRB_MIN_EXTRA_FLUSH:
+        return None
+
+    # Stage 3: ask/bid must have bounced ≥ 1¢ from local low
+    if bounce_from_local_low < _DCVRB_MIN_BOUNCE:
+        return None
+
+    # Stage 3: spread still tight
+    if l_spread > _DCVRB_MAX_SPREAD:
+        return None
+
+    # Stage 3: time gate still valid
+    if time_remaining_seconds < _DCVRB_MIN_TR_S:
+        return None
+
+    # Stage 3: at least one of the short-term contract-price changes must be positive
+    chg5  = _series_change(hist, _DCVRB_CHG_5S)
+    chg10 = _series_change(hist, _DCVRB_CHG_10S)
+    chg30 = _series_change(hist, _DCVRB_CHG_30S)
+
+    price_rising = (
+        (chg5  is not None and chg5  > 0.0)
+        or (chg10 is not None and chg10 > 0.0)
+    )
+    if not price_rising:
+        return None
+
+    # ── Build signal (fires exactly once per market/side) ─────────────────────
+    ws.signal_fired = True
+
+    mom   = momentum_score(ticks, n=_DCVRB_MOM_N)
+    rev   = reversal_score(ticks, losing, n=_DCVRB_MOM_N)
+    vel10 = btc_velocity(ticks, window_seconds=10.0)
+    vel30 = btc_velocity(ticks, window_seconds=30.0)
+    stds  = rolling_stds(ticks)
+    g     = _gap(btc_price, target_price)
+    dg    = _directional_gap(btc_price, target_price, losing)
+    gz    = _gap_z_score(btc_price, target_price, ticks, window_seconds=_DCVRB_Z_WIN_S)
+
+    # Side-normalised directional values
+    dir_gz  = gz  if losing == "YES" else (-gz  if gz  is not None else None)
+    dir_mom = mom if losing == "YES" else -mom
+
+    vol_regime         = _volatility_regime(stds["std_60s"])
+    extra_flush_bucket = _dcvrb_flush_bucket(extra_flush)
+    bounce_bucket      = _dcvrb_bounce_bucket(bounce_from_local_low)
+    strong_bounce      = bounce_from_local_low >= _DCVRB_STRONG_BOUNCE
+    v3_qualified       = (
+        extra_flush        >= _DCVRB_V3_MIN_FLUSH
+        and bounce_from_local_low >= _DCVRB_V3_MIN_BOUNCE
+    )
+    price_bucket       = _dcvrb_price_bucket(ws.watch_start_contract_ask)
+    drop_from_open     = ws.contract_open_price  - ws.watch_start_contract_ask
+    drop_from_high     = ws.contract_recent_high - ws.watch_start_contract_ask
+
+    reason = (
+        f"{_DCVRB_RULE_NAME} {_DCVRB_RULE_VERSION}: losing={losing} "
+        f"watch_ask={ws.watch_start_contract_ask:.4f} "
+        f"local_low={ws.local_low_since_watch:.4f} "
+        f"ask_now={l_ask:.4f} "
+        f"flush={extra_flush:+.4f}[{extra_flush_bucket}] "
+        f"bounce={bounce_from_local_low:+.4f}[{bounce_bucket}] "
+        f"strong={strong_bounce} v3={v3_qualified} | "
+        f"chg5={chg5 if chg5 is None else round(chg5, 4)} "
+        f"chg10={chg10 if chg10 is None else round(chg10, 4)} | "
+        f"spread={l_spread:.4f} remaining={time_remaining_seconds:.0f}s "
+        f"age={contract_age_seconds:.0f}s"
+    )
+    logger.info("Signal — %s", reason)
+
+    return Signal(
+        market_ticker          = market_ticker,
+        rule_name              = _DCVRB_RULE_NAME,
+        rule_version           = _DCVRB_RULE_VERSION,
+        side                   = losing,
+
+        contract_price         = l_mid,
+        bid_price              = l_bid,
+        ask_price              = l_ask,
+        spread                 = l_spread,
+
+        btc_price              = btc_price,
+        target_price           = target_price,
+        gap                    = g,
+        directional_gap        = dg,
+        gap_z_score            = gz,
+
+        contract_age_seconds   = contract_age_seconds,
+        time_remaining_seconds = time_remaining_seconds,
+
+        momentum_score         = mom,
+        reversal_score         = rev,
+        btc_velocity           = vel30,
+        volatility_30s         = stds["std_30s"],
+        volatility_60s         = stds["std_60s"],
+        volatility_120s        = stds["std_120s"],
+
+        reason                 = reason,
+        signal_status          = "watch_only",
+        extra = {
+            # Stage 1 watch-state context
+            "contract_open_price":          round(ws.contract_open_price, 6),
+            "contract_recent_high":         round(ws.contract_recent_high, 6),
+            "watch_start_contract_ask":     round(ws.watch_start_contract_ask, 6),
+            "watch_start_contract_bid":     round(ws.watch_start_contract_bid, 6),
+            "spread_at_watch":              round(ws.spread_at_watch, 6),
+            "volatility_60s_at_watch":      round(ws.volatility_60s_at_watch, 6) if ws.volatility_60s_at_watch is not None else None,
+            "drop_from_open":               round(drop_from_open, 6),
+            "drop_from_recent_high":        round(drop_from_high, 6),
+            # Stage 2/3 flush + bounce metrics
+            "local_low_since_watch":        round(ws.local_low_since_watch, 6),
+            "drop_from_watch_start":        round(drop_from_watch_start, 6),
+            "extra_flush":                  round(extra_flush, 6),
+            "bounce_from_local_low":        round(bounce_from_local_low, 6),
+            "extra_flush_bucket":           extra_flush_bucket,
+            "bounce_bucket":                bounce_bucket,
+            "strong_bounce":                strong_bounce,
+            "v3_qualified":                 v3_qualified,
+            "price_bucket":                 price_bucket,
+            # Contract price changes at signal time
+            "contract_price_change_5s":     round(chg5,  6) if chg5  is not None else None,
+            "contract_price_change_10s":    round(chg10, 6) if chg10 is not None else None,
+            "contract_price_change_30s":    round(chg30, 6) if chg30 is not None else None,
+            # BTC secondary context (NOT hard requirements for v1)
+            "winning_side":                 winning,
+            "losing_side":                  losing,
+            "raw_gap_z_score":              round(gz,     6) if gz     is not None else None,
+            "directional_gap_z_score":      round(dir_gz, 6) if dir_gz is not None else None,
+            "raw_momentum_score":           round(mom,    4),
+            "directional_momentum_score":   round(dir_mom, 4),
+            "btc_velocity_10s":             round(vel10, 6) if vel10 is not None else None,
+            "btc_velocity_30s":             round(vel30, 6) if vel30 is not None else None,
+            "volatility_regime":            vol_regime,
+            "market_age_seconds":           round(contract_age_seconds, 3),
+        },
+    )
+
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 #
 # Active strategies are evaluated every poll cycle.
@@ -2026,29 +2380,31 @@ def post_move_continuation_scalp(
 # to the signals table but will NOT open paper trades.
 
 _STRATEGIES = [
-    premium_momentum_continuation,        # NO-side active; YES-side watch_only (see below)
-    premium_no_midrange_scalp,            # paper_active — NO only, 0.65–0.80 (v1, ask-gated)
-    premium_no_midrange_scalp_v2,         # paper_active — NO only, 0.65–0.80 (v2, mid-gated + trail)
-    premium_momentum_scalp_v2,            # watch_only — conflicts with PNMS in 240-300s/NO band
-    early_overextension_reversal_scalp,   # watch_only research — never paper-traded
-    post_move_continuation_scalp,         # watch_only research — continuation scalp, never paper-traded
-    contract_value_bounce_scalp,          # watch_only research — losing-side contract-bounce scalp, never paper-traded
-    # cheap_losing_contract_reversal_trail # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
-    # cheap_losing_contract_late_reversal  # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
-    # cheap_reversal_scalp                # disabled — removed from registry 2026-05-28
+    premium_momentum_continuation,              # NO-side active; YES-side watch_only (see below)
+    premium_no_midrange_scalp,                  # paper_active — NO only, 0.65–0.80 (v1, ask-gated)
+    premium_no_midrange_scalp_v2,               # paper_active — NO only, 0.65–0.80 (v2, mid-gated + trail)
+    premium_momentum_scalp_v2,                  # watch_only — conflicts with PNMS in 240-300s/NO band
+    early_overextension_reversal_scalp,         # watch_only research — never paper-traded
+    post_move_continuation_scalp,               # watch_only research — continuation scalp, never paper-traded
+    delayed_contract_value_reversal_bounce,     # watch_only research — contract-price bounce scalp (3-stage)
+    contract_value_bounce_scalp,                # watch_only research — losing-side contract-bounce scalp, never paper-traded
+    # cheap_losing_contract_reversal_trail      # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
+    # cheap_losing_contract_late_reversal       # PAUSED 2026-06-02 — falsified (avg_mfe<0, hit-2c=100%); tracker/data retained
+    # cheap_reversal_scalp                      # disabled — removed from registry 2026-05-28
 ]
 
 # Keys that produce signals for the DB log but must NOT open paper trades.
 # Format: "rule_name/rule_version"        → all sides paused
 #         "rule_name/rule_version/SIDE"   → one side paused
 _WATCH_ONLY_KEYS: frozenset[str] = frozenset({
-    "premium_momentum_continuation/v1/YES",  # YES-side PMC: watch-only
-    "premium_momentum_scalp/v2",             # PMS v2: conflicts with PNMS NO band
-    "early_overextension_reversal_scalp/v1", # research only — outcomes tracked, not traded
-    "post_move_continuation_scalp/v1",       # research only — continuation scalp hypothesis, not traded
-    "contract_value_bounce_scalp/v1",        # research only — losing-side contract-bounce hypothesis, not traded
-    "cheap_losing_contract_reversal_trail/v1", # research only — 5 exit profiles simulated, not traded
-    "cheap_losing_contract_late_reversal/v1",  # research only — late-window variant, not traded
+    "premium_momentum_continuation/v1/YES",           # YES-side PMC: watch-only
+    "premium_momentum_scalp/v2",                      # PMS v2: conflicts with PNMS NO band
+    "early_overextension_reversal_scalp/v1",          # research only — outcomes tracked, not traded
+    "post_move_continuation_scalp/v1",                # research only — continuation scalp hypothesis, not traded
+    "cheap_losing_contract_reversal_trail/v1",        # research only — 5 exit profiles simulated, not traded
+    "cheap_losing_contract_late_reversal/v1",         # research only — late-window variant, not traded
+    "delayed_contract_value_reversal_bounce/v1",      # research only — contract-price bounce, 4 exit tests
+    "contract_value_bounce_scalp/v1",                 # research only — losing-side contract-bounce hypothesis, not traded
 })
 
 # ── PMC v1 forward-test filter ────────────────────────────────────────────────

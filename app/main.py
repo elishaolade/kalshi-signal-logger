@@ -44,6 +44,7 @@ from app.data_feed import (
     get_mock_contract_prices,
 )
 from app.clc_reversal_tracker import CLCReversalTracker
+from app.dcvrb_tracker import DCVRBTracker
 from app.db import execute_query, fetch_all, insert_and_get_id, get_pool
 from app.features import Tick, rolling_std, volatility_regime
 from app.observation_tracker import ObservationTracker
@@ -334,6 +335,7 @@ def _tick(
     contract_hist: _ContractHistory,
     obs_tracker: ObservationTracker,
     clc_tracker: CLCReversalTracker,
+    dcvrb_tracker: DCVRBTracker,
     reversal_prob: ReversalProbabilityProvider,
 ) -> None:
     now = datetime.now(timezone.utc)
@@ -420,8 +422,8 @@ def _tick(
             # the ObservationTracker here (still NO paper trade is opened).
             if sig.signal_status == "watch_only":
                 # Each tracker no-ops for rules it does not track, so we offer
-                # the signal to both.  Still NO paper trade is opened.
-                for _tracker in (obs_tracker, clc_tracker):
+                # the signal to all.  Still NO paper trade is opened.
+                for _tracker in (obs_tracker, clc_tracker, dcvrb_tracker):
                     try:
                         _tracker.register(sig, signal_id, contract_prices)
                     except Exception as exc:
@@ -478,6 +480,16 @@ def _tick(
     except Exception as exc:
         logger.error("CLC observation update error: %s", exc, exc_info=True)
 
+    # ── 12d. Advance DCVRB observations (4 exit tests × 3 versions, no trades) ─
+    try:
+        dcvrb_tracker.update(
+            market_ticker          = market_ticker,
+            contract_prices        = contract_prices,
+            time_remaining_seconds = time_remaining,
+        )
+    except Exception as exc:
+        logger.error("DCVRB observation update error: %s", exc, exc_info=True)
+
     # ── Periodic cooldown eviction ────────────────────────────────────────────
     if n % 60 == 0:
         cooldown.evict_expired()
@@ -527,6 +539,7 @@ def run() -> None:
     contract_hist = _ContractHistory(CONTRACT_TICK_BUFFER)
     obs_tracker   = ObservationTracker()
     clc_tracker   = CLCReversalTracker(slippage_mode=SLIPPAGE_MODE)
+    dcvrb_tracker = DCVRBTracker(slippage_mode=SLIPPAGE_MODE)
     reversal_prob = ReversalProbabilityProvider()
 
     _warm_up(btc_ticks)
@@ -547,7 +560,7 @@ def run() -> None:
 
         try:
             _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker,
-                  clc_tracker, reversal_prob)
+                  clc_tracker, dcvrb_tracker, reversal_prob)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
 
