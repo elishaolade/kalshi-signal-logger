@@ -1026,3 +1026,121 @@ CREATE TABLE IF NOT EXISTS research_runs (
     INDEX idx_rr_hypothesis (hypothesis_key, created_at),
     INDEX idx_rr_created    (created_at)
 );
+
+
+-- ============================================================================
+-- 18. hourly_range_markets
+--     One row per unique Kalshi BTC hourly range market discovered.
+--     Upserted on every HourlyRangeTracker poll.
+--     Outcome fields (contained, final_btc_price, summary stats) are written
+--     when the market disappears from the active Kalshi list.
+--
+--     OBSERVABILITY / RESEARCH ONLY — no live trading, no order execution.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hourly_range_markets (
+    id                  BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    market_ticker       VARCHAR(100)  NOT NULL,
+    event_ticker        VARCHAR(100)  NULL,
+    series_ticker       VARCHAR(100)  NULL,
+    title               VARCHAR(200)  NULL,
+
+    -- Band geometry (set on first discovery, immutable thereafter)
+    floor_strike        DECIMAL(14,2) NOT NULL,
+    cap_strike          DECIMAL(14,2) NOT NULL,
+    band_width          DECIMAL(14,2) NOT NULL,   -- cap - floor
+    band_center         DECIMAL(14,2) NOT NULL,   -- (cap + floor) / 2
+
+    open_time           DATETIME(3)   NULL,
+    close_time          DATETIME(3)   NULL,
+
+    -- Lifecycle
+    status              VARCHAR(20)   NOT NULL DEFAULT 'open',   -- open | closed | settled
+
+    -- Outcome (filled when market closes / is settled)
+    final_btc_price             DECIMAL(14,2) NULL,
+    contained                   BOOLEAN       NULL,   -- TRUE if final BTC in [floor, cap]
+    settled_at                  DATETIME(3)   NULL,
+
+    -- Summary stats computed at settlement from hourly_range_observations
+    n_observations              INT           NOT NULL DEFAULT 0,
+    pct_time_inside             DECIMAL(6,4)  NULL,   -- fraction of obs where inside_band=TRUE
+    max_excursion_above_cap     DECIMAL(14,2) NULL,   -- max(btc - cap) when above cap
+    max_excursion_below_floor   DECIMAL(14,2) NULL,   -- max(floor - btc) when below floor
+
+    first_seen_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uq_hrm_ticker (market_ticker),
+    INDEX idx_hrm_event      (event_ticker),
+    INDEX idx_hrm_close      (close_time),
+    INDEX idx_hrm_status     (status)
+);
+
+
+-- ============================================================================
+-- 19. hourly_range_observations
+--     One row per (market_ticker, observed_at) sample.
+--     Written every RANGE_MARKET_POLL_INTERVAL_SECONDS (default 30s) by
+--     HourlyRangeTracker for each open range market.
+--
+--     Containment confidence model (documented in hourly_range_tracker.py):
+--       sigma  = btc_volatility_60s * sqrt(time_to_expiry_seconds / 60)
+--       conf   = Phi(z_cap) + Phi(z_floor) - 1
+--       z_floor = (btc - floor) / sigma
+--       z_cap   = (cap - btc)   / sigma
+--     Treat confidence as a relative indicator, not a calibrated probability.
+--
+--     OBSERVABILITY / RESEARCH ONLY — no live trading, no order execution.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hourly_range_observations (
+    id                      BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    market_ticker           VARCHAR(100)  NOT NULL,
+    observed_at             DATETIME(3)   NOT NULL,
+
+    -- Band geometry (denormalised; self-contained rows for analysis)
+    floor_strike            DECIMAL(14,2) NOT NULL,
+    cap_strike              DECIMAL(14,2) NOT NULL,
+    band_width              DECIMAL(14,2) NOT NULL,
+    band_center             DECIMAL(14,2) NOT NULL,
+
+    -- BTC position relative to band
+    btc_price               DECIMAL(14,2) NULL,
+    distance_to_floor       DECIMAL(14,2) NULL,   -- btc - floor   (positive = above floor)
+    distance_to_cap         DECIMAL(14,2) NULL,   -- cap  - btc    (positive = below cap)
+    distance_to_center      DECIMAL(14,2) NULL,   -- btc  - center (signed)
+    inside_band             BOOLEAN       NULL,
+    norm_position           DECIMAL(8,4)  NULL,   -- (btc-floor)/band_width  0=floor 1=cap
+    range_state             ENUM('below_range','inside_lower_half','inside_upper_half','above_range') NULL,
+
+    -- Timing
+    contract_age_seconds    INT           NULL,
+    time_to_expiry_seconds  INT           NULL,
+
+    -- Contract quotes (YES = "BTC stays inside range")
+    yes_bid                 DECIMAL(6,4)  NULL,
+    yes_ask                 DECIMAL(6,4)  NULL,
+    yes_mid                 DECIMAL(6,4)  NULL,
+    yes_spread              DECIMAL(6,4)  NULL,
+    last_price              DECIMAL(6,4)  NULL,
+    volume                  DECIMAL(14,2) NULL,
+    liquidity               DECIMAL(14,2) NULL,
+
+    -- BTC features from the in-memory btc_ticks buffer
+    btc_volatility_30s      DECIMAL(10,6) NULL,
+    btc_volatility_60s      DECIMAL(10,6) NULL,
+    btc_velocity_10s        DECIMAL(10,6) NULL,
+    btc_velocity_30s        DECIMAL(10,6) NULL,
+
+    -- Containment confidence (see model note above)
+    containment_confidence  DECIMAL(6,4)  NULL,
+
+    created_at              TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_hro_ticker       (market_ticker),
+    INDEX idx_hro_observed     (observed_at),
+    INDEX idx_hro_ticker_time  (market_ticker, observed_at),
+    INDEX idx_hro_state        (range_state),
+    INDEX idx_hro_inside       (market_ticker, inside_band)
+);

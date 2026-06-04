@@ -14,9 +14,16 @@ import logging
 import math
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
+
+from app.config import (
+    KALSHI_API_BASE,
+    KALSHI_API_TIMEOUT_SECONDS,
+    KALSHI_BTC_RANGE_EVENT_TICKER,
+    KALSHI_BTC_RANGE_SERIES_TICKER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +193,168 @@ def get_active_mock_market() -> dict:
         "contract_age_seconds":   contract_age,
     }
 
+
+# ── Kalshi public REST helpers ────────────────────────────────────────────────
+
+def _parse_float(value: Any) -> Optional[float]:
+    """Parse an API field that may be numeric, string, empty string, or absent."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    """Parse ISO-8601 timestamps returned by the Kalshi REST API."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _kalshi_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Single GET against the Kalshi public REST API.  Raises on HTTP errors."""
+    base = KALSHI_API_BASE.rstrip("/")
+    url  = f"{base}/{path.lstrip('/')}"
+    with httpx.Client(timeout=KALSHI_API_TIMEOUT_SECONDS) as client:
+        resp = client.get(url, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _collect_markets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Kalshi /markets responses can return a single market or a list."""
+    if isinstance(payload.get("market"), dict):
+        return [payload["market"]]
+    markets = payload.get("markets")
+    return markets if isinstance(markets, list) else []
+
+
+def _normalize_range_market(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """
+    Normalise a Kalshi market dict into the fields used by HourlyRangeTracker.
+
+    Returns None for markets that lack numeric floor_strike / cap_strike (i.e.
+    binary up/down markets — not range markets).
+    """
+    floor_strike = _parse_float(raw.get("floor_strike"))
+    cap_strike   = _parse_float(raw.get("cap_strike"))
+    if floor_strike is None or cap_strike is None:
+        return None
+
+    yes_bid  = _parse_float(raw.get("yes_bid") or raw.get("yes_bid_dollars"))
+    yes_ask  = _parse_float(raw.get("yes_ask") or raw.get("yes_ask_dollars"))
+    yes_mid: Optional[float] = None
+    yes_spread: Optional[float] = None
+    if yes_bid is not None and yes_ask is not None:
+        yes_mid    = round((yes_bid + yes_ask) / 2, 4)
+        yes_spread = round(yes_ask - yes_bid, 4)
+
+    return {
+        "ticker":        raw.get("ticker"),
+        "event_ticker":  raw.get("event_ticker"),
+        "series_ticker": raw.get("series_ticker", ""),
+        "title":         raw.get("title") or raw.get("yes_sub_title") or "",
+        "floor_strike":  floor_strike,
+        "cap_strike":    cap_strike,
+        "band_width":    round(cap_strike - floor_strike, 2),
+        "band_center":   round((cap_strike + floor_strike) / 2, 2),
+        "open_time":     _parse_dt(raw.get("open_time")),
+        "close_time":    _parse_dt(raw.get("close_time")),
+        "yes_bid":       yes_bid,
+        "yes_ask":       yes_ask,
+        "yes_mid":       yes_mid,
+        "yes_spread":    yes_spread,
+        "last_price":    _parse_float(
+            raw.get("last_price") or raw.get("last_price_dollars")
+            or raw.get("previous_price_dollars")
+        ),
+        "volume":    _parse_float(raw.get("volume")    or raw.get("volume_dollars")),
+        "liquidity": _parse_float(raw.get("liquidity") or raw.get("liquidity_dollars")),
+    }
+
+
+def get_kalshi_markets(
+    *,
+    event_ticker:  Optional[str] = None,
+    series_ticker: Optional[str] = None,
+    status: str = "open",
+    limit:  int = 1000,
+) -> list[dict[str, Any]]:
+    """
+    Fetch raw Kalshi market dicts, handling cursor-based pagination.
+
+    Raises on network or HTTP errors — callers should catch and log.
+    """
+    params: dict[str, Any] = {"limit": limit, "status": status}
+    if event_ticker:
+        params["event_ticker"] = event_ticker
+    if series_ticker:
+        params["series_ticker"] = series_ticker
+
+    cursor: Optional[str] = None
+    out: list[dict[str, Any]] = []
+    while True:
+        page = dict(params)
+        if cursor:
+            page["cursor"] = cursor
+        payload = _kalshi_get("/markets", params=page)
+        out.extend(_collect_markets(payload))
+        cursor = payload.get("cursor")
+        if not cursor:
+            break
+    return out
+
+
+def get_kalshi_btc_hourly_range_markets(
+    *,
+    event_ticker:  Optional[str] = None,
+    series_ticker: Optional[str] = None,
+    status: str = "open",
+) -> list[dict[str, Any]]:
+    """
+    Fetch and normalise BTC hourly range markets from Kalshi.
+
+    Resolves configuration in order:
+      1. Explicit keyword arguments
+      2. KALSHI_BTC_RANGE_EVENT_TICKER  / KALSHI_BTC_RANGE_SERIES_TICKER env vars
+
+    Returns a list of normalised market dicts (floor/cap guaranteed non-None),
+    sorted by close_time then floor_strike.
+
+    Raises ValueError when neither event nor series ticker is available.
+    Raises httpx.HTTPError on network failures (let callers decide how to handle).
+    """
+    chosen_event  = event_ticker  or KALSHI_BTC_RANGE_EVENT_TICKER  or None
+    chosen_series = series_ticker or KALSHI_BTC_RANGE_SERIES_TICKER or None
+    if not chosen_event and not chosen_series:
+        raise ValueError(
+            "Hourly BTC range lookup requires event_ticker or series_ticker "
+            "(set KALSHI_BTC_RANGE_EVENT_TICKER or KALSHI_BTC_RANGE_SERIES_TICKER in .env)."
+        )
+
+    raw = get_kalshi_markets(
+        event_ticker=chosen_event,
+        series_ticker=chosen_series,
+        status=status,
+    )
+
+    normalized = [nm for nm in (_normalize_range_market(m) for m in raw) if nm is not None]
+    normalized.sort(key=lambda m: (
+        m["close_time"] or datetime.max.replace(tzinfo=timezone.utc),
+        m["floor_strike"],
+    ))
+    return normalized
+
+
+# ── Mock / 15-min helpers ─────────────────────────────────────────────────────
 
 def get_mock_contract_prices(
     btc_price: float,

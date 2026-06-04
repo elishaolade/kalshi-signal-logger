@@ -47,6 +47,7 @@ from app.clc_reversal_tracker import CLCReversalTracker
 from app.dcvrb_tracker import DCVRBTracker
 from app.db import execute_query, fetch_all, insert_and_get_id, get_pool
 from app.features import Tick, rolling_std, volatility_regime
+from app.hourly_range_tracker import HourlyRangeTracker
 from app.observation_tracker import ObservationTracker
 from app.paper_trader import PaperTrader
 from app.reversal_probability import ReversalProbabilityProvider
@@ -337,6 +338,7 @@ def _tick(
     clc_tracker: CLCReversalTracker,
     dcvrb_tracker: DCVRBTracker,
     reversal_prob: ReversalProbabilityProvider,
+    range_tracker: HourlyRangeTracker,
 ) -> None:
     now = datetime.now(timezone.utc)
 
@@ -490,6 +492,12 @@ def _tick(
     except Exception as exc:
         logger.error("DCVRB observation update error: %s", exc, exc_info=True)
 
+    # ── 12e. Hourly range market observations (research only, no trades) ──────
+    try:
+        range_tracker.observe(btc_price, list(btc_ticks))
+    except Exception as exc:
+        logger.error("Hourly range observation error: %s", exc, exc_info=True)
+
     # ── Periodic cooldown eviction ────────────────────────────────────────────
     if n % 60 == 0:
         cooldown.evict_expired()
@@ -541,6 +549,7 @@ def run() -> None:
     clc_tracker   = CLCReversalTracker(slippage_mode=SLIPPAGE_MODE)
     dcvrb_tracker = DCVRBTracker(slippage_mode=SLIPPAGE_MODE)
     reversal_prob = ReversalProbabilityProvider()
+    range_tracker = HourlyRangeTracker()
 
     _warm_up(btc_ticks)
 
@@ -560,7 +569,7 @@ def run() -> None:
 
         try:
             _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker,
-                  clc_tracker, dcvrb_tracker, reversal_prob)
+                  clc_tracker, dcvrb_tracker, reversal_prob, range_tracker)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
 

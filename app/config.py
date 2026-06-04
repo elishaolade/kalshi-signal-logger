@@ -32,7 +32,18 @@ SLIPPAGE_MODE = os.getenv("SLIPPAGE_MODE", "realistic")
 SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 
 # ── External API ─────────────────────────────────────────────────────────────
-KALSHI_API_BASE = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")
+KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")
+KALSHI_API_TIMEOUT_SECONDS = float(os.getenv("KALSHI_API_TIMEOUT_SECONDS", "8"))
+
+# ── Hourly BTC range market discovery ────────────────────────────────────────
+# Set ONE of these in .env to enable range-market observation.
+# KALSHI_BTC_RANGE_EVENT_TICKER  — a specific single event  (e.g. KXBTC-25060313)
+# KALSHI_BTC_RANGE_SERIES_TICKER — a whole series            (e.g. KXBTCR)
+# If both are empty the HourlyRangeTracker skips silently.
+KALSHI_BTC_RANGE_EVENT_TICKER  = os.getenv("KALSHI_BTC_RANGE_EVENT_TICKER",  "")
+KALSHI_BTC_RANGE_SERIES_TICKER = os.getenv("KALSHI_BTC_RANGE_SERIES_TICKER", "")
+# How often (seconds) the range tracker polls Kalshi.  30s is fine for hourly markets.
+RANGE_MARKET_POLL_INTERVAL_SECONDS = float(os.getenv("RANGE_MARKET_POLL_INTERVAL_SECONDS", "30"))
 
 # ── Research API ─────────────────────────────────────────────────────────────
 RESEARCH_API_TOKEN = os.getenv("RESEARCH_API_TOKEN", "")
