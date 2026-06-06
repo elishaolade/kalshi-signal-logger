@@ -1144,3 +1144,106 @@ CREATE TABLE IF NOT EXISTS hourly_range_observations (
     INDEX idx_hro_state        (range_state),
     INDEX idx_hro_inside       (market_ticker, inside_band)
 );
+
+
+-- ============================================================================
+-- 20. repricing_discrepancy_runs
+--     One row per execution of repricing_discrepancy_backtest.py.
+--     Stores the full parameter grid and summary counts.
+--
+-- 21. repricing_discrepancy_events
+--     One row per detected BTC burst event.  All threshold qualifications
+--     (N=40/50/60, X=0.01/0.02/0.03) and forward repricing measurements
+--     (Z=10/20/30/45/60s) are stored as columns for flexible report slicing.
+--
+--     BTC burst:  net dollar move >= $40/$50/$60 over a 30-second window.
+--     Direction:  BTC up → implied side = YES; BTC down → implied side = NO.
+--     Reaction:   implied-side mid_price change over same 30s window.
+--     Underreaction: reaction < X cents.
+--     Forward:    subsequent implied-side mid and bid/ask P&L over Z seconds.
+--
+--     RESEARCH ONLY — no live trading, no order execution.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS repricing_discrepancy_runs (
+    id                  BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    burst_window_s      INT          NOT NULL DEFAULT 30,
+    n_thresholds        JSON,
+    x_thresholds        JSON,
+    z_windows           JSON,
+    slippage_mode       VARCHAR(12)  NOT NULL,
+    contract_price_field VARCHAR(10) NOT NULL DEFAULT 'mid',
+    cooldown_s          INT          NOT NULL DEFAULT 30,
+    data_start          DATETIME(3),
+    data_end            DATETIME(3),
+    n_markets           INT          DEFAULT 0,
+    n_burst_events      INT          DEFAULT 0,
+    n_underreaction_x01 INT          DEFAULT 0,
+    n_underreaction_x02 INT          DEFAULT 0,
+    n_underreaction_x03 INT          DEFAULT 0,
+    notes               TEXT,
+    created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_rpdr_created (created_at)
+);
+
+CREATE TABLE IF NOT EXISTS repricing_discrepancy_events (
+    id                  BIGINT        AUTO_INCREMENT PRIMARY KEY,
+    run_id              BIGINT        NOT NULL,
+    market_ticker       VARCHAR(100)  NOT NULL,
+    event_time          DATETIME(3)   NOT NULL,
+    implied_side        ENUM('YES','NO') NOT NULL,
+    btc_price_start     DECIMAL(14,2) NULL,
+    btc_price_end       DECIMAL(14,2) NULL,
+    btc_move            DECIMAL(10,2) NULL,
+    btc_move_abs        DECIMAL(10,2) NULL,
+    qualified_n40       BOOLEAN       NOT NULL DEFAULT 1,
+    qualified_n50       BOOLEAN       NULL,
+    qualified_n60       BOOLEAN       NULL,
+    contract_mid_start  DECIMAL(6,4)  NULL,
+    contract_mid_end    DECIMAL(6,4)  NULL,
+    contract_change     DECIMAL(8,4)  NULL,
+    underreaction_x01   BOOLEAN       NULL,
+    underreaction_x02   BOOLEAN       NULL,
+    underreaction_x03   BOOLEAN       NULL,
+    contract_ask        DECIMAL(6,4)  NULL,
+    contract_bid        DECIMAL(6,4)  NULL,
+    contract_spread     DECIMAL(6,4)  NULL,
+    spread_bucket       VARCHAR(12)   NULL,
+    time_remaining_s    INT           NULL,
+    contract_age_s      INT           NULL,
+    volatility_regime   VARCHAR(12)   NULL,
+    entry_sim           DECIMAL(6,4)  NULL,
+    fwd_mid_10s         DECIMAL(8,4)  NULL,
+    fwd_mid_20s         DECIMAL(8,4)  NULL,
+    fwd_mid_30s         DECIMAL(8,4)  NULL,
+    fwd_mid_45s         DECIMAL(8,4)  NULL,
+    fwd_mid_60s         DECIMAL(8,4)  NULL,
+    fwd_mfe_10s         DECIMAL(8,4)  NULL,
+    fwd_mfe_20s         DECIMAL(8,4)  NULL,
+    fwd_mfe_30s         DECIMAL(8,4)  NULL,
+    fwd_mfe_45s         DECIMAL(8,4)  NULL,
+    fwd_mfe_60s         DECIMAL(8,4)  NULL,
+    fwd_mae_10s         DECIMAL(8,4)  NULL,
+    fwd_mae_20s         DECIMAL(8,4)  NULL,
+    fwd_mae_30s         DECIMAL(8,4)  NULL,
+    fwd_mae_45s         DECIMAL(8,4)  NULL,
+    fwd_mae_60s         DECIMAL(8,4)  NULL,
+    pnl_10s             DECIMAL(8,4)  NULL,
+    pnl_20s             DECIMAL(8,4)  NULL,
+    pnl_30s             DECIMAL(8,4)  NULL,
+    pnl_45s             DECIMAL(8,4)  NULL,
+    pnl_60s             DECIMAL(8,4)  NULL,
+    created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_rpde_run       (run_id),
+    INDEX idx_rpde_market    (market_ticker),
+    INDEX idx_rpde_time      (event_time),
+    INDEX idx_rpde_side      (run_id, implied_side),
+    INDEX idx_rpde_n50       (run_id, qualified_n50),
+    INDEX idx_rpde_n60       (run_id, qualified_n60),
+    INDEX idx_rpde_under_x01 (run_id, underreaction_x01),
+    INDEX idx_rpde_under_x02 (run_id, underreaction_x02),
+    INDEX idx_rpde_under_x03 (run_id, underreaction_x03),
+    CONSTRAINT fk_rpde_run
+        FOREIGN KEY (run_id) REFERENCES repricing_discrepancy_runs (id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
