@@ -121,6 +121,57 @@ def _containment_confidence(
     return round(max(0.0, min(1.0, conf)), 4)
 
 
+def _select_nearby_markets(
+    markets: list[dict],
+    btc_price: float,
+    *,
+    nearest_above: int = 5,
+    nearest_below: int = 5,
+) -> list[dict]:
+    """
+    Keep the spot-containing band plus the nearest bands above and below.
+
+    This trims the full hourly surface down to the contracts that are plausible
+    outcomes from the current BTC price while still preserving enough context
+    around spot for research.
+    """
+    containing: list[dict] = []
+    below: list[tuple[float, dict]] = []
+    above: list[tuple[float, dict]] = []
+
+    for market in markets:
+        try:
+            floor_s = float(market["floor_strike"])
+            cap_s = float(market["cap_strike"])
+            center = float(market["band_center"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if floor_s <= btc_price <= cap_s:
+            containing.append(market)
+        elif center < btc_price:
+            below.append((btc_price - center, market))
+        else:
+            above.append((center - btc_price, market))
+
+    below.sort(key=lambda item: item[0])
+    above.sort(key=lambda item: item[0])
+
+    selected = containing + [market for _, market in below[:nearest_below]]
+    selected.extend(market for _, market in above[:nearest_above])
+
+    # Preserve first-seen order for duplicates and API quirks.
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for market in selected:
+        ticker = market.get("ticker")
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        deduped.append(market)
+    return deduped
+
+
 # ── Tracker ───────────────────────────────────────────────────────────────────
 
 class HourlyRangeTracker:
@@ -189,19 +240,24 @@ class HourlyRangeTracker:
             logger.warning("HourlyRangeTracker: Kalshi fetch failed — %s", exc)
             return
 
+        selected_markets = _select_nearby_markets(markets, btc_price)
+
         # 2. Compute BTC features once for all markets this cycle.
         vol30  = rolling_std(btc_ticks, 30.0) or None
         vol60  = rolling_std(btc_ticks, 60.0) or None
         vel10  = btc_velocity(btc_ticks, window_seconds=10.0)
         vel30  = btc_velocity(btc_ticks, window_seconds=30.0)
 
-        current_tickers: set[str] = set()
+        current_open_tickers = {
+            mkt.get("ticker") for mkt in markets if mkt.get("ticker")
+        }
+        observed_tickers: set[str] = set()
 
-        for mkt in markets:
+        for mkt in selected_markets:
             ticker = mkt.get("ticker")
             if not ticker:
                 continue
-            current_tickers.add(ticker)
+            observed_tickers.add(ticker)
 
             # Compute timing fields.
             close_time       = mkt.get("close_time")
@@ -273,20 +329,21 @@ class HourlyRangeTracker:
             )
 
         # 4. Detect markets that have closed (were open last cycle, absent now).
-        closed_tickers = self._known_open - current_tickers
+        closed_tickers = self._known_open - current_open_tickers
         for ticker in closed_tickers:
             try:
                 self._settle_market(ticker, btc_price, now_dt)
             except Exception as exc:
                 logger.warning("Failed to settle market %s: %s", ticker, exc)
 
-        self._known_open = current_tickers
+        self._known_open = current_open_tickers
 
         if markets:
             logger.info(
-                "HourlyRangeTracker: %d range market(s) observed  "
+                "HourlyRangeTracker: %d open range market(s) fetched, "
+                "%d nearby market(s) observed  "
                 "%d settled this cycle",
-                len(markets), len(closed_tickers),
+                len(markets), len(observed_tickers), len(closed_tickers),
             )
 
     # ── DB helpers ─────────────────────────────────────────────────────────────
