@@ -5,3 +5,4 @@ httpx>=0.25.0
 fastapi>=0.115.0
 uvicorn>=0.30.0
 tzdata>=2024.1          # IANA tz database for zoneinfo on systems without /usr/share/zoneinfo
+cryptography>=42.0.0    # RSA signing for Kalshi API authentication

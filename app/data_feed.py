@@ -3,15 +3,20 @@ data_feed.py
 
 Real data:
   - Kraken public REST API for BTC/USD spot price (no auth needed)
+  - Kalshi production REST API for market and contract data
+    Authenticated via RSA key pair when KALSHI_KEY_ID + KALSHI_KEY_FILE are set.
+    Falls back to unauthenticated (public endpoints only) when keys are absent.
 
-Mock data (active until live Kalshi endpoints are wired up):
+Mock data (fallback when Kalshi API is unavailable):
   - BTC price random walk, seeded from Kraken when available
   - 15-minute BTC up/down market aligned to the current clock window
   - Binary contract bid/ask priced from a probability model (not Kalshi)
 """
 
+import base64
 import logging
 import math
+import os
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -23,6 +28,8 @@ from app.config import (
     KALSHI_API_TIMEOUT_SECONDS,
     KALSHI_BTC_RANGE_EVENT_TICKER,
     KALSHI_BTC_RANGE_SERIES_TICKER,
+    KALSHI_KEY_FILE,
+    KALSHI_KEY_ID,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,12 +226,91 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+# ── Kalshi RSA authentication ─────────────────────────────────────────────────
+
+# Private key is loaded once at module import and cached.
+# If the key file is missing or keys aren't configured, _KALSHI_PRIVATE_KEY
+# stays None and all requests are made without auth headers.
+
+_KALSHI_PRIVATE_KEY = None
+
+def _load_private_key():
+    """Load the RSA private key from KALSHI_KEY_FILE. Called once at import."""
+    global _KALSHI_PRIVATE_KEY
+    if not KALSHI_KEY_ID or not KALSHI_KEY_FILE:
+        return
+    if not os.path.exists(KALSHI_KEY_FILE):
+        logger.warning(
+            "KALSHI_KEY_FILE=%r not found — requests will be unauthenticated",
+            KALSHI_KEY_FILE,
+        )
+        return
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        with open(KALSHI_KEY_FILE, "rb") as f:
+            _KALSHI_PRIVATE_KEY = load_pem_private_key(f.read(), password=None)
+        logger.info("Kalshi private key loaded from %s (key_id=%s)", KALSHI_KEY_FILE, KALSHI_KEY_ID)
+    except Exception as exc:
+        logger.warning("Failed to load Kalshi private key: %s — requests will be unauthenticated", exc)
+
+
+_load_private_key()
+
+
+def _kalshi_auth_headers(method: str, path: str) -> dict[str, str]:
+    """
+    Build Kalshi RSA authentication headers for a single request.
+
+    Kalshi signs: {timestamp_ms}{METHOD}{path}
+      timestamp_ms — current Unix time in milliseconds as a string
+      METHOD       — uppercase HTTP verb (GET, POST, …)
+      path         — URL path only, no host, no query string
+                     e.g.  /trade-api/v2/markets
+
+    Signature algorithm: RSA-PSS with SHA-256, DIGEST_LENGTH salt.
+
+    Returns an empty dict when auth is not configured, so unauthenticated
+    requests continue to work for public endpoints.
+    """
+    if _KALSHI_PRIVATE_KEY is None or not KALSHI_KEY_ID:
+        return {}
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    timestamp_ms = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    message      = (timestamp_ms + method.upper() + path).encode("utf-8")
+
+    signature = _KALSHI_PRIVATE_KEY.sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+
+    return {
+        "KALSHI-ACCESS-KEY":       KALSHI_KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+    }
+
+
 def _kalshi_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Single GET against the Kalshi public REST API.  Raises on HTTP errors."""
-    base = KALSHI_API_BASE.rstrip("/")
-    url  = f"{base}/{path.lstrip('/')}"
+    """
+    Single GET against the Kalshi REST API.
+
+    Adds RSA auth headers automatically when KALSHI_KEY_ID and KALSHI_KEY_FILE
+    are configured. Falls back to unauthenticated for public endpoints.
+    Raises on HTTP errors — callers should catch and log.
+    """
+    base    = KALSHI_API_BASE.rstrip("/")
+    url_path = "/" + path.lstrip("/")
+    url     = base + url_path
+    headers = _kalshi_auth_headers("GET", url_path)
     with httpx.Client(timeout=KALSHI_API_TIMEOUT_SECONDS) as client:
-        resp = client.get(url, params=params)
+        resp = client.get(url, params=params, headers=headers)
         resp.raise_for_status()
         return resp.json()
 

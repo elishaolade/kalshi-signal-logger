@@ -35,6 +35,14 @@ SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
 KALSHI_API_TIMEOUT_SECONDS = float(os.getenv("KALSHI_API_TIMEOUT_SECONDS", "8"))
 
+# ── Kalshi API authentication (RSA key pair) ──────────────────────────────────
+# Both must be set together to enable authenticated requests.
+# KALSHI_KEY_ID   — the key ID shown in your Kalshi API settings
+# KALSHI_KEY_FILE — path to the RSA private key PEM file
+# When either is absent, requests fall back to unauthenticated (public endpoints only).
+KALSHI_KEY_ID   = os.getenv("KALSHI_KEY_ID",   "").strip()
+KALSHI_KEY_FILE = os.getenv("KALSHI_KEY_FILE", "").strip()
+
 # ── Hourly BTC range market discovery ────────────────────────────────────────
 # Set ONE of these in .env to enable range-market observation.
 # KALSHI_BTC_RANGE_EVENT_TICKER  — a specific single event  (e.g. KXBTC-25060313)
