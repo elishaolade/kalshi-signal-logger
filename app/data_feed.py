@@ -276,8 +276,8 @@ def _normalize_range_market(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
             raw.get("last_price") or raw.get("last_price_dollars")
             or raw.get("previous_price_dollars")
         ),
-        "volume":    _parse_float(raw.get("volume")    or raw.get("volume_dollars")),
-        "liquidity": _parse_float(raw.get("liquidity") or raw.get("liquidity_dollars")),
+        "volume":    _parse_float(raw.get("volume")    or raw.get("volume_dollars")    or raw.get("volume_fp")),
+        "liquidity": _parse_float(raw.get("liquidity") or raw.get("liquidity_dollars") or raw.get("liquidity_fp")),
     }
 
 

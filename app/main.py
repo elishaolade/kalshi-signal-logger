@@ -1,57 +1,53 @@
 """
-main.py — Main polling loop for the Kalshi BTC signal logger.
+main.py — Research ingestion loop for the Kalshi BTC market logger.
+
+Purpose
+-------
+Capture what happened, when it happened, and what the market knew
+at that moment. No signals. No strategies. No predictions.
 
 Poll cycle (every POLL_INTERVAL_SECONDS):
   1.  Fetch BTC price             (Kraken → mock fallback)
-  2.  Get active 15-min market    (mock)
+  2.  Fetch active Kalshi market  (production API → mock fallback)
   3.  Upsert market row           → markets
-  4.  Store BTC tick              → btc_ticks
-  5.  Get YES/NO contract prices  (mock pricing model)
-  6.  Store contract ticks        → contract_ticks
-  7.  Maintain BTC history        (in-memory deque, warm-started from DB)
-  8.  Evaluate strategies         premium_momentum_continuation/v1 (NO active, YES watch-only)
-                                  premium_no_midrange_scalp/v1    (NO only, paper_active)
-                                  premium_momentum_scalp/v2       (watch-only — conflicts with PNMS)
-  9.  Deduplicate signals          cooldown window per (rule/version/side/ticker)
-  10. Insert fired signals         → signals
-  11. Open paper trades            → paper_trades  (via PaperTrader)
-  12. Update open trades           exit checks + → trade_snapshots
-  13. Log console summary
+  4.  Upsert contract rows        → contracts  (YES + NO, once per market)
+  5.  Insert market snapshot      → market_snapshots
+  6.  Insert contract snapshots   → contract_snapshots  (YES + NO)
+  7.  Compute + insert metrics    → market_metrics
+
+All writes are insert-only for snapshots. Markets and contracts are
+upserted (one row per unique market — not one per poll).
 
 No live trades are placed at any point.
 """
-
 from __future__ import annotations
 
 import collections
+import json
 import logging
 import signal
+import statistics
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.config import (
     LIVE_TRADING_ENABLED,
-    PAPER_POSITION_SIZE,
     POLL_INTERVAL_SECONDS,
-    SIGNAL_TIMEZONE,
-    SLIPPAGE_MODE,
 )
 from app.data_feed import (
-    get_active_mock_market,
     get_btc_price,
+    get_kalshi_markets,
+    get_active_mock_market,
     get_mock_contract_prices,
+    _parse_float,
+    _parse_dt,
+    KALSHI_BTC_RANGE_SERIES_TICKER,
 )
-from app.clc_reversal_tracker import CLCReversalTracker
-from app.dcvrb_tracker import DCVRBTracker
-from app.db import execute_query, fetch_all, insert_and_get_id, get_pool
-from app.features import Tick, rolling_std, volatility_regime
-from app.hourly_range_tracker import HourlyRangeTracker
-from app.observation_tracker import ObservationTracker
-from app.paper_trader import PaperTrader
-from app.reversal_probability import ReversalProbabilityProvider
-from app.strategies import Signal, clc_late_skip_stats, clc_skip_stats, run_all
+from app.db import execute_query, fetch_all, fetch_one, insert_and_get_id, get_pool
+from app.features import Tick
+from app.models import MarketMetrics, MarketSnapshot
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -64,450 +60,473 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# How long to suppress duplicate signals for the same rule/side/market.
-SIGNAL_COOLDOWN_SECONDS = int(30)
-
-# In-memory BTC tick buffer depth.  120s features + overhead at 2s polling ≈ 90
-# ticks minimum; 600 gives ~20 minutes of history for restarts and analysis.
+# In-memory BTC tick buffer.
+# 15m window at 2s polling = 450 ticks; 600 gives 20 min of rolling history.
 BTC_TICK_BUFFER = 600
-
-# Per-side contract mid buffer depth.  ~16 minutes at 2s polling — enough to
-# cover a full 15-minute window so "low since open" and windowed contract
-# changes are scoped to one market.  Reset automatically on market rollover.
-CONTRACT_TICK_BUFFER = 500
-
-# How far back to pre-load BTC ticks from the DB on startup.
-WARMUP_LOOKBACK_SECONDS = 180
-
-# How often to flush the CLC near-miss funnel counter to the log (seconds).
-CLC_SKIP_FLUSH_SECONDS = 600
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
-_stop_event = False   # set to True by signal handler; checked in loop
+_stop_event = False
 
 
 def _on_shutdown(signum: int, _frame) -> None:
     global _stop_event
-    name = signal.Signals(signum).name
-    logger.info("Shutdown requested (%s) — finishing current tick then stopping", name)
+    logger.info("Shutdown requested (%s) — finishing current tick", signal.Signals(signum).name)
     _stop_event = True
 
 
-# ── Signal cooldown tracker ───────────────────────────────────────────────────
+# ── In-memory state ───────────────────────────────────────────────────────────
 
-class _Cooldown:
+# market_id (str) → markets.id (int)
+_market_id_cache: dict[str, int] = {}
+
+# market_id (str) → {side: contracts.id (int)}
+_contract_id_cache: dict[str, dict[str, int]] = {}
+
+# market_id (str) → current snapshot_sequence counter
+_snapshot_sequence: dict[str, int] = collections.defaultdict(int)
+
+
+# ── Kalshi market fetcher ──────────────────────────────────────────────────────
+
+_kalshi_market_cache: Optional[dict] = None
+_kalshi_market_cache_ts: float = 0.0
+_KALSHI_CACHE_TTL = 30.0  # seconds
+
+
+def _get_active_kalshi_market(btc_price: float) -> dict:
     """
-    Prevents the same strategy/side/market from firing more than once per
-    cooldown window.  Keyed by "rule_name/rule_version/side/market_ticker".
+    Return the nearest-expiry Kalshi BTC binary market closest to current BTC price.
+    Falls back to the mock market on any failure.
+
+    Returns a dict with keys:
+        market_id, title, market_type, target_price,
+        opens_at, closes_at, time_remaining_seconds, status,
+        _raw  (full Kalshi API payload for raw_payload storage)
     """
+    global _kalshi_market_cache, _kalshi_market_cache_ts
 
-    def __init__(self, window_seconds: int) -> None:
-        self._window = timedelta(seconds=window_seconds)
-        self._last: dict[str, datetime] = {}
+    now_ts = time.monotonic()
+    if _kalshi_market_cache and now_ts - _kalshi_market_cache_ts < _KALSHI_CACHE_TTL:
+        return _update_timing(_kalshi_market_cache)
 
-    def is_blocked(self, key: str) -> bool:
-        last = self._last.get(key)
-        return last is not None and (datetime.now(timezone.utc) - last) < self._window
+    series = KALSHI_BTC_RANGE_SERIES_TICKER or "KXBTC"
+    try:
+        raw_markets = get_kalshi_markets(series_ticker=series, status="open")
+    except Exception as exc:
+        logger.warning("Kalshi fetch failed: %s — using mock market", exc)
+        return _mock_market_as_v2(btc_price)
 
-    def mark(self, key: str) -> None:
-        self._last[key] = datetime.now(timezone.utc)
+    # Binary (T) markets: have floor_strike, no cap_strike.
+    binary = []
+    for m in raw_markets:
+        fs = _parse_float(m.get("floor_strike"))
+        cs = _parse_float(m.get("cap_strike"))
+        if fs is not None and cs is None:
+            ct = _parse_dt(m.get("close_time"))
+            binary.append({"raw": m, "floor_strike": fs, "close_time": ct})
 
-    def evict_expired(self) -> None:
-        """Prune stale entries to prevent unbounded growth."""
-        now = datetime.now(timezone.utc)
-        expired = [k for k, v in self._last.items() if now - v >= self._window]
-        for k in expired:
-            del self._last[k]
+    if not binary:
+        logger.warning("No Kalshi BTC binary markets found — using mock")
+        return _mock_market_as_v2(btc_price)
+
+    binary.sort(key=lambda x: x["close_time"] or datetime.max.replace(tzinfo=timezone.utc))
+    nearest_close = binary[0]["close_time"]
+    same_expiry   = [b for b in binary if b["close_time"] == nearest_close]
+    best          = min(same_expiry, key=lambda b: abs(b["floor_strike"] - btc_price))
+    raw           = best["raw"]
+
+    result = {
+        "market_id":    raw.get("ticker"),
+        "title":        raw.get("title") or raw.get("yes_sub_title") or "",
+        "market_type":  "binary",
+        "target_price": best["floor_strike"],
+        "opens_at":     _parse_dt(raw.get("open_time")),
+        "closes_at":    best["close_time"],
+        "settles_at":   None,
+        "status":       "open",
+        "_raw":         raw,
+    }
+    _kalshi_market_cache    = result
+    _kalshi_market_cache_ts = now_ts
+    return _update_timing(result)
 
 
-# ── Contract-mid history ──────────────────────────────────────────────────────
+def _update_timing(market: dict) -> dict:
+    """Recompute time_remaining_seconds without hitting the API."""
+    now       = datetime.now(timezone.utc)
+    closes_at = market.get("closes_at")
+    tte       = max(0, int((closes_at - now).total_seconds())) if closes_at else None
+    return {**market, "time_remaining_seconds": tte}
 
-class _ContractHistory:
+
+def _mock_market_as_v2(btc_price: float) -> dict:
+    """Wrap get_active_mock_market() into the v2 dict format."""
+    m = get_active_mock_market()
+    return {
+        "market_id":              m["market_ticker"],
+        "title":                  None,
+        "market_type":            "binary",
+        "target_price":           m["target_price"],
+        "opens_at":               m["open_time"],
+        "closes_at":              m["close_time"],
+        "settles_at":             None,
+        "status":                 "open",
+        "time_remaining_seconds": int(m["time_remaining_seconds"]),
+        "_raw":                   None,
+    }
+
+
+def _get_contract_prices(market: dict, btc_price: float) -> dict[str, dict]:
     """
-    Per-side rolling buffer of contract mid prices for the *current* market.
-
-    Buffers are cleared automatically when the active market_ticker changes, so
-    "low since open" and windowed price changes are always scoped to a single
-    15-minute window.  Mirrors the in-memory btc_ticks buffer pattern.
+    Extract YES/NO bid/ask from a Kalshi market dict.
+    Falls back to mock pricing when real prices are unavailable.
+    Returns {"YES": {bid_price, ask_price, last_price, spread, volume, source}, "NO": ...}
     """
+    raw     = market.get("_raw") or {}
+    yes_bid = _parse_float(raw.get("yes_bid_dollars") or raw.get("yes_bid"))
+    yes_ask = _parse_float(raw.get("yes_ask_dollars") or raw.get("yes_ask"))
+    no_bid  = _parse_float(raw.get("no_bid_dollars")  or raw.get("no_bid"))
+    no_ask  = _parse_float(raw.get("no_ask_dollars")  or raw.get("no_ask"))
+    yes_last = _parse_float(
+        raw.get("last_price_dollars")
+        or raw.get("previous_price_dollars")
+        or raw.get("last_price")
+    )
 
-    def __init__(self, maxlen: int) -> None:
-        self._maxlen = maxlen
-        self._ticker: Optional[str] = None
-        self._bufs: dict[str, collections.deque] = {
-            "YES": collections.deque(maxlen=maxlen),
-            "NO":  collections.deque(maxlen=maxlen),
+    if yes_ask is None or yes_ask <= 0:
+        tte  = market.get("time_remaining_seconds") or 1
+        mock = get_mock_contract_prices(btc_price, market["target_price"], tte)
+        return {
+            "YES": {**mock["YES"], "bid_price": mock["YES"]["bid_price"],
+                    "ask_price": mock["YES"]["ask_price"],
+                    "volume": None, "source": "mock"},
+            "NO":  {**mock["NO"],  "bid_price": mock["NO"]["bid_price"],
+                    "ask_price": mock["NO"]["ask_price"],
+                    "volume": None, "source": "mock"},
         }
 
-    def observe(
-        self,
-        market_ticker: str,
-        contract_prices: dict[str, dict],
-        ts: float,
-    ) -> dict[str, list[Tick]]:
-        """Append this cycle's mids and return {side: list[Tick]} history."""
-        if market_ticker != self._ticker:
-            self._ticker = market_ticker
-            for buf in self._bufs.values():
-                buf.clear()
+    yes_bid  = yes_bid or 0.0
+    no_bid   = no_bid  or round(1.0 - yes_ask, 4)
+    no_ask   = no_ask  or round(1.0 - yes_bid, 4)
+    no_last  = round(1.0 - yes_last, 4) if yes_last is not None else None
+    volume   = int(_parse_float(
+        raw.get("volume_fp") or raw.get("volume_dollars") or raw.get("volume")
+    ) or 0) or None
 
-        for side in ("YES", "NO"):
-            mid = contract_prices.get(side, {}).get("mid_price")
-            if mid is not None:
-                self._bufs[side].append(Tick(price=float(mid), ts=ts))
-
-        return {side: list(buf) for side, buf in self._bufs.items()}
+    return {
+        "YES": {"bid_price": yes_bid, "ask_price": yes_ask,
+                "last_price": yes_last, "spread": round(yes_ask - yes_bid, 4),
+                "volume": volume, "source": "kalshi"},
+        "NO":  {"bid_price": no_bid,  "ask_price": no_ask,
+                "last_price": no_last, "spread": round(no_ask - no_bid, 4),
+                "volume": volume, "source": "kalshi"},
+    }
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── DB write helpers ──────────────────────────────────────────────────────────
 
-def _upsert_market(market: dict) -> None:
+def _upsert_market(market: dict) -> int:
+    """Upsert market row. Returns markets.id."""
+    market_id = market["market_id"]
+    if market_id in _market_id_cache:
+        return _market_id_cache[market_id]
+
+    raw_json = json.dumps(market.get("_raw")) if market.get("_raw") else None
     execute_query(
         """
-        INSERT INTO markets (market_ticker, target_price, open_time, close_time)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO markets
+            (market_id, title, market_type, target_price,
+             opens_at, closes_at, status, raw_payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            target_price = VALUES(target_price),
-            open_time    = VALUES(open_time),
-            close_time   = VALUES(close_time)
+            title      = VALUES(title),
+            status     = VALUES(status),
+            updated_at = CURRENT_TIMESTAMP
         """,
         (
-            market["market_ticker"],
-            market["target_price"],
-            market["open_time"],
-            market["close_time"],
+            market_id,
+            market.get("title"),
+            market.get("market_type", "binary"),
+            market.get("target_price"),
+            market.get("opens_at"),
+            market.get("closes_at"),
+            market.get("status", "open"),
+            raw_json,
         ),
     )
+    row = fetch_one("SELECT id FROM markets WHERE market_id = %s", (market_id,))
+    db_id = row["id"]
+    _market_id_cache[market_id] = db_id
+    return db_id
 
 
-def _insert_btc_tick(
-    market_ticker: str,
-    btc_price: float,
-    recorded_at: datetime,
-) -> None:
-    execute_query(
-        "INSERT INTO btc_ticks (market_ticker, btc_price, source, recorded_at) "
-        "VALUES (%s, %s, 'kraken_or_mock', %s)",
-        (market_ticker, btc_price, recorded_at),
-    )
+def _upsert_contracts(market_db_id: int, market_id: str) -> dict[str, int]:
+    """
+    Upsert YES + NO contract rows for a market.
+    Returns {"YES": contracts.id, "NO": contracts.id}.
+    """
+    if market_id in _contract_id_cache:
+        return _contract_id_cache[market_id]
+
+    ids: dict[str, int] = {}
+    for side in ("YES", "NO"):
+        contract_id = f"{market_id}_{side}"
+        execute_query(
+            """
+            INSERT INTO contracts (market_id, contract_id, side, status)
+            VALUES (%s, %s, %s, 'open')
+            ON DUPLICATE KEY UPDATE status = 'open', updated_at = CURRENT_TIMESTAMP
+            """,
+            (market_db_id, contract_id, side),
+        )
+        row = fetch_one("SELECT id FROM contracts WHERE contract_id = %s", (contract_id,))
+        ids[side] = row["id"]
+
+    _contract_id_cache[market_id] = ids
+    return ids
 
 
-def _insert_contract_tick(
-    market_ticker: str,
-    side: str,
-    quotes: dict,
-    time_remaining: float,
-    contract_age: float,
-    recorded_at: datetime,
-) -> None:
-    execute_query(
-        """
-        INSERT INTO contract_ticks (
-            market_ticker, side,
-            bid_price, ask_price, mid_price, last_price, spread,
-            time_remaining_seconds, contract_age_seconds,
-            recorded_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            market_ticker, side,
-            quotes.get("bid_price"),
-            quotes.get("ask_price"),
-            quotes.get("mid_price"),
-            quotes.get("last_price"),
-            quotes.get("spread"),
-            int(time_remaining),
-            int(contract_age),
-            recorded_at,
-        ),
-    )
+def _insert_market_snapshot(
+    market_db_id: int,
+    market_id:    str,
+    captured_at:  datetime,
+    btc_price:    float,
+    tte:          Optional[int],
+    raw_payload:  Optional[dict],
+) -> int:
+    """Insert one market_snapshot row. Returns market_snapshots.id."""
+    _snapshot_sequence[market_id] += 1
+    seq      = _snapshot_sequence[market_id]
+    raw_json = json.dumps(raw_payload) if raw_payload else None
 
-
-def _insert_signal(sig: Signal) -> int:
     return insert_and_get_id(
         """
-        INSERT INTO signals (
-            market_ticker, rule_name, rule_version, side,
-            contract_price, bid_price, ask_price, spread,
-            btc_price, target_price, gap, directional_gap, gap_z_score,
-            contract_age_seconds, time_remaining_seconds,
-            momentum_score, reversal_score, btc_velocity,
-            volatility_30s, volatility_60s, volatility_120s,
-            edge, confidence_score, reason, signal_status, recorded_at,
-            entry_date, entry_time, entry_hour, entry_minute,
-            entry_day_of_week, entry_day_name, entry_is_weekend,
-            entry_15m_block, entry_30m_block, entry_hour_block,
-            market_open_time, market_close_time, timezone_used
-        ) VALUES (
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s, %s,
-            %s, %s, %s,
-            %s, %s, %s,
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s,
-            %s, %s, %s,
-            %s, %s, %s
+        INSERT INTO market_snapshots
+            (market_id, snapshot_sequence, captured_at,
+             btc_price, time_remaining_seconds, source, raw_payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (market_db_id, seq, captured_at, btc_price, tte, "kraken", raw_json),
+    )
+
+
+def _insert_contract_snapshots(
+    snapshot_id:  int,
+    contract_ids: dict[str, int],
+    captured_at:  datetime,
+    prices:       dict[str, dict],
+) -> None:
+    """Insert YES + NO contract_snapshots for one poll cycle."""
+    for side, price_data in prices.items():
+        cid = contract_ids.get(side)
+        if cid is None:
+            continue
+        bid = price_data.get("bid_price")
+        ask = price_data.get("ask_price")
+        if bid is None or ask is None:
+            continue
+        execute_query(
+            """
+            INSERT INTO contract_snapshots
+                (market_snapshot_id, contract_id, captured_at,
+                 last_price, bid_price, ask_price, spread, volume)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                snapshot_id, cid, captured_at,
+                price_data.get("last_price"),
+                bid, ask,
+                price_data.get("spread"),
+                price_data.get("volume"),
+            ),
         )
+
+
+def _insert_market_metrics(
+    snapshot_id:  int,
+    captured_at:  datetime,
+    btc_price:    float,
+    target_price: Optional[float],
+    btc_ticks:    list[Tick],
+) -> None:
+    """Compute and insert one market_metrics row."""
+
+    # Distance from strike
+    distance     : Optional[float] = None
+    distance_pct : Optional[float] = None
+    above        : Optional[bool]  = None
+    if target_price and target_price > 0:
+        distance     = round(btc_price - target_price, 2)
+        distance_pct = round((btc_price - target_price) / target_price * 100, 6)
+        above        = btc_price > target_price
+
+    def _price_ago(seconds: float) -> Optional[float]:
+        if not btc_ticks:
+            return None
+        cutoff = btc_ticks[-1].ts - seconds
+        for tick in reversed(btc_ticks[:-1]):
+            if tick.ts <= cutoff:
+                return tick.price
+        return None
+
+    def _pct_return(lag_s: float) -> Optional[float]:
+        past = _price_ago(lag_s)
+        if past is None or past == 0:
+            return None
+        return round((btc_price - past) / past, 8)
+
+    def _return_stddev(window_s: float) -> Optional[float]:
+        if len(btc_ticks) < 2:
+            return None
+        cutoff = btc_ticks[-1].ts - window_s
+        window = [t for t in btc_ticks if t.ts >= cutoff]
+        if len(window) < 2:
+            return None
+        rets = [
+            window[i].price / window[i - 1].price - 1
+            for i in range(1, len(window))
+            if window[i - 1].price > 0
+        ]
+        if len(rets) < 2:
+            return None
+        try:
+            return round(statistics.stdev(rets), 8)
+        except statistics.StatisticsError:
+            return None
+
+    execute_query(
+        """
+        INSERT INTO market_metrics (
+            market_snapshot_id, captured_at,
+            distance_from_target, distance_from_target_pct, is_above_target,
+            btc_return_30s, btc_return_1m, btc_return_5m,
+            btc_return_stddev_1m, btc_return_stddev_3m,
+            btc_return_stddev_5m, btc_return_stddev_15m
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
-            sig.market_ticker, sig.rule_name, sig.rule_version, sig.side,
-            sig.contract_price, sig.bid_price, sig.ask_price, sig.spread,
-            sig.btc_price, sig.target_price,
-            sig.gap, sig.directional_gap, sig.gap_z_score,
-            sig.contract_age_seconds, sig.time_remaining_seconds,
-            sig.momentum_score, sig.reversal_score, sig.btc_velocity,
-            sig.volatility_30s, sig.volatility_60s, sig.volatility_120s,
-            sig.edge, sig.confidence_score,
-            sig.reason, sig.signal_status, sig.recorded_at,
-            # time-of-day fields
-            sig.entry_date, sig.entry_time_local, sig.entry_hour, sig.entry_minute,
-            sig.entry_day_of_week, sig.entry_day_name, sig.entry_is_weekend,
-            sig.entry_15m_block, sig.entry_30m_block, sig.entry_hour_block,
-            sig.market_open_time, sig.market_close_time, sig.timezone_used,
+            snapshot_id, captured_at,
+            distance, distance_pct, above,
+            _pct_return(30), _pct_return(60), _pct_return(300),
+            _return_stddev(60),  _return_stddev(180),
+            _return_stddev(300), _return_stddev(900),
         ),
     )
 
 
+# ── Warm-up ───────────────────────────────────────────────────────────────────
+
 def _warm_up(btc_ticks: collections.deque) -> None:
-    """Pre-load recent BTC ticks from DB so feature windows are populated at start."""
+    """Pre-load recent BTC prices from market_snapshots to seed the rolling buffer."""
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=WARMUP_LOOKBACK_SECONDS)
         rows = fetch_all(
-            "SELECT btc_price, recorded_at FROM btc_ticks "
-            "WHERE recorded_at >= %s ORDER BY recorded_at ASC",
-            (cutoff,),
+            "SELECT btc_price, captured_at FROM market_snapshots "
+            "ORDER BY captured_at DESC LIMIT %s",
+            (BTC_TICK_BUFFER,),
         )
-        for row in rows:
+        for row in reversed(rows):
             btc_ticks.append(Tick(
                 price=float(row["btc_price"]),
-                ts=row["recorded_at"].timestamp(),
+                ts=row["captured_at"].timestamp(),
             ))
         if btc_ticks:
-            logger.info("Warm-up: loaded %d BTC ticks from the last %ds",
-                        len(btc_ticks), WARMUP_LOOKBACK_SECONDS)
+            logger.info("Warm-up: loaded %d BTC prices from market_snapshots", len(btc_ticks))
         else:
-            logger.info("Warm-up: no recent ticks in DB — starting cold")
+            logger.info("Warm-up: no recent data in DB — starting cold")
     except Exception as exc:
-        logger.warning("Warm-up from DB failed (continuing cold): %s", exc)
+        logger.warning("Warm-up failed (continuing cold): %s", exc)
 
 
 # ── Console summary ───────────────────────────────────────────────────────────
 
 def _log_summary(
-    n: int,
-    btc_price: float,
-    target_price: float,
-    market_ticker: str,
-    time_remaining: float,
-    contract_prices: dict,
-    signals_fired: int,
-    trades_opened: int,
-    trades_open: int,
-    trades_closed: int,
+    n:           int,
+    btc_price:   float,
+    market_id:   str,
+    target:      Optional[float],
+    tte:         Optional[int],
+    prices:      dict,
 ) -> None:
-    yes = contract_prices.get("YES", {})
-    no  = contract_prices.get("NO",  {})
-    gap = btc_price - target_price
+    yes = prices.get("YES", {})
+    no  = prices.get("NO",  {})
+    gap = f"{btc_price - target:+,.0f}" if target else "—"
     logger.info(
-        "tick#%04d | BTC $%s  tgt $%s  gap %s | "
-        "YES %.2f/%.2f  NO %.2f/%.2f | "
-        "t=%ds | sigs=%d opened=%d open=%d closed=%d | %s",
+        "tick#%04d | BTC $%s  target $%s  gap %s | "
+        "YES %.3f/%.3f  NO %.3f/%.3f | tte=%ss  src=%s | %s",
         n,
-        f"{btc_price:,.0f}", f"{target_price:,.0f}", f"{gap:+,.0f}",
+        f"{btc_price:,.0f}",
+        f"{target:,.0f}" if target else "—",
+        gap,
         yes.get("bid_price", 0), yes.get("ask_price", 0),
         no.get("bid_price",  0), no.get("ask_price",  0),
-        int(time_remaining),
-        signals_fired, trades_opened, trades_open, trades_closed,
-        market_ticker,
+        tte if tte is not None else "—",
+        yes.get("source", "?"),
+        market_id,
     )
 
 
 # ── One poll cycle ────────────────────────────────────────────────────────────
 
-def _tick(
-    n: int,
-    btc_ticks: collections.deque,
-    cooldown: _Cooldown,
-    trader: PaperTrader,
-    contract_hist: _ContractHistory,
-    obs_tracker: ObservationTracker,
-    clc_tracker: CLCReversalTracker,
-    dcvrb_tracker: DCVRBTracker,
-    reversal_prob: ReversalProbabilityProvider,
-    range_tracker: HourlyRangeTracker,
-) -> None:
+def _tick(n: int, btc_ticks: collections.deque) -> None:
     now = datetime.now(timezone.utc)
 
-    # ── 1. BTC price ──────────────────────────────────────────────────────────
+    # 1. BTC price
     btc_price = get_btc_price()
-
-    # ── 2. Active market ──────────────────────────────────────────────────────
-    market          = get_active_mock_market()
-    market_ticker   = market["market_ticker"]
-    target_price    = market["target_price"]
-    time_remaining  = market["time_remaining_seconds"]
-    contract_age    = market["contract_age_seconds"]
-
-    # ── 3 + 4. Persist raw market and BTC data ────────────────────────────────
-    try:
-        _upsert_market(market)
-        _insert_btc_tick(market_ticker, btc_price, now)
-    except Exception as exc:
-        logger.warning("Failed to persist market/BTC row: %s", exc)
-
-    # ── 5. Contract prices ────────────────────────────────────────────────────
-    contract_prices = get_mock_contract_prices(btc_price, target_price, time_remaining)
-
-    # ── 6. Persist contract ticks ─────────────────────────────────────────────
-    try:
-        for side in ("YES", "NO"):
-            _insert_contract_tick(
-                market_ticker, side, contract_prices[side],
-                time_remaining, contract_age, now,
-            )
-    except Exception as exc:
-        logger.warning("Failed to persist contract tick(s): %s", exc)
-
-    # ── 7. Update in-memory BTC history ──────────────────────────────────────
     btc_ticks.append(Tick(price=btc_price, ts=now.timestamp()))
     ticks = list(btc_ticks)
 
-    # ── 7b. Update per-side contract-mid history (scoped to this market) ──────
-    contract_history = contract_hist.observe(market_ticker, contract_prices, now.timestamp())
+    # 2. Active market
+    market       = _get_active_kalshi_market(btc_price)
+    market_id    = market["market_id"]
+    target_price = market.get("target_price")
+    tte          = market.get("time_remaining_seconds")
 
-    # ── 8–11. Strategy evaluation, dedup, insert, trade open ─────────────────
-    signals_fired  = 0
-    trades_opened  = 0
-
-    if len(ticks) >= 2:                                  # need at least 2 ticks for features
-        fired = run_all(
-            ticks                  = ticks,
-            market_ticker          = market_ticker,
-            btc_price              = btc_price,
-            target_price           = target_price,
-            contract_age_seconds   = contract_age,
-            time_remaining_seconds = time_remaining,
-            contract_prices        = contract_prices,
-            contract_history       = contract_history,
-            reversal_prob_fn       = reversal_prob.lookup,
-            timezone_name          = SIGNAL_TIMEZONE,
-            market_open_time       = market.get("open_time"),
-            market_close_time      = market.get("close_time"),
-        )
-
-        for sig in fired:
-            cd_key = f"{sig.rule_name}/{sig.rule_version}/{sig.side}/{market_ticker}"
-
-            if cooldown.is_blocked(cd_key):
-                logger.debug("Cooldown — suppressing duplicate signal: %s", cd_key)
-                continue
-
-            try:
-                signal_id = _insert_signal(sig)
-            except Exception as exc:
-                logger.error("Failed to insert signal (%s): %s", cd_key, exc)
-                continue                         # don't open a trade without a DB signal row
-
-            cooldown.mark(cd_key)
-            signals_fired += 1
-            logger.info(
-                "Signal #%d fired: %s  side=%s  ask=%.4f",
-                signal_id, sig.rule_name, sig.side, sig.ask_price,
-            )
-
-            # watch_only signals are logged to the DB but must not open trades.
-            # Research signals that opt into shadow-tracking are registered with
-            # the ObservationTracker here (still NO paper trade is opened).
-            if sig.signal_status == "watch_only":
-                # Each tracker no-ops for rules it does not track, so we offer
-                # the signal to all.  Still NO paper trade is opened.
-                for _tracker in (obs_tracker, clc_tracker, dcvrb_tracker):
-                    try:
-                        _tracker.register(sig, signal_id, contract_prices)
-                    except Exception as exc:
-                        logger.error(
-                            "Failed to register observation (%s) for signal #%d: %s",
-                            type(_tracker).__name__, signal_id, exc,
-                        )
-                logger.debug(
-                    "Watch-only signal #%d — recorded but no trade opened", signal_id,
-                )
-                continue
-
-            try:
-                trade_id = trader.open_trade(sig, signal_id, contract_prices)
-                if trade_id:
-                    trades_opened += 1
-            except Exception as exc:
-                logger.error("Failed to open paper trade for signal #%d: %s",
-                             signal_id, exc)
-
-    # ── 12 + 13. Update open trades; snapshots written inside update() ────────
-    trades_closed: list[int] = []
+    # 3. Upsert market
     try:
-        trades_closed = trader.update(
-            market_ticker          = market_ticker,
-            contract_prices        = contract_prices,
-            btc_ticks              = ticks,
-            btc_price              = btc_price,
-            target_price           = target_price,
-            time_remaining_seconds = time_remaining,
+        market_db_id = _upsert_market(market)
+    except Exception as exc:
+        logger.warning("Failed to upsert market %s: %s", market_id, exc)
+        return
+
+    # 4. Upsert contracts
+    try:
+        contract_ids = _upsert_contracts(market_db_id, market_id)
+    except Exception as exc:
+        logger.warning("Failed to upsert contracts for %s: %s", market_id, exc)
+        return
+
+    # 5. Contract prices
+    prices = _get_contract_prices(market, btc_price)
+
+    # 6. Insert market snapshot
+    try:
+        snapshot_id = _insert_market_snapshot(
+            market_db_id=market_db_id,
+            market_id=market_id,
+            captured_at=now,
+            btc_price=btc_price,
+            tte=tte,
+            raw_payload={"btc_price": btc_price, "market_raw": market.get("_raw")},
         )
     except Exception as exc:
-        logger.error("Trade update error: %s", exc, exc_info=True)
+        logger.warning("Failed to insert market snapshot: %s", exc)
+        return
 
-    # ── 12b. Advance watch-only shadow observations (no trades) ───────────────
+    # 7. Insert contract snapshots
     try:
-        obs_tracker.update(
-            market_ticker          = market_ticker,
-            contract_prices        = contract_prices,
-            time_remaining_seconds = time_remaining,
-        )
+        _insert_contract_snapshots(snapshot_id, contract_ids, now, prices)
     except Exception as exc:
-        logger.error("Observation update error: %s", exc, exc_info=True)
+        logger.warning("Failed to insert contract snapshots: %s", exc)
 
-    # ── 12c. Advance CLC reversal observations (5 exit profiles, no trades) ───
+    # 8. Insert market metrics
     try:
-        vol_regime = volatility_regime(rolling_std(ticks, 60.0))
-        clc_tracker.update(
-            market_ticker          = market_ticker,
-            contract_prices        = contract_prices,
-            time_remaining_seconds = time_remaining,
-            volatility_regime      = vol_regime,
-        )
+        _insert_market_metrics(snapshot_id, now, btc_price, target_price, ticks)
     except Exception as exc:
-        logger.error("CLC observation update error: %s", exc, exc_info=True)
+        logger.warning("Failed to insert market metrics: %s", exc)
 
-    # ── 12d. Advance DCVRB observations (4 exit tests × 3 versions, no trades) ─
-    try:
-        dcvrb_tracker.update(
-            market_ticker          = market_ticker,
-            contract_prices        = contract_prices,
-            time_remaining_seconds = time_remaining,
-        )
-    except Exception as exc:
-        logger.error("DCVRB observation update error: %s", exc, exc_info=True)
-
-    # ── 12e. Hourly range market observations (research only, no trades) ──────
-    try:
-        range_tracker.observe(btc_price, list(btc_ticks))
-    except Exception as exc:
-        logger.error("Hourly range observation error: %s", exc, exc_info=True)
-
-    # ── Periodic cooldown eviction ────────────────────────────────────────────
-    if n % 60 == 0:
-        cooldown.evict_expired()
-
-    # ── 14. Console summary ───────────────────────────────────────────────────
-    _log_summary(
-        n, btc_price, target_price, market_ticker, time_remaining,
-        contract_prices, signals_fired, trades_opened,
-        trader.open_count, len(trades_closed),
-    )
+    # 9. Console summary
+    _log_summary(n, btc_price, market_id, target_price, tte, prices)
 
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
@@ -515,95 +534,54 @@ def _tick(
 def run() -> None:
     global _stop_event
 
-    # Hard guard — belt and suspenders alongside the db.py check.
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
             "LIVE_TRADING_ENABLED=true is not permitted — "
-            "this project is paper-only. Set it to false and restart."
+            "this project is research-only. Set it to false and restart."
         )
 
-    # Register OS signal handlers.
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT,  _on_shutdown)
 
-    logger.info("Kalshi signal logger starting (paper-only mode)")
+    logger.info("Kalshi market logger starting (research-only mode)")
 
-    # ── Connect to MySQL (db.py retries internally) ───────────────────────────
-    logger.info("Connecting to MySQL at %s …", "%(host)s:%(port)s/%(db)s" % {
-        "host": __import__("app.config", fromlist=["MYSQL_HOST"]).MYSQL_HOST,
-        "port": __import__("app.config", fromlist=["MYSQL_PORT"]).MYSQL_PORT,
-        "db":   __import__("app.config", fromlist=["MYSQL_DATABASE"]).MYSQL_DATABASE,
-    })
     try:
         get_pool()
     except RuntimeError as exc:
         logger.critical("Cannot reach MySQL: %s", exc)
         raise SystemExit(1) from exc
 
-    # ── Initialise stateful components ────────────────────────────────────────
-    trader        = PaperTrader(slippage_mode=SLIPPAGE_MODE, position_size=PAPER_POSITION_SIZE)
     btc_ticks: collections.deque[Tick] = collections.deque(maxlen=BTC_TICK_BUFFER)
-    cooldown      = _Cooldown(SIGNAL_COOLDOWN_SECONDS)
-    contract_hist = _ContractHistory(CONTRACT_TICK_BUFFER)
-    obs_tracker   = ObservationTracker()
-    clc_tracker   = CLCReversalTracker(slippage_mode=SLIPPAGE_MODE)
-    dcvrb_tracker = DCVRBTracker(slippage_mode=SLIPPAGE_MODE)
-    reversal_prob = ReversalProbabilityProvider()
-    range_tracker = HourlyRangeTracker()
-
     _warm_up(btc_ticks)
 
     logger.info(
-        "Running — interval=%.1fs  slippage=%s  position_size=%d  "
-        "cooldown=%ds  tick_buffer=%d",
-        POLL_INTERVAL_SECONDS, SLIPPAGE_MODE, PAPER_POSITION_SIZE,
-        SIGNAL_COOLDOWN_SECONDS, BTC_TICK_BUFFER,
+        "Running — interval=%.1fs  tick_buffer=%d",
+        POLL_INTERVAL_SECONDS, BTC_TICK_BUFFER,
     )
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
     n = 0
-    last_clc_flush = time.monotonic()
     while not _stop_event:
         n += 1
         tick_start = time.monotonic()
 
         try:
-            _tick(n, btc_ticks, cooldown, trader, contract_hist, obs_tracker,
-                  clc_tracker, dcvrb_tracker, reversal_prob, range_tracker)
+            _tick(n, btc_ticks)
         except Exception as exc:
             logger.error("Unhandled error on tick #%d: %s", n, exc, exc_info=True)
 
-        # Periodically flush the CLC near-miss funnel so we can see which gate is
-        # choking the watch-only strategy (logged, then reset).
-        if tick_start - last_clc_flush >= CLC_SKIP_FLUSH_SECONDS:
-            for _stats in (clc_skip_stats, clc_late_skip_stats):
-                if _stats.total() > 0:
-                    logger.info(_stats.format_summary())
-                    _stats.reset()
-            last_clc_flush = tick_start
-
-        elapsed = time.monotonic() - tick_start
+        elapsed   = time.monotonic() - tick_start
         sleep_for = max(0.0, POLL_INTERVAL_SECONDS - elapsed)
 
         if elapsed > POLL_INTERVAL_SECONDS:
-            logger.warning("Tick #%d took %.2fs (> poll interval %.1fs)",
-                           n, elapsed, POLL_INTERVAL_SECONDS)
+            logger.warning(
+                "Tick #%d took %.2fs (> %.1fs poll interval)", n, elapsed, POLL_INTERVAL_SECONDS
+            )
 
-        # Interruptible sleep — wakes immediately on shutdown signal.
         deadline = time.monotonic() + sleep_for
         while not _stop_event and time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(0.1, deadline - time.monotonic()))
 
-    # Final flush of any unreported CLC near-misses before exiting.
-    for _stats in (clc_skip_stats, clc_late_skip_stats):
-        if _stats.total() > 0:
-            logger.info(_stats.format_summary())
-            _stats.reset()
-
-    logger.info("Signal logger stopped cleanly after %d tick(s)", n)
+    logger.info("Market logger stopped cleanly after %d tick(s)", n)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ SLIPPAGE_MODE = os.getenv("SLIPPAGE_MODE", "realistic")
 SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 
 # ── External API ─────────────────────────────────────────────────────────────
-KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://demo-api.kalshi.co/trade-api/v2")
+KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
 KALSHI_API_TIMEOUT_SECONDS = float(os.getenv("KALSHI_API_TIMEOUT_SECONDS", "8"))
 
 # ── Hourly BTC range market discovery ────────────────────────────────────────
