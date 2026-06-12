@@ -140,6 +140,9 @@ def _get_active_kalshi_market(btc_price: float) -> dict:
         "market_id":    raw.get("ticker"),
         "title":        raw.get("title") or raw.get("yes_sub_title") or "",
         "market_type":  "binary",
+        # target_price = contract strike/threshold (Kalshi field: floor_strike).
+        # This is the BTC level at which YES/NO settles.  It is NOT the live
+        # spot price.  e.g. KXBTC-260612-0500-T63500 → target_price = 63500.00
         "target_price": best["floor_strike"],
         "opens_at":     _parse_dt(raw.get("open_time")),
         "closes_at":    best["close_time"],
@@ -161,8 +164,15 @@ def _update_timing(market: dict) -> dict:
 
 
 def _mock_market_as_v2(btc_price: float) -> dict:
-    """Wrap get_active_mock_market() into the v2 dict format."""
-    m = get_active_mock_market()
+    """
+    Wrap get_active_mock_market() into the v2 dict format.
+
+    ``btc_price`` is passed through so the mock market's strike (target_price)
+    is derived from the SAME spot reading already stored in market_snapshots.
+    This prevents a boundary race where a second get_btc_price() call returns a
+    value that rounds to a different $500 strike than the first call.
+    """
+    m = get_active_mock_market(btc_price=btc_price)
     return {
         "market_id":              m["market_ticker"],
         "title":                  None,
@@ -452,7 +462,7 @@ def _log_summary(
     no  = prices.get("NO",  {})
     gap = f"{btc_price - target:+,.0f}" if target else "—"
     logger.info(
-        "tick#%04d | BTC $%s  target $%s  gap %s | "
+        "tick#%04d | BTC $%s  strike $%s  gap %s | "
         "YES %.3f/%.3f  NO %.3f/%.3f | tte=%ss  src=%s | %s",
         n,
         f"{btc_price:,.0f}",

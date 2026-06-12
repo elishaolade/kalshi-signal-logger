@@ -152,18 +152,26 @@ def get_btc_price() -> float:
         return fallback
 
 
-def get_active_mock_market() -> dict:
+def get_active_mock_market(btc_price: Optional[float] = None) -> dict:
     """
     Return a fake 15-minute BTC up/down market aligned to the current clock.
 
-    The target price is the opening BTC price rounded to the nearest $500.
-    The ticker encodes the window date, start time, and target so it is
-    unique per window.
+    ``target_price`` is the contract strike/threshold — BTC must close above
+    (or below) this level for YES/NO to settle at $1.  It is NOT the live spot
+    price.  It is snapped to the nearest $500 to mimic typical Kalshi strike
+    granularity (e.g. BTC=63,368 → strike=63,500).
+
+    Args:
+        btc_price: live BTC spot price fetched by the caller.  When provided,
+                   the strike is derived from *this same reading* so that
+                   ``btc_price`` and ``target_price`` are always consistent
+                   within one tick.  Falls back to a fresh Kraken fetch only
+                   when called stand-alone (e.g. tests, CLI).
 
     Returns:
         {
             "market_ticker":          str,
-            "target_price":           float,
+            "target_price":           float,   # contract strike, not spot price
             "open_time":              datetime (UTC, tz-aware),
             "close_time":             datetime (UTC, tz-aware),
             "time_remaining_seconds": float,
@@ -173,21 +181,25 @@ def get_active_mock_market() -> dict:
     open_time, close_time = _current_15min_window()
     now = datetime.now(timezone.utc)
 
-    # Snap target to the nearest $500 — typical Kalshi strike granularity
-    btc_now = get_btc_price()
+    # Use the caller-supplied spot price so strike and snapshot btc_price share
+    # the same reading.  Only call get_btc_price() when no price is passed in.
+    btc_now = btc_price if btc_price is not None else get_btc_price()
+
+    # Snap to nearest $500 — this is the contract strike, not the live price.
+    # e.g. BTC=63,368.16  →  strike=63,500.00
     target_price = round(btc_now / 500) * 500
 
     time_remaining  = max(0.0, (close_time - now).total_seconds())
     contract_age    = (now - open_time).total_seconds()
 
-    # Ticker format: KXBTC-YYMMDD-HHMM-T<target>
-    # e.g.  KXBTC-250527-1415-T97500
+    # Ticker format: KXBTC-YYMMDD-HHMM-T<strike>
+    # e.g.  KXBTC-260612-0500-T63500
     date_part   = open_time.strftime("%y%m%d")
     time_part   = open_time.strftime("%H%M")
     market_ticker = f"KXBTC-{date_part}-{time_part}-T{int(target_price)}"
 
     logger.debug(
-        "Mock market: %s  BTC=%.2f  target=%.2f  remaining=%.0fs",
+        "Mock market: %s  spot=%.2f  strike=%.2f  remaining=%.0fs",
         market_ticker, btc_now, target_price, time_remaining,
     )
 

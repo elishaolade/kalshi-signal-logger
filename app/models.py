@@ -23,7 +23,11 @@ class Market:
     market_id:      str
     title:          Optional[str]       = None
     market_type:    Optional[str]       = None   # "binary" | "range"
-    target_price:   Optional[float]     = None   # NULL for range markets
+    # Contract strike / settlement threshold.  For a binary BTC market this is
+    # the Kalshi floor_strike (e.g. 63500.00 for KXBTC-260612-0500-T63500).
+    # NULL for range markets (they have both floor and cap, not a single strike).
+    # Never the live BTC spot price — see MarketSnapshot.btc_price for that.
+    target_price:   Optional[float]     = None
     opens_at:       Optional[datetime]  = None
     closes_at:      Optional[datetime]  = None
     settles_at:     Optional[datetime]  = None
@@ -103,6 +107,9 @@ class MarketMetrics:
 
     Definitions
     -----------
+    btc_price        = live Bitcoin spot price at capture time  (market_snapshots.btc_price)
+    target_price     = contract strike / settlement threshold   (markets.target_price / floor_strike)
+
     distance_from_target      = btc_price - target_price
     distance_from_target_pct  = (btc_price - target_price) / target_price * 100
     btc_return_X              = (btc_now - btc_X_ago) / btc_X_ago * 100
