@@ -122,13 +122,15 @@ def _current_15min_window() -> tuple[datetime, datetime]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_btc_price() -> float:
+def get_btc_price(*, allow_mock: bool = True) -> float:
     """
     Return current BTC/USD price.
 
     Tries the Kraken public ticker API first (no credentials required).
-    On any failure, falls back to the module-level mock random walk so the
-    rest of the system keeps running during development.
+    When ``allow_mock`` is true, any failure falls back to the module-level
+    mock random walk so development tooling can keep running.  When false,
+    the exception is raised so callers can fail closed instead of inventing
+    data.
     """
     try:
         with httpx.Client(timeout=5.0) as client:
@@ -144,6 +146,8 @@ def get_btc_price() -> float:
             return _advance_mock_price(anchor=price)   # keep mock in sync
 
     except Exception as exc:
+        if not allow_mock:
+            raise RuntimeError(f"Kraken BTC/USD fetch failed: {exc}") from exc
         fallback = _advance_mock_price()
         logger.warning(
             "Kraken fetch failed (%s) — using mock BTC price %.2f",

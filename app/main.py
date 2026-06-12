@@ -7,8 +7,8 @@ Capture what happened, when it happened, and what the market knew
 at that moment. No signals. No strategies. No predictions.
 
 Poll cycle (every POLL_INTERVAL_SECONDS):
-  1.  Fetch BTC price             (Kraken → mock fallback)
-  2.  Fetch active Kalshi market  (production API → mock fallback)
+  1.  Fetch BTC price             (Kraken only)
+  2.  Fetch active Kalshi market  (production Kalshi API only)
   3.  Upsert market row           → markets
   4.  Upsert contract rows        → contracts  (YES + NO, once per market)
   5.  Insert market snapshot      → market_snapshots
@@ -39,8 +39,6 @@ from app.config import (
 from app.data_feed import (
     get_btc_price,
     get_kalshi_markets,
-    get_active_mock_market,
-    get_mock_contract_prices,
     _parse_float,
     _parse_dt,
     KALSHI_BTC_RANGE_SERIES_TICKER,
@@ -97,7 +95,6 @@ _KALSHI_CACHE_TTL = 30.0  # seconds
 def _get_active_kalshi_market(btc_price: float) -> dict:
     """
     Return the nearest-expiry Kalshi BTC binary market closest to current BTC price.
-    Falls back to the mock market on any failure.
 
     Returns a dict with keys:
         market_id, title, market_type, target_price,
@@ -114,8 +111,7 @@ def _get_active_kalshi_market(btc_price: float) -> dict:
     try:
         raw_markets = get_kalshi_markets(series_ticker=series, status="open")
     except Exception as exc:
-        logger.warning("Kalshi fetch failed: %s — using mock market", exc)
-        return _mock_market_as_v2(btc_price)
+        raise RuntimeError(f"Kalshi fetch failed: {exc}") from exc
 
     # Binary (T) markets: have floor_strike, no cap_strike.
     binary = []
@@ -127,8 +123,7 @@ def _get_active_kalshi_market(btc_price: float) -> dict:
             binary.append({"raw": m, "floor_strike": fs, "close_time": ct})
 
     if not binary:
-        logger.warning("No Kalshi BTC binary markets found — using mock")
-        return _mock_market_as_v2(btc_price)
+        raise RuntimeError("No Kalshi BTC binary markets found")
 
     binary.sort(key=lambda x: x["close_time"] or datetime.max.replace(tzinfo=timezone.utc))
     nearest_close = binary[0]["close_time"]
@@ -163,34 +158,9 @@ def _update_timing(market: dict) -> dict:
     return {**market, "time_remaining_seconds": tte}
 
 
-def _mock_market_as_v2(btc_price: float) -> dict:
-    """
-    Wrap get_active_mock_market() into the v2 dict format.
-
-    ``btc_price`` is passed through so the mock market's strike (target_price)
-    is derived from the SAME spot reading already stored in market_snapshots.
-    This prevents a boundary race where a second get_btc_price() call returns a
-    value that rounds to a different $500 strike than the first call.
-    """
-    m = get_active_mock_market(btc_price=btc_price)
-    return {
-        "market_id":              m["market_ticker"],
-        "title":                  None,
-        "market_type":            "binary",
-        "target_price":           m["target_price"],
-        "opens_at":               m["open_time"],
-        "closes_at":              m["close_time"],
-        "settles_at":             None,
-        "status":                 "open",
-        "time_remaining_seconds": int(m["time_remaining_seconds"]),
-        "_raw":                   None,
-    }
-
-
 def _get_contract_prices(market: dict, btc_price: float) -> dict[str, dict]:
     """
     Extract YES/NO bid/ask from a Kalshi market dict.
-    Falls back to mock pricing when real prices are unavailable.
     Returns {"YES": {bid_price, ask_price, last_price, spread, volume, source}, "NO": ...}
     """
     raw     = market.get("_raw") or {}
@@ -205,16 +175,9 @@ def _get_contract_prices(market: dict, btc_price: float) -> dict[str, dict]:
     )
 
     if yes_ask is None or yes_ask <= 0:
-        tte  = market.get("time_remaining_seconds") or 1
-        mock = get_mock_contract_prices(btc_price, market["target_price"], tte)
-        return {
-            "YES": {**mock["YES"], "bid_price": mock["YES"]["bid_price"],
-                    "ask_price": mock["YES"]["ask_price"],
-                    "volume": None, "source": "mock"},
-            "NO":  {**mock["NO"],  "bid_price": mock["NO"]["bid_price"],
-                    "ask_price": mock["NO"]["ask_price"],
-                    "volume": None, "source": "mock"},
-        }
+        raise RuntimeError(
+            f"Kalshi quote data unavailable for market {market.get('market_id')}"
+        )
 
     yes_bid  = yes_bid or 0.0
     no_bid   = no_bid  or round(1.0 - yes_ask, 4)
@@ -482,12 +445,20 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
     now = datetime.now(timezone.utc)
 
     # 1. BTC price
-    btc_price = get_btc_price()
+    try:
+        btc_price = get_btc_price(allow_mock=False)
+    except Exception as exc:
+        logger.warning("Skipping tick #%d: BTC price unavailable — %s", n, exc)
+        return
     btc_ticks.append(Tick(price=btc_price, ts=now.timestamp()))
     ticks = list(btc_ticks)
 
     # 2. Active market
-    market       = _get_active_kalshi_market(btc_price)
+    try:
+        market = _get_active_kalshi_market(btc_price)
+    except Exception as exc:
+        logger.warning("Skipping tick #%d: active market unavailable — %s", n, exc)
+        return
     market_id    = market["market_id"]
     target_price = market.get("target_price")
     tte          = market.get("time_remaining_seconds")
@@ -507,7 +478,11 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         return
 
     # 5. Contract prices
-    prices = _get_contract_prices(market, btc_price)
+    try:
+        prices = _get_contract_prices(market, btc_price)
+    except Exception as exc:
+        logger.warning("Skipping tick #%d: contract prices unavailable — %s", n, exc)
+        return
 
     # 6. Insert market snapshot
     try:
