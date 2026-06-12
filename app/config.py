@@ -35,6 +35,18 @@ SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
 KALSHI_API_TIMEOUT_SECONDS = float(os.getenv("KALSHI_API_TIMEOUT_SECONDS", "8"))
 
+# ── Active 15-minute BTC binary market selection ─────────────────────────────
+# Series used by the core BTC up/down logger. Keep this separate from the
+# hourly range tracker configuration so the logger never piggybacks on range
+# market settings.
+KALSHI_BTC_BINARY_SERIES_TICKER = os.getenv("KALSHI_BTC_BINARY_SERIES_TICKER", "KXBTC").strip()
+# Reject binary markets whose strike is implausibly far from spot.
+KALSHI_BTC_BINARY_MAX_STRIKE_GAP = float(os.getenv("KALSHI_BTC_BINARY_MAX_STRIKE_GAP", "1500"))
+# The active 15-minute market should be closing soon; allow a little slack.
+KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS = int(
+    os.getenv("KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS", "1200")
+)
+
 # ── Kalshi API authentication (RSA key pair) ──────────────────────────────────
 # Both must be set together to enable authenticated requests.
 # KALSHI_KEY_ID   — the key ID shown in your Kalshi API settings

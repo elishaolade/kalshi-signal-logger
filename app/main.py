@@ -33,6 +33,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.config import (
+    KALSHI_BTC_BINARY_MAX_STRIKE_GAP,
+    KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS,
+    KALSHI_BTC_BINARY_SERIES_TICKER,
     LIVE_TRADING_ENABLED,
     POLL_INTERVAL_SECONDS,
 )
@@ -41,7 +44,6 @@ from app.data_feed import (
     get_kalshi_markets,
     _parse_float,
     _parse_dt,
-    KALSHI_BTC_RANGE_SERIES_TICKER,
 )
 from app.db import execute_query, fetch_all, fetch_one, insert_and_get_id, get_pool
 from app.features import Tick
@@ -107,7 +109,7 @@ def _get_active_kalshi_market(btc_price: float) -> dict:
     if _kalshi_market_cache and now_ts - _kalshi_market_cache_ts < _KALSHI_CACHE_TTL:
         return _update_timing(_kalshi_market_cache)
 
-    series = KALSHI_BTC_RANGE_SERIES_TICKER or "KXBTC"
+    series = KALSHI_BTC_BINARY_SERIES_TICKER or "KXBTC"
     try:
         raw_markets = get_kalshi_markets(series_ticker=series, status="open")
     except Exception as exc:
@@ -115,20 +117,50 @@ def _get_active_kalshi_market(btc_price: float) -> dict:
 
     # Binary (T) markets: have floor_strike, no cap_strike.
     binary = []
+    now_utc = datetime.now(timezone.utc)
     for m in raw_markets:
         fs = _parse_float(m.get("floor_strike"))
         cs = _parse_float(m.get("cap_strike"))
-        if fs is not None and cs is None:
-            ct = _parse_dt(m.get("close_time"))
-            binary.append({"raw": m, "floor_strike": fs, "close_time": ct})
+        ct = _parse_dt(m.get("close_time"))
+        ot = _parse_dt(m.get("open_time"))
+        if fs is not None and cs is None and ct is not None:
+            tte_s = int((ct - now_utc).total_seconds())
+            binary.append(
+                {
+                    "raw": m,
+                    "floor_strike": fs,
+                    "close_time": ct,
+                    "open_time": ot,
+                    "tte_s": tte_s,
+                    "gap": abs(fs - btc_price),
+                }
+            )
 
     if not binary:
         raise RuntimeError("No Kalshi BTC binary markets found")
 
-    binary.sort(key=lambda x: x["close_time"] or datetime.max.replace(tzinfo=timezone.utc))
-    nearest_close = binary[0]["close_time"]
-    same_expiry   = [b for b in binary if b["close_time"] == nearest_close]
-    best          = min(same_expiry, key=lambda b: abs(b["floor_strike"] - btc_price))
+    candidates = [
+        b for b in binary
+        if 0 < b["tte_s"] <= KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS
+    ]
+    if not candidates:
+        nearest = min(binary, key=lambda b: abs(b["tte_s"]))
+        raise RuntimeError(
+            "No BTC binary markets close soon enough "
+            f"(series={series!r}, nearest_tte={nearest['tte_s']}s, "
+            f"nearest_strike={nearest['floor_strike']:.2f})"
+        )
+
+    candidates.sort(key=lambda b: (b["close_time"], b["gap"]))
+    nearest_close = candidates[0]["close_time"]
+    same_expiry = [b for b in candidates if b["close_time"] == nearest_close]
+    best = min(same_expiry, key=lambda b: b["gap"])
+    if best["gap"] > KALSHI_BTC_BINARY_MAX_STRIKE_GAP:
+        raise RuntimeError(
+            "Nearest soon-closing BTC binary strike is implausibly far from spot "
+            f"(series={series!r}, strike={best['floor_strike']:.2f}, "
+            f"btc={btc_price:.2f}, gap={best['gap']:.2f}, tte={best['tte_s']}s)"
+        )
     raw           = best["raw"]
 
     result = {
