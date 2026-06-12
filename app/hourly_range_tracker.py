@@ -111,7 +111,7 @@ def _containment_confidence(
     if time_to_expiry_seconds <= 0 or len(btc_ticks) < 5:
         return None
     vol60 = rolling_std(btc_ticks, 60.0)
-    if vol60 <= 0:
+    if vol60 is None or vol60 <= 0:
         return None
     # Project: if the last 60s had std=vol60, remaining T/60 periods give sigma_rem
     sigma = vol60 * math.sqrt(max(time_to_expiry_seconds, 1) / 60.0)
