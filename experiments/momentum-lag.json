@@ -1,0 +1,33 @@
+{
+  "_comment": "Example momentum-lag experiment config.  All values are EXPERIMENTAL — not validated strategy parameters.",
+
+  "name": "momentum-lag-v1",
+  "description": "First-pass sweep of BTC momentum vs Kalshi repricing lag hypothesis. Tests whether short-term BTC moves toward a contract's winning side, combined with muted contract repricing, predict further contract repricing over 30-120 second windows.",
+  "hypothesis": "When BTC moves at least $20 toward a contract's winning side over a 30-second window, but the contract ask has risen by no more than 3 cents during the same window, the contract tends to reprice further in the same direction over the next 30-120 seconds.",
+
+  "lookback_seconds": 30,
+  "minimum_btc_move_toward_target": 20.0,
+  "maximum_contract_reprice_during_lookback": 0.03,
+
+  "minimum_time_remaining_seconds": 300,
+  "maximum_time_remaining_seconds": 720,
+
+  "minimum_entry_ask": 0.05,
+  "maximum_entry_ask": 0.95,
+  "maximum_spread": 0.04,
+
+  "holding_period_seconds": [30, 60, 120],
+  "profit_target_cents": [0.03, 0.05, 0.08, 0.10],
+
+  "loss_limit_cents": null,
+  "exit_on_momentum_reversal": false,
+  "exit_on_distance_invalidation": null,
+
+  "allow_multiple_entries_per_contract": false,
+  "cooldown_seconds": 30.0,
+
+  "estimated_fee_per_contract": 0.003,
+  "estimated_slippage_cents": 0.01,
+
+  "train_fraction": 0.7
+}
