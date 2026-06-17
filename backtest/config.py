@@ -154,9 +154,13 @@ _VALID_KEYS = frozenset(f.name for f in dataclasses.fields(ExperimentConfig))
 def load_config(path: str | Path) -> ExperimentConfig:
     """Load an ExperimentConfig from a JSON file.
 
-    Raises ValueError for any unrecognised key so typos fail loudly.
+    Keys beginning with ``_`` are treated as comments and silently ignored
+    (e.g. ``"_comment": "..."``) so experiment files can be annotated.
+    Raises ValueError for any other unrecognised key so typos fail loudly.
     """
     raw: dict[str, Any] = json.loads(Path(path).read_text())
+    # Strip comment/annotation keys (convention: leading underscore).
+    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
     extra = set(raw) - _VALID_KEYS
     if extra:
         raise ValueError(
