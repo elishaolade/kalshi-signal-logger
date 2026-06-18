@@ -48,6 +48,7 @@ from app.data_feed import (
 from app.db import execute_query, fetch_all, fetch_one, insert_and_get_id, get_pool
 from app.features import Tick
 from app.models import MarketMetrics, MarketSnapshot
+from app.momentum_shadow_tracker import MomentumShadowTracker
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,9 @@ _contract_id_cache: dict[str, dict[str, int]] = {}
 
 # market_id (str) → current snapshot_sequence counter
 _snapshot_sequence: dict[str, int] = collections.defaultdict(int)
+
+# Momentum shadow tracker (initialized in run(), after DB pool is ready).
+_shadow_tracker: Optional[MomentumShadowTracker] = None
 
 
 # ── Kalshi market fetcher ──────────────────────────────────────────────────────
@@ -545,11 +549,31 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
     # 9. Console summary
     _log_summary(n, btc_price, market_id, target_price, tte, prices)
 
+    # 10. Shadow tracking (research-only; no orders placed)
+    if _shadow_tracker is not None:
+        try:
+            _shadow_tracker.on_tick(
+                market_db_id  = market_db_id,
+                market_id     = market_id,
+                market_ticker = market_id,
+                contract_ids  = contract_ids,
+                target_price  = target_price,
+                captured_at   = now,
+                btc_price     = btc_price,
+                tte           = tte,
+                prices        = prices,
+                btc_ticks     = ticks,
+                snapshot_id   = snapshot_id,
+                snapshot_seq  = _snapshot_sequence[market_id],
+            )
+        except Exception as exc:
+            logger.warning("Shadow tracker error on tick #%d: %s", n, exc)
+
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
-    global _stop_event
+    global _stop_event, _shadow_tracker
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -570,6 +594,14 @@ def run() -> None:
 
     btc_ticks: collections.deque[Tick] = collections.deque(maxlen=BTC_TICK_BUFFER)
     _warm_up(btc_ticks)
+
+    try:
+        _shadow_tracker = MomentumShadowTracker()
+    except Exception as exc:
+        logger.warning(
+            "MomentumShadowTracker init failed (shadow tracking disabled "
+            "— run the migration first): %s", exc
+        )
 
     logger.info(
         "Running — interval=%.1fs  tick_buffer=%d",
