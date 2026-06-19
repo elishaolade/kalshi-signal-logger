@@ -199,7 +199,7 @@ def _breadth(hours: int) -> None:
         SELECT
           COUNT(*) AS trades,
           COUNT(DISTINCT market_ticker) AS distinct_markets,
-          COUNT(DISTINCT DATE_FORMAT(signal_at, '%%Y-%%m-%%d %%H:%%i')) AS distinct_signal_minutes
+          COUNT(DISTINCT DATE_FORMAT(signal_at, '%Y-%m-%d %H:%i')) AS distinct_signal_minutes
         FROM momentum_shadow_trades
         WHERE status = 'COMPLETE'
           AND signal_at >= UTC_TIMESTAMP() - INTERVAL %s HOUR
@@ -216,7 +216,7 @@ def _hourly(hours: int) -> None:
     rows = fetch_all(
         """
         SELECT
-          DATE_FORMAT(signal_at, '%%Y-%%m-%%d %%H:00:00') AS hour_bucket,
+          DATE_FORMAT(signal_at, '%Y-%m-%d %H:00:00') AS hour_bucket,
           COUNT(*) AS trades,
           ROUND(AVG(net_pnl_cents), 4) AS avg_net_cents,
           ROUND(AVG(net_pnl_cents > 0) * 100, 1) AS win_rate_pct,
