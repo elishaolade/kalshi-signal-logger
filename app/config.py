@@ -68,3 +68,88 @@ RANGE_MARKET_POLL_INTERVAL_SECONDS = float(os.getenv("RANGE_MARKET_POLL_INTERVAL
 # ── Research API ─────────────────────────────────────────────────────────────
 RESEARCH_API_TOKEN = os.getenv("RESEARCH_API_TOKEN", "")
 RESEARCH_API_MAX_ROWS = int(os.getenv("RESEARCH_API_MAX_ROWS", "200"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Momentum LIVE trading (real money) — SEPARATE, EXPLICITLY GATED subsystem
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These flags control app/momentum_live_trader.py ONLY.  They are intentionally
+# namespaced (MOMENTUM_LIVE_*) and kept distinct from the legacy
+# LIVE_TRADING_ENABLED flag, which continues to guard the research logger /
+# paper pipeline (app/db.py refuses to build a pool when LIVE_TRADING_ENABLED is
+# true).  The live trader runs WITH LIVE_TRADING_ENABLED=false and its own
+# explicit MOMENTUM_LIVE_* gates set.
+#
+# DEFAULTS ARE NON-LIVE.  No real order is ever sent unless ALL required gates
+# below are explicitly set:
+#   1. MOMENTUM_LIVE_ENABLED=true
+#   2. MOMENTUM_LIVE_CONFIRM=I_UNDERSTAND_REAL_MONEY   (exact string)
+#   3. KALSHI_KEY_ID and KALSHI_KEY_FILE configured (authenticated client)
+#   4. Kill switch not engaged
+#   5. Sane bankroll / per-trade dollar caps configured (> 0)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() == "true"
+
+
+# ── Master gates ──────────────────────────────────────────────────────────────
+MOMENTUM_LIVE_ENABLED = _env_bool("MOMENTUM_LIVE_ENABLED", "false")
+# Must equal this exact token for live execution to be permitted.
+MOMENTUM_LIVE_CONFIRM_TOKEN = "I_UNDERSTAND_REAL_MONEY"
+MOMENTUM_LIVE_CONFIRM = os.getenv("MOMENTUM_LIVE_CONFIRM", "").strip()
+
+# ── Kill switch ───────────────────────────────────────────────────────────────
+# Engaged when either the env flag is true OR the kill-switch file exists.
+MOMENTUM_LIVE_KILL_SWITCH = _env_bool("MOMENTUM_LIVE_KILL_SWITCH", "false")
+MOMENTUM_LIVE_KILL_SWITCH_FILE = os.getenv(
+    "MOMENTUM_LIVE_KILL_SWITCH_FILE", ""
+).strip()
+
+# ── Bankroll + Kelly sizing ───────────────────────────────────────────────────
+# Bankroll in whole dollars.  Kelly fraction is a multiplier on the computed
+# full-Kelly stake (e.g. 0.25 = quarter Kelly).  Per-trade dollar and contract
+# caps bound the stake regardless of what Kelly suggests.
+MOMENTUM_LIVE_BANKROLL_DOLLARS       = float(os.getenv("MOMENTUM_LIVE_BANKROLL_DOLLARS", "0"))
+MOMENTUM_LIVE_KELLY_FRACTION         = float(os.getenv("MOMENTUM_LIVE_KELLY_FRACTION", "0"))
+MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE  = float(os.getenv("MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE", "0"))
+# 0 = no explicit contract cap (still bounded by the dollar caps above).
+MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE = int(os.getenv("MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE", "0"))
+
+# ── Risk gates ────────────────────────────────────────────────────────────────
+MOMENTUM_LIVE_MAX_ACTIVE_TRADES      = int(os.getenv("MOMENTUM_LIVE_MAX_ACTIVE_TRADES", "1"))
+# Max cumulative realized loss (whole dollars, positive number) per UTC day
+# before new live entries are blocked.  0 disables the daily-loss gate.
+MOMENTUM_LIVE_MAX_DAILY_LOSS_DOLLARS = float(os.getenv("MOMENTUM_LIVE_MAX_DAILY_LOSS_DOLLARS", "0"))
+# Max bid-ask spread (dollar fraction) tolerated at entry. 0.04 = 4 cents.
+MOMENTUM_LIVE_MAX_SPREAD             = float(os.getenv("MOMENTUM_LIVE_MAX_SPREAD", "0.04"))
+# Reject entry if the quote we are acting on is older than this many seconds.
+MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS  = float(os.getenv("MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS", "5"))
+# Minimum number of COMPLETE shadow trades required before any live sizing /
+# entry is permitted (projected stats must be statistically meaningful).
+MOMENTUM_LIVE_MIN_SHADOW_TRADES      = int(os.getenv("MOMENTUM_LIVE_MIN_SHADOW_TRADES", "50"))
+# Rolling window (most-recent COMPLETE shadow trades) used to derive projected
+# win-rate / expectancy / profit-factor for Kelly sizing.
+MOMENTUM_LIVE_PROJECTED_WINDOW       = int(os.getenv("MOMENTUM_LIVE_PROJECTED_WINDOW", "100"))
+# How long (seconds) a resting entry order may sit unfilled before it is
+# cancelled (do not chase; do not fabricate fills).
+MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS", "10")
+)
+
+# ── Automatic pause (live actual drifting below shadow projected) ──────────────
+# Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.
+# A window only counts once it has at least LIVE_PAUSE_MIN_TRADES completed live
+# trades (do not pause on tiny samples).  If, in any qualifying window, live
+# actual performance trails shadow-projected by more than any threshold below,
+# new live entries are paused until a human manually unpauses.
+LIVE_PAUSE_MIN_TRADES            = int(os.getenv("LIVE_PAUSE_MIN_TRADES", "25"))
+# Win-rate gap in percentage POINTS (projected_pct - actual_pct).
+LIVE_PAUSE_WIN_RATE_GAP_PCT      = float(os.getenv("LIVE_PAUSE_WIN_RATE_GAP_PCT", "15"))
+# Expectancy gap in dollar fraction (projected - actual). 0.02 = 2 cents/contract.
+LIVE_PAUSE_EXPECTANCY_GAP_CENTS  = float(os.getenv("LIVE_PAUSE_EXPECTANCY_GAP_CENTS", "0.02"))
+# Profit-factor gap (projected_pf - actual_pf).
+LIVE_PAUSE_PROFIT_FACTOR_GAP     = float(os.getenv("LIVE_PAUSE_PROFIT_FACTOR_GAP", "0.5"))
+# Rolling windows evaluated for pause.
+LIVE_PAUSE_WINDOWS = (25, 50, 100)

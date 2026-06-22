@@ -49,6 +49,7 @@ from app.db import execute_query, fetch_all, fetch_one, insert_and_get_id, get_p
 from app.features import Tick
 from app.models import MarketMetrics, MarketSnapshot
 from app.momentum_shadow_tracker import MomentumShadowTracker
+from app.momentum_live_trader import MomentumLiveTrader
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,11 @@ _snapshot_sequence: dict[str, int] = collections.defaultdict(int)
 
 # Momentum shadow tracker (initialized in run(), after DB pool is ready).
 _shadow_tracker: Optional[MomentumShadowTracker] = None
+
+# Momentum LIVE trader (real money). Default non-live; stays inert unless every
+# MOMENTUM_LIVE_* gate is set. Runs alongside — never replaces — the shadow
+# tracker. Initialized in run() after the DB pool is ready.
+_live_trader: Optional[MomentumLiveTrader] = None
 
 
 # ── Kalshi market fetcher ──────────────────────────────────────────────────────
@@ -569,11 +575,33 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         except Exception as exc:
             logger.warning("Shadow tracker error on tick #%d: %s", n, exc)
 
+    # 11. Live trading (real money; runs only when fully armed via MOMENTUM_LIVE_*).
+    #     Called AFTER the shadow tracker so live entries pair tick-for-tick with
+    #     shadow entries. Inert by default — never places orders unless armed.
+    if _live_trader is not None:
+        try:
+            _live_trader.on_tick(
+                market_db_id  = market_db_id,
+                market_id     = market_id,
+                market_ticker = market_id,
+                contract_ids  = contract_ids,
+                target_price  = target_price,
+                captured_at   = now,
+                btc_price     = btc_price,
+                tte           = tte,
+                prices        = prices,
+                btc_ticks     = ticks,
+                snapshot_id   = snapshot_id,
+                snapshot_seq  = _snapshot_sequence[market_id],
+            )
+        except Exception as exc:
+            logger.warning("Live trader error on tick #%d: %s", n, exc)
+
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
-    global _stop_event, _shadow_tracker
+    global _stop_event, _shadow_tracker, _live_trader
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -601,6 +629,14 @@ def run() -> None:
         logger.warning(
             "MomentumShadowTracker init failed (shadow tracking disabled "
             "— run the migration first): %s", exc
+        )
+
+    try:
+        _live_trader = MomentumLiveTrader()
+    except Exception as exc:
+        logger.warning(
+            "MomentumLiveTrader init failed (live trading disabled "
+            "— run scripts/migrate_add_momentum_live.py first): %s", exc
         )
 
     logger.info(
