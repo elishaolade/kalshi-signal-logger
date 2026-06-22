@@ -191,6 +191,40 @@ class KalshiTradingClient:
         payload = self._request("GET", f"/portfolio/orders/{order_id}")
         return payload.get("order", payload)
 
+    def get_orders(
+        self,
+        *,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """List recent orders, optionally filtered by ticker/status."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        payload = self._request("GET", "/portfolio/orders", params=params)
+        orders = payload.get("orders")
+        return orders if isinstance(orders, list) else []
+
+    def find_order_by_client_order_id(
+        self, client_order_id: str, *, ticker: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """
+        Reconciliation helper: locate an order we may have submitted by its
+        client_order_id.  Used after an ambiguous POST (request sent, response
+        lost) to decide whether the order actually landed before retrying.
+        Lists recent orders and matches client-side so it works regardless of
+        whether the API supports a client_order_id query filter.
+        """
+        if not client_order_id:
+            return None
+        for o in self.get_orders(ticker=ticker):
+            if str(o.get("client_order_id") or "") == client_order_id:
+                return o
+        return None
+
     def get_fills(
         self,
         *,

@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import sys
 import os
+from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
 from app import config
 from app.momentum_live_trader import (
+    MomentumLiveTrader,
+    _ActiveLive,
     compute_full_kelly_fraction,
     compute_position_size,
     compute_drift_fields,
@@ -29,6 +32,16 @@ from app.momentum_live_trader import (
     kill_switch_engaged,
     is_live_armed,
     _summarize_fills,
+    aggregate_fills,
+    order_remaining,
+    is_order_open,
+    net_position_for_side,
+    reconcile_decision,
+    combine_exit_fills,
+    reconstruct_exit_state,
+    should_replace_exit,
+    partition_trade_orders,
+    resolve_recovery_baseline,
 )
 from app.kalshi_trading import dollars_to_cents, cents_to_dollars
 
@@ -312,6 +325,349 @@ class TestPriceConversion:
     def test_cents_to_dollars(self):
         assert cents_to_dollars(42) == pytest.approx(0.42)
         assert cents_to_dollars(None) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Partial-fill safety helpers (Priority 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOrderRemaining:
+    def test_basic(self):
+        assert order_remaining(10, 4) == 6
+
+    def test_never_negative(self):
+        # Cumulative fills can momentarily appear >= requested; never go negative.
+        assert order_remaining(10, 12) == 0
+
+    def test_zero_when_complete(self):
+        assert order_remaining(5, 5) == 0
+
+
+class TestIsOrderOpen:
+    def test_terminal_status(self):
+        assert is_order_open({"status": "executed"}) is False
+        assert is_order_open({"status": "canceled"}) is False
+        assert is_order_open({"status": "expired"}) is False
+
+    def test_remaining_count_zero_is_terminal(self):
+        assert is_order_open({"status": "resting", "remaining_count": 0}) is False
+
+    def test_resting_with_remaining_is_open(self):
+        assert is_order_open({"status": "resting", "remaining_count": 3}) is True
+
+    def test_partial_still_open(self):
+        assert is_order_open({"status": "partially_filled", "remaining_count": 2}) is True
+
+    def test_unknown_treated_as_open(self):
+        # Conservative: never assume an order is dead without evidence.
+        assert is_order_open({}) is True
+        assert is_order_open(None) is True
+
+
+class TestAggregateFills:
+    def test_aggregates_across_orders(self):
+        # Two exit orders: 3 @ 0.50 then 2 @ 0.45 -> cumulative 5, vwap weighted.
+        order1 = [{"count": 3, "yes_price": 50}]
+        order2 = [{"count": 2, "yes_price": 45}]
+        count, avg, fees = aggregate_fills([order1, order2], "YES")
+        assert count == 5
+        assert avg == pytest.approx((3 * 0.50 + 2 * 0.45) / 5)
+        assert fees is None
+
+    def test_partial_exit_then_remainder_covers_position(self):
+        # filled 5; first exit fills 2 (remaining 3), second exit fills 3 -> flat.
+        filled = 5
+        first = [{"count": 2, "no_price": 40}]
+        count1, _, _ = aggregate_fills([first], "NO")
+        assert order_remaining(filled, count1) == 3       # only resubmit 3
+        second = [{"count": 3, "no_price": 38}]
+        count2, _, _ = aggregate_fills([first, second], "NO")
+        assert count2 == 5
+        assert order_remaining(filled, count2) == 0       # now flat -> finalize
+
+    def test_fees_summed_across_orders(self):
+        o1 = [{"count": 1, "yes_price": 50, "fee": 0.01}]
+        o2 = [{"count": 1, "yes_price": 50, "fee": 0.01}]
+        _, _, fees = aggregate_fills([o1, o2], "YES")
+        assert fees == pytest.approx(0.02)
+
+    def test_empty(self):
+        assert aggregate_fills([[], []], "YES") == (0, None, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Restart reconciliation helpers (Priority 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNetPosition:
+    def test_yes_long(self):
+        pos = [{"ticker": "KXBTC-T1", "position": 7}]
+        assert net_position_for_side(pos, "KXBTC-T1", "YES") == 7
+        assert net_position_for_side(pos, "KXBTC-T1", "NO") == 0
+
+    def test_no_long(self):
+        pos = [{"ticker": "KXBTC-T1", "position": -4}]
+        assert net_position_for_side(pos, "KXBTC-T1", "NO") == 4
+        assert net_position_for_side(pos, "KXBTC-T1", "YES") == 0
+
+    def test_ticker_mismatch(self):
+        pos = [{"ticker": "OTHER", "position": 5}]
+        assert net_position_for_side(pos, "KXBTC-T1", "YES") == 0
+
+    def test_empty(self):
+        assert net_position_for_side([], "KXBTC-T1", "YES") == 0
+
+
+class TestReconcileDecision:
+    def test_position_triggers_flatten(self):
+        assert reconcile_decision(5, True) == "rehydrate_flatten"
+        assert reconcile_decision(5, False) == "rehydrate_flatten"
+
+    def test_no_position_open_order_cancels(self):
+        assert reconcile_decision(0, True) == "cancel_then_close"
+
+    def test_no_position_no_order_reconciled(self):
+        assert reconcile_decision(0, False) == "mark_reconciled"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gap 1 — restart reconstruction after partial exit
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestReconstructExitState:
+    def test_partial_exit_preserved(self):
+        # Bought 10, sold 4 before crash, 6 remain. Original must NOT become 6.
+        s = reconstruct_exit_state(db_entry_filled=10, db_exit_filled=4, position_qty=6)
+        assert s["original_entry"] == 10     # original entry preserved
+        assert s["exit_filled"] == 4         # prior exits preserved
+        assert s["remaining"] == 6           # remaining reconstructed
+
+    def test_exit_unpersisted_recovered_from_position(self):
+        # Exit filled before crash but exit_filled not yet persisted (=0):
+        # derive it from (original - position).
+        s = reconstruct_exit_state(db_entry_filled=10, db_exit_filled=0, position_qty=6)
+        assert s["original_entry"] == 10
+        assert s["exit_filled"] == 4
+        assert s["remaining"] == 6
+
+    def test_entry_underrecorded_repaired_upward(self):
+        # Crash right after fill before DB entry update: db_entry=0 but position=5.
+        s = reconstruct_exit_state(db_entry_filled=0, db_exit_filled=0, position_qty=5)
+        assert s["original_entry"] == 5
+        assert s["exit_filled"] == 0
+        assert s["remaining"] == 5
+
+    def test_remaining_never_turns_into_original(self):
+        # The core bug guard: with a prior partial exit, original != remaining.
+        s = reconstruct_exit_state(db_entry_filled=8, db_exit_filled=3, position_qty=5)
+        assert s["original_entry"] == 8
+        assert s["original_entry"] != s["remaining"]
+
+    def test_idempotent_across_repeated_restarts(self):
+        # First restart derives exit_filled=4 and persists it; a second restart
+        # with that persisted value and the same position yields the same state.
+        first = reconstruct_exit_state(db_entry_filled=10, db_exit_filled=0, position_qty=6)
+        second = reconstruct_exit_state(
+            db_entry_filled=first["original_entry"],
+            db_exit_filled=first["exit_filled"],
+            position_qty=6,
+        )
+        assert first == second
+        third = reconstruct_exit_state(
+            db_entry_filled=second["original_entry"],
+            db_exit_filled=second["exit_filled"],
+            position_qty=6,
+        )
+        assert third == second
+
+
+class TestCombineExitFills:
+    def test_baseline_plus_session_full_round_trip(self):
+        # Pre-restart baseline: 4 sold @ 0.46 (value 1.84). Post-restart
+        # session: 6 sold @ 0.44. Cumulative must reflect ALL 10.
+        combined = combine_exit_fills(
+            baseline_count=4, baseline_value=4 * 0.46, baseline_fees=None,
+            session_count=6, session_avg=0.44, session_fees=None,
+        )
+        assert combined["count"] == 10
+        assert combined["value"] == pytest.approx(4 * 0.46 + 6 * 0.44)
+        assert combined["avg"] == pytest.approx((4 * 0.46 + 6 * 0.44) / 10)
+
+    def test_fresh_trade_equals_session(self):
+        combined = combine_exit_fills(0, 0.0, None, 5, 0.50, 0.01)
+        assert combined["count"] == 5
+        assert combined["avg"] == pytest.approx(0.50)
+        assert combined["fees"] == pytest.approx(0.01)
+
+    def test_fees_summed_over_known_parts(self):
+        combined = combine_exit_fills(4, 1.84, 0.02, 6, 0.44, 0.03)
+        assert combined["fees"] == pytest.approx(0.05)
+
+    def test_restart_pnl_reflects_full_round_trip(self):
+        # End-to-end via the same helpers the trader uses: original 10 contracts,
+        # entry 0.40 (entry fees 0.10 total), exits 4@0.46 (pre) + 6@0.44 (post).
+        combined = combine_exit_fills(
+            baseline_count=4, baseline_value=4 * 0.46, baseline_fees=0.04,
+            session_count=6, session_avg=0.44, session_fees=0.06,
+        )
+        pnl = compute_actual_pnl(
+            actual_entry_price=0.40,
+            actual_exit_price=combined["avg"],          # blended over all 10
+            entry_fees_total=0.10,
+            exit_fees_total=combined["fees"],           # 0.04 + 0.06
+            filled_contracts=10,                        # ORIGINAL size, not 6
+        )
+        # gross/contract = blended_exit - 0.40; fees/contract = (0.10+0.10)/10 = 0.02
+        expected = round(combined["avg"] - 0.40 - 0.02, 6)
+        assert pnl["actual_profit_cents"] == pytest.approx(expected)
+        assert pnl["actual_profit_dollars"] == pytest.approx(expected * 10)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gap 2 — no oversell during cancel/reprice (replacement gate)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestShouldReplaceExit:
+    def test_open_order_must_not_replace(self):
+        # Order still working -> fills can still land -> do NOT replace.
+        assert should_replace_exit({"status": "resting", "remaining_count": 2}, 2) is False
+
+    def test_unknown_state_must_not_replace(self):
+        # Ambiguous state is treated as open -> fail safe, no replace.
+        assert should_replace_exit(None, 3) is False
+        assert should_replace_exit({}, 3) is False
+
+    def test_terminal_with_remaining_replaces(self):
+        assert should_replace_exit({"status": "canceled", "remaining_count": 0}, 3) is True
+
+    def test_terminal_but_flat_does_not_replace(self):
+        # Nothing left to sell -> no replacement (would otherwise oversell).
+        assert should_replace_exit({"status": "executed", "remaining_count": 0}, 0) is False
+
+    def test_replacement_qty_bounded_by_remaining(self):
+        # The gate pairs with order_remaining: even when replacing, qty is the
+        # remaining only — never the original size.
+        filled, cumulative_exit = 10, 7
+        remaining = order_remaining(filled, cumulative_exit)
+        assert remaining == 3
+        assert should_replace_exit({"status": "canceled"}, remaining) is True
+        # If a late fill pushed cumulative to full, remaining is 0 -> no replace.
+        assert should_replace_exit({"status": "canceled"}, order_remaining(10, 10)) is False
+
+
+class TestPartitionTradeOrders:
+    def test_owned_and_unknown_orders_split_by_durable_keys(self):
+        orders = [
+            {"order_id": "srv-1", "client_order_id": "cli-a"},
+            {"order_id": "srv-2", "client_order_id": "cli-b"},
+            {"order_id": "srv-3", "client_order_id": "cli-c"},
+        ]
+        owned, unknown = partition_trade_orders(
+            orders,
+            known_order_ids={"srv-2"},
+            known_client_order_ids={"cli-a"},
+        )
+        assert [o["order_id"] for o in owned] == ["srv-1", "srv-2"]
+        assert [o["order_id"] for o in unknown] == ["srv-3"]
+
+
+class TestResolveRecoveryBaseline:
+    def test_prefers_persisted_when_count_and_value_match(self):
+        baseline = resolve_recovery_baseline(
+            reconstructed_exit_count=4,
+            persisted_count=4,
+            persisted_value=1.84,
+            persisted_fees=0.04,
+            fills_count=4,
+            fills_avg=0.45,
+            fills_fees=0.05,
+        )
+        assert baseline["verified"] is True
+        assert baseline["source"] == "persisted"
+        assert baseline["count"] == 4
+        assert baseline["value"] == pytest.approx(1.84)
+        assert baseline["fees"] == pytest.approx(0.04)
+
+    def test_falls_back_to_fill_history_when_persisted_progress_missing(self):
+        baseline = resolve_recovery_baseline(
+            reconstructed_exit_count=4,
+            persisted_count=0,
+            persisted_value=None,
+            persisted_fees=None,
+            fills_count=4,
+            fills_avg=0.46,
+            fills_fees=0.04,
+        )
+        assert baseline["verified"] is True
+        assert baseline["source"] == "fills"
+        assert baseline["value"] == pytest.approx(4 * 0.46)
+
+    def test_mismatch_keeps_count_but_marks_accounting_unverified(self):
+        baseline = resolve_recovery_baseline(
+            reconstructed_exit_count=4,
+            persisted_count=1,
+            persisted_value=0.44,
+            persisted_fees=0.01,
+            fills_count=3,
+            fills_avg=0.47,
+            fills_fees=0.03,
+        )
+        assert baseline["verified"] is False
+        assert baseline["source"] == "mismatch"
+        assert baseline["count"] == 4
+        assert baseline["value"] == pytest.approx(0.0)
+        assert baseline["fees"] is None
+
+
+class TestExitSubmitSequencing:
+    def test_exit_client_order_id_persisted_before_post(self, monkeypatch):
+        calls = []
+
+        class FakeClient:
+            def __init__(self):
+                self.seen = []
+
+            def place_order(self, **kwargs):
+                self.seen.append(kwargs["client_order_id"])
+                update_calls = [c for c in calls if c[0] == "update"]
+                assert update_calls, "trade row should be updated before POST"
+                assert update_calls[-1][1][0] == kwargs["client_order_id"]
+                return {"order_id": "exit-1", "client_order_id": kwargs["client_order_id"]}
+
+        def fake_execute_query(sql, params):
+            if "UPDATE momentum_live_trades SET status='PENDING_EXIT'" in sql:
+                calls.append(("update", params))
+
+        trader = object.__new__(MomentumLiveTrader)
+        trader._client = FakeClient()
+        trader._active = {}
+        trader._reconcile_ambiguous_order = lambda *args, **kwargs: None
+        trader._record_order_event = lambda live, event_type, **kwargs: calls.append(
+            ("event", event_type, kwargs)
+        )
+
+        monkeypatch.setattr("app.momentum_live_trader.execute_query", fake_execute_query)
+
+        live = _ActiveLive(
+            live_trade_id=7,
+            market_id=1,
+            contract_id=2,
+            market_ticker="TICK",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=0.0,
+            entry_ask=0.40,
+            horizon_ts=0.0,
+            requested_contracts=5,
+            status="PENDING_EXIT",
+            filled_contracts=5,
+        )
+
+        trader._submit_exit(live, 0.45, live.signal_at, "fixed_time", 3)
+
+        assert live.exit_order_id == "exit-1"
+        assert any(c[0] == "event" and c[1] == "exit_submit_intent" for c in calls)
+        assert any(c[0] == "event" and c[1] == "exit_submitted" for c in calls)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

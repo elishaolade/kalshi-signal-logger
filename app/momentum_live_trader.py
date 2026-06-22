@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import os
 import statistics
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -421,6 +422,242 @@ def _summarize_fills(fills: list[dict], side: str) -> tuple[int, Optional[float]
     return total, avg, (round(fees, 4) if saw_fee else None)
 
 
+def aggregate_fills(
+    fill_lists: list[list[dict]], side: str
+) -> tuple[int, Optional[float], Optional[float]]:
+    """
+    Aggregate fills ACROSS multiple order ids into one (count, avg_price, fees).
+
+    Used so a trade exited via several orders (partial fills, cancel/replace)
+    is summarized as a single round-trip outcome rather than only the last
+    order.  Flattens the per-order fill lists and defers to ``_summarize_fills``.
+    """
+    flat: list[dict] = []
+    for fl in fill_lists:
+        if fl:
+            flat.extend(fl)
+    return _summarize_fills(flat, side)
+
+
+def order_remaining(requested: int, filled: int) -> int:
+    """Non-negative quantity still to fill.  Never resubmit more than this."""
+    return max(0, int(requested) - int(filled))
+
+
+def is_order_open(order: Optional[dict]) -> bool:
+    """
+    Best-effort: is a Kalshi order still working (resting / partially filled)?
+
+    Terminal when status is canceled/executed/expired/closed OR remaining_count
+    is 0.  Unknown/missing state is treated as OPEN (conservative — we would
+    rather poll again or cancel explicitly than assume an order is dead and
+    leave residual quantity untracked).
+
+    NOTE: exact Kalshi order field names (``status`` values, ``remaining_count``)
+    must be confirmed against the live API.
+    """
+    if not order:
+        return True
+    status = str(order.get("status") or "").strip().lower()
+    if status in ("canceled", "cancelled", "executed", "filled", "closed", "expired"):
+        return False
+    rem = order.get("remaining_count")
+    if rem is None:
+        rem = order.get("remaining")
+    if rem is not None:
+        try:
+            return int(rem) > 0
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def net_position_for_side(positions: list[dict], ticker: str, side: str) -> int:
+    """
+    Net long contracts held on ``side`` for ``ticker`` from a positions payload.
+
+    Assumes Kalshi ``market_position.position`` is signed: positive = long YES,
+    negative = long NO.  Returns the magnitude on the requested side, else 0.
+
+    NOTE: this sign convention must be confirmed against the live API.
+    """
+    for p in positions:
+        if str(p.get("ticker") or "") != ticker:
+            continue
+        pos = p.get("position")
+        try:
+            pos = int(pos)
+        except (TypeError, ValueError):
+            continue
+        return max(0, pos) if side == "YES" else max(0, -pos)
+    return 0
+
+
+def combine_exit_fills(
+    baseline_count: int,
+    baseline_value: float,
+    baseline_fees: Optional[float],
+    session_count: int,
+    session_avg: Optional[float],
+    session_fees: Optional[float],
+) -> dict:
+    """
+    Combine a restart BASELINE of prior exit fills (from closed orders before a
+    crash) with the CURRENT session's exit aggregate into one cumulative result.
+
+    ``baseline_value`` is sum(price*count) for prior fills; the session value is
+    derived from ``session_avg * session_count``.  Unknown fees (None) are
+    summed only over known parts.  For a fresh trade baseline is 0/0/None, so
+    the result equals the session aggregate (no behaviour change).
+    """
+    count = int(baseline_count) + int(session_count)
+    session_value = (
+        float(session_avg) * int(session_count)
+        if (session_avg is not None and session_count) else 0.0
+    )
+    value = float(baseline_value) + session_value
+    fee_parts = [f for f in (baseline_fees, session_fees) if f is not None]
+    fees = round(sum(fee_parts), 6) if fee_parts else None
+    avg = round(value / count, 6) if count > 0 else None
+    return {"count": count, "avg": avg, "fees": fees, "value": round(value, 6)}
+
+
+def reconstruct_exit_state(
+    *, db_entry_filled: int, db_exit_filled: int, position_qty: int
+) -> dict:
+    """
+    Pure quantity reconstruction for a trade being rebuilt after a restart.
+
+    Keeps the ORIGINAL entry size distinct from current remaining position:
+      original_entry = max(recorded entry size, position + recorded exits)
+                       (never shrinks the original; repairs upward if the DB
+                        under-recorded the entry fill before the crash)
+      exit_filled    = original_entry - position_qty   (already sold)
+      remaining      = position_qty                    (still to flatten)
+
+    This guarantees a partially-exited trade is NOT rebuilt as if ``position_qty``
+    were the original trade size.
+    """
+    pos = max(0, int(position_qty))
+    original_entry = max(int(db_entry_filled or 0), pos + int(db_exit_filled or 0))
+    exit_filled = max(0, original_entry - pos)
+    remaining = max(0, original_entry - exit_filled)
+    return {
+        "original_entry": original_entry,
+        "exit_filled": exit_filled,
+        "remaining": remaining,
+    }
+
+
+def should_replace_exit(order: Optional[dict], remaining: int) -> bool:
+    """
+    Safety gate for cancel/reprice: only submit a replacement sell when the
+    prior order is CONFIRMED TERMINAL (no more fills can land on it) and there
+    is still quantity left.  If the order is not confirmed terminal we must NOT
+    replace (doing so off a stale fill snapshot can oversell).
+    """
+    return (not is_order_open(order)) and int(remaining) >= 1
+
+
+def partition_trade_orders(
+    orders: list[dict],
+    known_order_ids: set[str],
+    known_client_order_ids: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Partition ticker-scoped open orders into orders attributable to this trade
+    and orders we cannot safely claim.
+
+    Startup reconciliation must never cancel or adopt unrelated live orders on
+    the same ticker.  An order is treated as ours only when its server order id
+    or client_order_id matches a durable key we already recorded for the trade.
+    Unknown orders force manual review instead of broad cancellation.
+    """
+    owned: list[dict] = []
+    unknown: list[dict] = []
+    for order in orders:
+        oid = str(order.get("order_id") or order.get("id") or "")
+        coid = str(order.get("client_order_id") or "")
+        if (oid and oid in known_order_ids) or (coid and coid in known_client_order_ids):
+            owned.append(order)
+        else:
+            unknown.append(order)
+    return owned, unknown
+
+
+def reconcile_decision(position_qty: int, has_open_order: bool) -> str:
+    """
+    Pure decision for startup reconciliation of a non-terminal live row.
+
+      position_qty > 0           -> "rehydrate_flatten" (real exposure to manage)
+      position_qty 0, open order -> "cancel_then_close" (cancel stray, no posn)
+      position_qty 0, no order   -> "mark_reconciled"   (already flat)
+    """
+    if position_qty and position_qty > 0:
+        return "rehydrate_flatten"
+    if has_open_order:
+        return "cancel_then_close"
+    return "mark_reconciled"
+
+
+def resolve_recovery_baseline(
+    *,
+    reconstructed_exit_count: int,
+    persisted_count: int,
+    persisted_value: Optional[float],
+    persisted_fees: Optional[float],
+    fills_count: int,
+    fills_avg: Optional[float],
+    fills_fees: Optional[float],
+) -> dict:
+    """
+    Pick the restart baseline used for exit accounting.
+
+    We preserve the reconstructed exit COUNT even when value/fee history cannot
+    be verified, because exposure management depends on the count.  In that
+    mismatch case we intentionally mark accounting unverified and decline to
+    synthesize PnL from mismatched count/value histories.
+    """
+    reconstructed_exit_count = max(0, int(reconstructed_exit_count))
+    persisted_count = max(0, int(persisted_count))
+    fills_count = max(0, int(fills_count))
+
+    if reconstructed_exit_count == 0:
+        return {
+            "count": 0,
+            "value": 0.0,
+            "fees": None,
+            "verified": True,
+            "source": "none",
+        }
+
+    if persisted_count == reconstructed_exit_count and persisted_value is not None:
+        return {
+            "count": reconstructed_exit_count,
+            "value": round(float(persisted_value), 6),
+            "fees": persisted_fees,
+            "verified": True,
+            "source": "persisted",
+        }
+
+    if fills_count == reconstructed_exit_count and fills_avg is not None:
+        return {
+            "count": reconstructed_exit_count,
+            "value": round(float(fills_avg) * reconstructed_exit_count, 6),
+            "fees": fills_fees,
+            "verified": True,
+            "source": "fills",
+        }
+
+    return {
+        "count": reconstructed_exit_count,
+        "value": 0.0,
+        "fees": None,
+        "verified": False,
+        "source": "mismatch",
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Active live trade state
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,15 +678,30 @@ class _ActiveLive:
     status:        str             # PENDING_ENTRY | ACTIVE | PENDING_EXIT
 
     # Order linkage
-    entry_order_id:  Optional[str] = None
-    entry_submit_ts: Optional[float] = None
-    exit_order_id:   Optional[str] = None
+    entry_order_id:        Optional[str] = None
+    entry_client_order_id: Optional[str] = None
+    entry_submit_ts:       Optional[float] = None
+    entry_cancel_requested: bool = False
+    # Exit may span MULTIPLE orders (cancel/replace, partial fills); track all.
+    exit_order_id:   Optional[str] = None          # most-recent exit order
+    exit_order_ids:  list[str] = field(default_factory=list)
     exit_submit_ts:  Optional[float] = None
 
     # Fills
-    filled_contracts:   int = 0
-    actual_entry_price: Optional[float] = None
-    actual_entry_fees:  Optional[float] = None   # total entry-side fees from fills
+    filled_contracts:      int = 0                  # ORIGINAL entry size (never shrinks)
+    exit_filled_contracts: int = 0                  # cumulative EXIT fills (baseline+session)
+    actual_entry_price:    Optional[float] = None
+    actual_entry_fees:     Optional[float] = None   # total entry-side fees
+
+    # Cumulative exit aggregates (running): value = sum(exit_price*count).
+    exit_value: float = 0.0
+    exit_fees:  Optional[float] = None
+    exit_accounting_verified: bool = True
+    # Restart baseline = exit fills from orders NOT in exit_order_ids (prior,
+    # already-closed exits recovered on restart). 0/0/None for a fresh trade.
+    exit_baseline_count: int = 0
+    exit_baseline_value: float = 0.0
+    exit_baseline_fees:  Optional[float] = None
 
     # Projected exit tracking (identical to shadow _advance_active)
     peak_bid:    float = float("-inf")
@@ -457,6 +709,13 @@ class _ActiveLive:
     grace_start: Optional[float] = None
     projected_exit_bid: Optional[float] = None
     exit_reason: Optional[str] = None
+
+    # Last bid observed on THIS market (used to price a flatten after rollover,
+    # when the main loop no longer feeds this market's quotes).
+    last_bid: Optional[float] = None
+    # True once this trade must be flattened off the main quote stream
+    # (market rolled over, or rehydrated on restart): managed by _advance_flattening.
+    flattening: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -476,6 +735,11 @@ class MomentumLiveTrader:
         self._cooldown_until: dict[int, float] = {}
         self._active: dict[int, _ActiveLive] = {}
 
+        # Recovery / safety latches.  While set, _try_open_live refuses new
+        # entries until open exposure from a restart or rollover is resolved.
+        self._flatten_only = False
+        self._unresolved_recovery = False
+
         self._armed, reason = is_live_armed()
         self._client: Optional[KalshiTradingClient] = None
         if self._armed:
@@ -485,7 +749,7 @@ class MomentumLiveTrader:
                 self._armed = False
                 reason = str(exc)
 
-        self._recover_orphans()
+        self._reconcile_on_startup()
 
         if self._armed:
             logger.warning(
@@ -657,6 +921,12 @@ class MomentumLiveTrader:
         if kill_switch_engaged():
             return False, "kill_switch", "kill switch engaged"
 
+        if self._flatten_only:
+            return (
+                False, "blocked_flatten_only",
+                "flatten-only recovery mode — resolve open exposure before new entries",
+            )
+
         if self._is_paused():
             return False, "blocked_paused", "live trading is paused (manual unpause required)"
 
@@ -740,6 +1010,10 @@ class MomentumLiveTrader:
         target_ask = round(sig.entry_ask + _TP, 4)
         now = datetime.now(timezone.utc)
 
+        # Idempotency: generate the client_order_id and PERSIST it (with the row)
+        # BEFORE the POST, so an ambiguous submission can be reconciled by id.
+        coid = str(uuid.uuid4())
+
         # Persist the trade row up front (PENDING_ENTRY) with projected stats.
         live_trade_id = insert_and_get_id(
             """
@@ -751,7 +1025,7 @@ class MomentumLiveTrader:
                 projected_entry_ask, projected_target_ask,
                 projected_expectancy_cents, projected_win_rate,
                 projected_profit_factor, projected_profit_loss_ratio,
-                status, created_at
+                entry_client_order_id, status, created_at
             ) VALUES (
                 %s, %s, %s, %s,
                 %s, %s,
@@ -760,7 +1034,7 @@ class MomentumLiveTrader:
                 %s, %s,
                 %s, %s,
                 %s, %s,
-                'PENDING_ENTRY', %s
+                %s, 'PENDING_ENTRY', %s
             )
             """,
             (
@@ -772,7 +1046,7 @@ class MomentumLiveTrader:
                 sig.entry_ask, target_ask,
                 _safe(proj["expectancy"]), _safe(proj["win_rate"]),
                 _safe(proj["profit_factor"]), _safe(proj["profit_loss_ratio"]),
-                now,
+                coid, now,
             ),
         )
 
@@ -788,51 +1062,75 @@ class MomentumLiveTrader:
             horizon_ts=sig.signal_ts + _HOLD_S,
             requested_contracts=contracts,
             status="PENDING_ENTRY",
+            entry_client_order_id=coid,
         )
 
         # Place the real entry order (limit buy at the observed ask).
+        live.entry_submit_ts = datetime.now(timezone.utc).timestamp()
         try:
             order = self._client.place_order(
                 ticker=market_ticker, side=sig.side, action="buy",
                 count=contracts, limit_price=sig.entry_ask, order_type="limit",
-            )
-            live.entry_order_id = str(order.get("order_id") or order.get("id") or "")
-            live.entry_submit_ts = datetime.now(timezone.utc).timestamp()
-            execute_query(
-                "UPDATE momentum_live_trades SET entry_order_id=%s, "
-                "entry_client_order_id=%s WHERE id=%s",
-                (live.entry_order_id, str(order.get("client_order_id") or ""), live_trade_id),
-            )
-            self._record_order_event(
-                live, "entry_submitted", action="buy",
-                requested_count=contracts, limit_price=sig.entry_ask,
-                order_id=live.entry_order_id,
-                client_order_id=str(order.get("client_order_id") or ""),
-                raw=order,
-            )
-            self._active[sig.contract_id] = live
-            logger.warning(
-                "live ENTRY SUBMITTED #%d | %s %s | x%d @ %.3f (order=%s)",
-                live_trade_id, market_ticker, sig.side, contracts,
-                sig.entry_ask, live.entry_order_id,
+                client_order_id=coid,
             )
         except KalshiTradingError as exc:
-            execute_query(
-                "UPDATE momentum_live_trades SET status='REJECTED' WHERE id=%s",
-                (live_trade_id,),
+            # Ambiguous: the POST may have succeeded but the response was lost.
+            # Reconcile by client_order_id before declaring it failed.
+            order = self._reconcile_ambiguous_order(coid, market_ticker)
+            if order is None:
+                execute_query(
+                    "UPDATE momentum_live_trades SET status='REJECTED' WHERE id=%s",
+                    (live_trade_id,),
+                )
+                self._record_order_event(
+                    live, "entry_rejected", action="buy",
+                    requested_count=contracts, limit_price=sig.entry_ask,
+                    client_order_id=coid, detail=str(exc)[:480],
+                )
+                logger.error("live ENTRY REJECTED #%d | %s", live_trade_id, exc)
+                return True
+            logger.warning(
+                "live ENTRY adopted after ambiguous submission #%d (coid=%s)",
+                live_trade_id, coid,
             )
-            self._record_order_event(
-                live, "entry_rejected", action="buy",
-                requested_count=contracts, limit_price=sig.entry_ask,
-                detail=str(exc)[:480],
-            )
-            logger.error("live ENTRY REJECTED #%d | %s", live_trade_id, exc)
+
+        live.entry_order_id = str(order.get("order_id") or order.get("id") or "")
+        execute_query(
+            "UPDATE momentum_live_trades SET entry_order_id=%s WHERE id=%s",
+            (live.entry_order_id, live_trade_id),
+        )
+        self._record_order_event(
+            live, "entry_submitted", action="buy",
+            requested_count=contracts, limit_price=sig.entry_ask,
+            order_id=live.entry_order_id, client_order_id=coid, raw=order,
+        )
+        self._active[sig.contract_id] = live
+        logger.warning(
+            "live ENTRY SUBMITTED #%d | %s %s | x%d @ %.3f (order=%s)",
+            live_trade_id, market_ticker, sig.side, contracts,
+            sig.entry_ask, live.entry_order_id,
+        )
         return True
 
     def _advance_active(self, row: MarketRow, captured_at: datetime) -> None:
         """Advance every active live trade by one tick."""
         for contract_id, live in list(self._active.items()):
+            # Flattening trades belong to a market the main loop no longer feeds
+            # (rolled over / recovered on restart); manage them off the quote
+            # stream using last_bid, never the current row.
+            if live.flattening:
+                try:
+                    self._advance_flattening(live, captured_at)
+                except KalshiTradingError as exc:
+                    logger.warning(
+                        "live flatten poll failed (#%d, retry next tick): %s",
+                        live.live_trade_id, exc,
+                    )
+                continue
+
             bid = get_bid(row, live.side)
+            if bid is not None:
+                live.last_bid = bid
 
             # Projected excursion tracking (identical to shadow tracker).
             if row.ts <= live.horizon_ts and bid is not None:
@@ -854,112 +1152,290 @@ class MomentumLiveTrader:
                 )
 
     def _advance_pending_entry(self, live: _ActiveLive, row: MarketRow, captured_at: datetime) -> None:
-        """Poll the resting entry order; promote to ACTIVE on fill, cancel on timeout."""
+        """
+        Poll the entry order with partial-fill safety.
+
+        We must never promote to ACTIVE while quantity is still resting and
+        untracked, and never lose residual quantity.  Strategy:
+          - if fully filled -> promote with the final fill count;
+          - if partially filled while the order is still open -> cancel the
+            remainder once, then promote on the next tick from the (now final)
+            cumulative fills;
+          - if unfilled past timeout/horizon -> cancel and abandon;
+          - if the order is already terminal -> promote (filled>=1) or abandon.
+        ``filled_contracts`` is always kept in sync with cumulative fills.
+        """
         if not live.entry_order_id:
             return
+
         fills = self._client.get_fills(order_id=live.entry_order_id)
         count, avg_price, entry_fees = _summarize_fills(fills, live.side)
+        # Keep partial state current at all times (residual is never lost).
+        live.filled_contracts = count
+        live.actual_entry_price = avg_price
+        live.actual_entry_fees = entry_fees
 
-        elapsed = datetime.now(timezone.utc).timestamp() - (live.entry_submit_ts or 0)
-        timed_out = elapsed > config.MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS
-        past_horizon = row.ts >= live.horizon_ts
-
-        if count >= 1:
-            # (Partial or full) entry achieved.
-            live.filled_contracts = count
-            live.actual_entry_price = avg_price
-            live.actual_entry_fees = entry_fees   # preserved for round-trip pnl
-            live.status = "ACTIVE"
-            execute_query(
-                "UPDATE momentum_live_trades SET status='ACTIVE', "
-                "filled_contracts=%s, actual_entry_price=%s, entry_at=%s WHERE id=%s",
-                (count, avg_price, captured_at, live.live_trade_id),
-            )
-            self._record_order_event(
-                live,
-                "entry_filled" if count >= live.requested_contracts else "entry_partial",
-                action="buy", requested_count=live.requested_contracts,
-                filled_count=count, avg_fill_price=avg_price,
-                order_id=live.entry_order_id,
-            )
-            logger.warning(
-                "live ENTRY FILLED #%d | %s %s | %d/%d @ %.3f",
-                live.live_trade_id, live.market_ticker, live.side,
-                count, live.requested_contracts, avg_price or 0.0,
-            )
+        # Fully filled — promote immediately, nothing resting.
+        if count >= live.requested_contracts:
+            self._promote_entry_to_active(live, captured_at)
             return
 
-        if timed_out or past_horizon:
-            # No fill — do not chase. Cancel and abandon (no fabricated fill).
-            try:
-                self._client.cancel_order(live.entry_order_id)
-            except KalshiTradingError as exc:
-                logger.warning("entry cancel failed #%d: %s", live.live_trade_id, exc)
-            execute_query(
-                "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
-                (live.live_trade_id,),
-            )
-            self._record_order_event(
-                live, "entry_canceled", action="buy",
-                requested_count=live.requested_contracts, filled_count=0,
-                order_id=live.entry_order_id,
-                detail="unfilled past timeout/horizon",
-            )
-            logger.info("live ENTRY CANCELED (unfilled) #%d", live.live_trade_id)
-            del self._active[live.contract_id]
+        order = self._safe_get_order(live.entry_order_id)
+        order_open = is_order_open(order)
+
+        if order_open:
+            elapsed = datetime.now(timezone.utc).timestamp() - (live.entry_submit_ts or 0)
+            timed_out = elapsed > config.MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS
+            past_horizon = row.ts >= live.horizon_ts
+
+            # Partial fill while still resting: cancel the remainder once so no
+            # quantity stays untracked. Promotion happens once it goes terminal.
+            if count >= 1 and not live.entry_cancel_requested:
+                self._cancel_entry_remainder(live, "lock in partial entry fill")
+                return
+            # No fill and out of time: cancel; abandon once terminal.
+            if count == 0 and (timed_out or past_horizon) and not live.entry_cancel_requested:
+                self._cancel_entry_remainder(live, "unfilled past timeout/horizon")
+                return
+            # Still working within the fill window — wait.
+            return
+
+        # Order is terminal (executed/canceled/expired).
+        if count >= 1:
+            self._promote_entry_to_active(live, captured_at)
+        else:
+            self._abandon_entry(live, "unfilled (order terminal)")
+
+    def _cancel_entry_remainder(self, live: _ActiveLive, reason: str) -> None:
+        """Cancel the resting entry order; promotion/abandon resolves next tick."""
+        try:
+            self._client.cancel_order(live.entry_order_id)
+        except KalshiTradingError as exc:
+            logger.warning("entry cancel failed #%d: %s", live.live_trade_id, exc)
+        live.entry_cancel_requested = True
+        logger.info("live ENTRY cancel requested #%d | %s", live.live_trade_id, reason)
+
+    def _promote_entry_to_active(self, live: _ActiveLive, captured_at: datetime) -> None:
+        """Lock in the final entry fill and move to ACTIVE (no residual qty)."""
+        count = live.filled_contracts
+        live.status = "ACTIVE"
+        execute_query(
+            "UPDATE momentum_live_trades SET status='ACTIVE', "
+            "filled_contracts=%s, actual_entry_price=%s, actual_entry_fees=%s, "
+            "entry_at=%s WHERE id=%s",
+            (count, live.actual_entry_price, live.actual_entry_fees,
+             captured_at, live.live_trade_id),
+        )
+        self._record_order_event(
+            live,
+            "entry_filled" if count >= live.requested_contracts else "entry_partial",
+            action="buy", requested_count=live.requested_contracts,
+            filled_count=count, avg_fill_price=live.actual_entry_price,
+            order_id=live.entry_order_id,
+        )
+        logger.warning(
+            "live ENTRY FILLED #%d | %s %s | %d/%d @ %.3f",
+            live.live_trade_id, live.market_ticker, live.side,
+            count, live.requested_contracts, live.actual_entry_price or 0.0,
+        )
+
+    def _abandon_entry(self, live: _ActiveLive, reason: str) -> None:
+        """No position taken — mark CANCELED and drop from active management."""
+        execute_query(
+            "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
+            (live.live_trade_id,),
+        )
+        self._record_order_event(
+            live, "entry_canceled", action="buy",
+            requested_count=live.requested_contracts, filled_count=0,
+            order_id=live.entry_order_id, detail=reason,
+        )
+        logger.info("live ENTRY CANCELED (%s) #%d", reason, live.live_trade_id)
+        self._active.pop(live.contract_id, None)
+
+    def _safe_get_order(self, order_id: str) -> Optional[dict]:
+        """get_order that returns None on API error (caller treats as open)."""
+        try:
+            return self._client.get_order(order_id)
+        except KalshiTradingError as exc:
+            logger.warning("get_order failed (%s): %s", order_id, exc)
+            return None
 
     def _advance_active_position(
         self, live: _ActiveLive, row: MarketRow, bid: Optional[float], captured_at: datetime
     ) -> None:
-        """Apply the frozen exit rules; submit a real sell when an exit fires."""
+        """
+        Apply the frozen exit rules.  On the FIRST firing we COMMIT to exiting:
+        the projected (shadow) exit is locked, the trade flips to PENDING_EXIT,
+        and all subsequent flatten attempts/retries run through the exit path
+        (so a failed submit or a price that no longer re-qualifies can never
+        strand the position before its horizon).
+        """
         exit_reason, exit_bid = self._frozen_exit_decision(live, row, bid)
         if exit_reason is None:
             return
 
+        # Lock projected exit (shadow outcome) at first firing; commit to exit.
         live.exit_reason = exit_reason
-        live.projected_exit_bid = exit_bid   # observed bid drives projected pnl
+        live.projected_exit_bid = exit_bid   # may be None for "unexecutable"
+        live.status = "PENDING_EXIT"
+        execute_query(
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', exit_reason=%s WHERE id=%s",
+            (exit_reason, live.live_trade_id),
+        )
+
+        remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
+        if remaining < 1:
+            return
 
         if exit_bid is None:
-            # Frozen "unexecutable": no bid to sell into.  Keep the position and
-            # retry the exit as soon as a bid appears (do not fabricate a fill).
-            live.status = "PENDING_EXIT"
-            execute_query(
-                "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
-                "exit_reason=%s WHERE id=%s",
-                (exit_reason, live.live_trade_id),
-            )
+            # Frozen "unexecutable": no bid to sell into. Stay PENDING_EXIT and
+            # retry to flatten as soon as a bid appears (never fabricate a fill).
             self._record_guardrail(
                 "exit_no_bid", live.market_ticker, live.side,
                 f"exit fired ({exit_reason}) with no bid; will retry to flatten",
             )
             return
 
-        self._submit_exit(live, exit_bid, captured_at, exit_reason)
+        self._submit_exit(live, exit_bid, captured_at, exit_reason, remaining)
+
+    def _aggregate_exit_fills(self, live: _ActiveLive) -> tuple[int, Optional[float], Optional[float]]:
+        """
+        Cumulative exit fills = restart BASELINE (prior closed exits) + this
+        session's exit orders.  Persists the running totals so a later restart
+        can reconstruct the full round trip.
+        """
+        fill_lists = [
+            self._client.get_fills(order_id=oid) for oid in live.exit_order_ids
+        ]
+        s_count, s_avg, s_fees = aggregate_fills(fill_lists, live.side)
+        combined = combine_exit_fills(
+            live.exit_baseline_count, live.exit_baseline_value, live.exit_baseline_fees,
+            s_count, s_avg, s_fees,
+        )
+        live.exit_filled_contracts = combined["count"]
+        live.exit_value = combined["value"]
+        live.exit_fees = combined["fees"]
+        self._persist_exit_progress(live)
+        return combined["count"], combined["avg"], combined["fees"]
+
+    def _persist_exit_progress(self, live: _ActiveLive) -> None:
+        """Persist cumulative exit progress for restart-safe reconstruction."""
+        try:
+            execute_query(
+                "UPDATE momentum_live_trades SET exit_filled_contracts=%s, "
+                "exit_value_cents=%s, exit_fees_total=%s WHERE id=%s",
+                (
+                    live.exit_filled_contracts,
+                    round(live.exit_value, 6) if live.exit_accounting_verified else None,
+                    live.exit_fees if live.exit_accounting_verified else None,
+                    live.live_trade_id,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("failed to persist exit progress #%d: %s", live.live_trade_id, exc)
+
+    def _reconstruct_exit_from_fills(
+        self, ticker: str, side: str
+    ) -> tuple[int, Optional[float], Optional[float]]:
+        """
+        Authoritative cumulative exit (count, avg_price, fees) for a ticker/side
+        from the fills history (SELL fills).  Used on restart when the persisted
+        progress does not match the live position.
+
+        NOTE: assumes get_fills(ticker=...) returns historical (closed-order)
+        fills and that each fill exposes an ``action`` of buy/sell — confirm
+        against the live Kalshi API.
+        """
+        fills = self._client.get_fills(ticker=ticker)
+        sells = [f for f in fills if str(f.get("action") or "").strip().lower() == "sell"]
+        return _summarize_fills(sells, side)
 
     def _advance_pending_exit(
         self, live: _ActiveLive, row: MarketRow, bid: Optional[float], captured_at: datetime
     ) -> None:
-        """Poll the resting exit order; finalize on fill; re-price/retry otherwise."""
-        if not live.exit_order_id:
-            # We owed an exit but had no bid before — try again now.
-            if bid is not None:
-                self._submit_exit(live, bid, captured_at, live.exit_reason or EXIT_FIXED_TIME)
+        """
+        Poll exit order(s) with partial-exit safety.
+
+        Aggregates fills across ALL exit orders for the trade, finalizes only
+        when cumulative exit fills cover the full entry position, and only ever
+        resubmits the REMAINING quantity (never the original full size).
+        """
+        if not live.exit_order_ids:
+            # We owe an exit but never placed one (no bid earlier) — try now.
+            remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
+            if bid is not None and remaining >= 1:
+                self._submit_exit(live, bid, captured_at,
+                                  live.exit_reason or EXIT_FIXED_TIME, remaining)
             return
 
-        fills = self._client.get_fills(order_id=live.exit_order_id)
-        count, avg_price, exit_fees = _summarize_fills(fills, live.side)
+        count, avg_price, exit_fees = self._aggregate_exit_fills(live)
         if count >= live.filled_contracts and count >= 1:
-            self._finalize_complete(live, avg_price, exit_fees, captured_at)
+            self._finalize_complete(live, avg_price, exit_fees, count, captured_at)
             return
 
-        # Not (fully) filled — chase the bid to get flat: cancel + re-submit.
+        remaining = order_remaining(live.filled_contracts, count)
+        latest = live.exit_order_id
+        order = self._safe_get_order(latest) if latest else None
+        order_open = is_order_open(order) if latest else False
+
+        if not order_open:
+            # Latest exit order is done but we are not flat — sell the remainder.
+            if bid is not None and remaining >= 1:
+                self._submit_exit(live, bid, captured_at,
+                                  live.exit_reason or EXIT_FIXED_TIME, remaining)
+            return
+
+        # Still resting — chase the bid after the timeout: cancel, then ONLY
+        # replace once the cancelled order is CONFIRMED TERMINAL.  A still-open
+        # order can keep filling, so deriving the replacement quantity from a
+        # stale snapshot could oversell.  If we can't confirm terminal this
+        # tick, do nothing and retry next tick (fail safe).
         elapsed = datetime.now(timezone.utc).timestamp() - (live.exit_submit_ts or 0)
         if elapsed > config.MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS and bid is not None:
             try:
-                self._client.cancel_order(live.exit_order_id)
+                self._client.cancel_order(latest)
             except KalshiTradingError as exc:
                 logger.warning("exit cancel failed #%d: %s", live.live_trade_id, exc)
-            self._submit_exit(live, bid, captured_at, live.exit_reason or EXIT_FIXED_TIME)
+            # Re-confirm terminal state of the cancelled order before replacing.
+            confirmed = self._safe_get_order(latest)
+            count, avg_price, exit_fees = self._aggregate_exit_fills(live)
+            if count >= live.filled_contracts and count >= 1:
+                self._finalize_complete(live, avg_price, exit_fees, count, captured_at)
+                return
+            remaining = order_remaining(live.filled_contracts, count)
+            if not should_replace_exit(confirmed, remaining):
+                # Not confirmed terminal (or nothing left) — do NOT replace now;
+                # the cancel will settle and we retry on a later tick.
+                logger.info(
+                    "exit replace deferred #%d — cancel not confirmed terminal yet",
+                    live.live_trade_id,
+                )
+                return
+            self._submit_exit(live, bid, captured_at,
+                              live.exit_reason or EXIT_FIXED_TIME, remaining)
+
+    def _advance_flattening(self, live: _ActiveLive, captured_at: datetime) -> None:
+        """
+        Manage a position that must be flattened off the main quote stream
+        (market rolled over, or rehydrated on restart).  Polls exit fills (no
+        market data needed) and resubmits the remaining quantity at the last
+        observed bid until flat.
+        """
+        count, avg_price, exit_fees = self._aggregate_exit_fills(live)
+        if count >= live.filled_contracts and count >= 1:
+            self._finalize_complete(live, avg_price, exit_fees, count, captured_at)
+            return
+
+        remaining = order_remaining(live.filled_contracts, count)
+        if remaining < 1:
+            return
+        latest = live.exit_order_id
+        order = self._safe_get_order(latest) if latest else None
+        order_open = is_order_open(order) if latest else False
+        if not order_open and live.last_bid is not None:
+            self._submit_exit(live, live.last_bid, captured_at,
+                              live.exit_reason or EXIT_FIXED_TIME, remaining)
 
     def _frozen_exit_decision(
         self, live: _ActiveLive, row: MarketRow, bid: Optional[float]
@@ -982,48 +1458,92 @@ class MomentumLiveTrader:
         return None, None
 
     def _submit_exit(
-        self, live: _ActiveLive, bid: float, captured_at: datetime, exit_reason: str
+        self, live: _ActiveLive, bid: float, captured_at: datetime,
+        exit_reason: str, qty: int,
     ) -> None:
-        """Place a real limit sell to flatten the position at the observed bid."""
+        """
+        Place a limit sell for ``qty`` (the REMAINING quantity, never the full
+        original size).  Generates and persists a client_order_id before the
+        POST; on an ambiguous failure, reconciles by that id so a landed order
+        is adopted instead of duplicated.
+        """
+        if qty < 1:
+            return
+        coid = str(uuid.uuid4())
+        live.exit_submit_ts = datetime.now(timezone.utc).timestamp()
+        execute_query(
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
+            "exit_client_order_id=%s, exit_reason=%s WHERE id=%s",
+            (coid, exit_reason, live.live_trade_id),
+        )
+        self._record_order_event(
+            live, "exit_submit_intent", action="sell",
+            requested_count=qty, limit_price=bid, client_order_id=coid,
+            detail="persisted before submit for restart reconciliation",
+        )
         try:
             order = self._client.place_order(
                 ticker=live.market_ticker, side=live.side, action="sell",
-                count=live.filled_contracts, limit_price=bid, order_type="limit",
-            )
-            live.exit_order_id = str(order.get("order_id") or order.get("id") or "")
-            live.exit_submit_ts = datetime.now(timezone.utc).timestamp()
-            live.status = "PENDING_EXIT"
-            execute_query(
-                "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
-                "exit_order_id=%s, exit_client_order_id=%s, exit_reason=%s WHERE id=%s",
-                (live.exit_order_id, str(order.get("client_order_id") or ""),
-                 exit_reason, live.live_trade_id),
-            )
-            self._record_order_event(
-                live, "exit_submitted", action="sell",
-                requested_count=live.filled_contracts, limit_price=bid,
-                order_id=live.exit_order_id,
-                client_order_id=str(order.get("client_order_id") or ""),
-                raw=order,
-            )
-            logger.warning(
-                "live EXIT SUBMITTED #%d | %s %s | x%d @ %.3f (%s)",
-                live.live_trade_id, live.market_ticker, live.side,
-                live.filled_contracts, bid, exit_reason,
+                count=qty, limit_price=bid, order_type="limit",
+                client_order_id=coid,
             )
         except KalshiTradingError as exc:
-            self._record_order_event(
-                live, "exit_rejected", action="sell",
-                requested_count=live.filled_contracts, limit_price=bid,
-                detail=str(exc)[:480],
-            )
-            logger.error("live EXIT REJECTED #%d | %s", live.live_trade_id, exc)
+            # Ambiguous: the order may have landed. Try to adopt it by coid so we
+            # do not double-sell; otherwise leave it for next-tick retry (which
+            # only ever resubmits the remaining quantity).
+            adopted = self._reconcile_ambiguous_order(coid, live.market_ticker)
+            if adopted is None:
+                self._record_order_event(
+                    live, "exit_rejected", action="sell",
+                    requested_count=qty, limit_price=bid,
+                    client_order_id=coid, detail=str(exc)[:480],
+                )
+                logger.error("live EXIT REJECTED #%d | %s", live.live_trade_id, exc)
+                return
+            order = adopted
+
+        oid = str(order.get("order_id") or order.get("id") or "")
+        if oid and oid not in live.exit_order_ids:
+            live.exit_order_ids.append(oid)
+        live.exit_order_id = oid
+        live.status = "PENDING_EXIT"
+        execute_query(
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
+            "exit_order_id=%s, exit_client_order_id=%s, exit_reason=%s WHERE id=%s",
+            (oid, coid, exit_reason, live.live_trade_id),
+        )
+        self._record_order_event(
+            live, "exit_submitted", action="sell",
+            requested_count=qty, limit_price=bid,
+            order_id=oid, client_order_id=coid, raw=order,
+        )
+        logger.warning(
+            "live EXIT SUBMITTED #%d | %s %s | x%d @ %.3f (%s)",
+            live.live_trade_id, live.market_ticker, live.side, qty, bid, exit_reason,
+        )
+
+    def _reconcile_ambiguous_order(
+        self, client_order_id: str, ticker: str
+    ) -> Optional[dict]:
+        """Return the order matching client_order_id if it actually landed, else None."""
+        try:
+            return self._client.find_order_by_client_order_id(client_order_id, ticker=ticker)
+        except KalshiTradingError as exc:
+            logger.warning("ambiguous-order reconcile failed (%s): %s", client_order_id, exc)
+            return None
 
     def _finalize_complete(
         self, live: _ActiveLive, actual_exit_price: Optional[float],
-        exit_fees_total: Optional[float], captured_at: datetime,
+        exit_fees_total: Optional[float], exit_count: int, captured_at: datetime,
     ) -> None:
-        """Compute projected/actual/drift, persist COMPLETE, evaluate pause."""
+        """
+        Compute projected/actual/drift, persist COMPLETE, evaluate pause.
+
+        ``actual_exit_price``/``exit_fees_total``/``exit_count`` are the values
+        AGGREGATED across all exit orders for the trade (see _aggregate_exit_fills),
+        so the recorded outcome reflects the whole round trip, not the last order.
+        """
+        live.exit_filled_contracts = exit_count
         # Projected (shadow-of-this-trade) pnl on observed quotes.
         projected_profit = None
         if live.projected_exit_bid is not None:
@@ -1033,17 +1553,25 @@ class MomentumLiveTrader:
 
         # Actual pnl from real fills — charges BOTH entry and exit fees,
         # normalized to per-contract (see compute_actual_pnl).
-        actual = compute_actual_pnl(
-            actual_entry_price=live.actual_entry_price,
-            actual_exit_price=actual_exit_price,
-            entry_fees_total=live.actual_entry_fees,
-            exit_fees_total=exit_fees_total,
-            filled_contracts=live.filled_contracts,
-        )
-        actual_profit           = actual["actual_profit_cents"]
-        actual_profit_dollars   = actual["actual_profit_dollars"]
-        actual_won              = actual["actual_trade_won"]
-        actual_fees_per_contract = actual["fees_per_contract"]
+        if live.exit_accounting_verified:
+            actual = compute_actual_pnl(
+                actual_entry_price=live.actual_entry_price,
+                actual_exit_price=actual_exit_price,
+                entry_fees_total=live.actual_entry_fees,
+                exit_fees_total=exit_fees_total,
+                filled_contracts=live.filled_contracts,
+            )
+            actual_profit = actual["actual_profit_cents"]
+            actual_profit_dollars = actual["actual_profit_dollars"]
+            actual_won = actual["actual_trade_won"]
+            actual_fees_per_contract = actual["fees_per_contract"]
+        else:
+            actual_exit_price = None
+            exit_fees_total = None
+            actual_profit = None
+            actual_profit_dollars = None
+            actual_won = None
+            actual_fees_per_contract = None
 
         # Projected strategy expectancy stored at entry (re-read for drift).
         row = fetch_one(
@@ -1092,18 +1620,26 @@ class MomentumLiveTrader:
                 live.live_trade_id,
             ),
         )
+        if not live.exit_accounting_verified:
+            self._record_guardrail(
+                "accounting_unverified", live.market_ticker, live.side,
+                f"trade #{live.live_trade_id}: completed flat but restart baseline "
+                f"could not be verified; actual PnL/drift left NULL",
+            )
         self._record_order_event(
             live, "exit_filled", action="sell",
-            requested_count=live.filled_contracts, filled_count=live.filled_contracts,
+            requested_count=live.filled_contracts, filled_count=exit_count,
             avg_fill_price=actual_exit_price, order_id=live.exit_order_id,
         )
         logger.warning(
-            "live COMPLETE #%d | %s %s | proj=%s act=%s delta=%s capture=%s",
+            "live COMPLETE #%d | %s %s | filled=%d exit=%d | proj=%s act=%s delta=%s capture=%s",
             live.live_trade_id, live.market_ticker, live.side,
+            live.filled_contracts, exit_count,
             _fmt(projected_profit), _fmt(actual_profit),
             _fmt(drift["profit_delta_cents"]), _fmt(drift["profit_capture_ratio"]),
         )
-        del self._active[live.contract_id]
+        self._active.pop(live.contract_id, None)
+        self._maybe_clear_flatten_only()
 
         # Automatic pause check on every completed live trade.
         try:
@@ -1111,35 +1647,66 @@ class MomentumLiveTrader:
         except Exception as exc:
             logger.error("pause evaluation failed: %s", exc, exc_info=True)
 
+    def _maybe_clear_flatten_only(self) -> None:
+        """Lift flatten-only mode once no rolled-over/recovered exposure remains."""
+        if not self._flatten_only:
+            return
+        if any(l.flattening for l in self._active.values()):
+            return
+        self._flatten_only = False
+        self._unresolved_recovery = False
+        logger.warning("live flatten-only mode cleared — exposure resolved")
+
     def _close_out_on_rollover(self, live: _ActiveLive, captured_at: datetime) -> None:
-        """Best-effort flatten on market rollover; never leave a silent position."""
-        if live.status == "PENDING_ENTRY" and live.entry_order_id:
-            try:
-                self._client.cancel_order(live.entry_order_id)
-            except KalshiTradingError:
-                pass
+        """
+        Handle a trade whose market is rolling over.
+
+        - No real position yet (PENDING_ENTRY, 0 filled): cancel and abandon.
+        - Real filled position: DO NOT drop it.  Switch to flatten-only
+          management (it stays in self._active, flagged ``flattening``) so it is
+          driven to flat by _advance_flattening on subsequent ticks, and block
+          new entries until the exposure is resolved.
+        """
+        remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
+
+        if live.status == "PENDING_ENTRY" and live.filled_contracts == 0:
+            if live.entry_order_id and not live.entry_cancel_requested:
+                try:
+                    self._client.cancel_order(live.entry_order_id)
+                except KalshiTradingError:
+                    pass
             execute_query(
                 "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
                 (live.live_trade_id,),
             )
             self._record_order_event(
                 live, "entry_canceled", action="buy",
-                detail="market rollover", order_id=live.entry_order_id,
+                detail="market rollover (unfilled)", order_id=live.entry_order_id,
             )
-        else:
-            # We may be holding contracts; record a guardrail so it can't be
-            # missed. A standing exit order (if any) is left to fill/cancel.
-            execute_query(
-                "UPDATE momentum_live_trades SET status='UNEXECUTABLE', exit_at=%s, "
-                "exit_reason='rollover_open_position' WHERE id=%s",
-                (captured_at, live.live_trade_id),
-            )
-            self._record_guardrail(
-                "rollover_open_position", live.market_ticker, live.side,
-                f"market rolled over with live trade #{live.live_trade_id} "
-                f"status={live.status} filled={live.filled_contracts} — verify positions",
-            )
-        self._active.pop(live.contract_id, None)
+            self._active.pop(live.contract_id, None)
+            return
+
+        # Real (or possibly real) exposure — keep managing until flat.
+        live.flattening = True
+        live.exit_reason = live.exit_reason or EXIT_FIXED_TIME
+        self._flatten_only = True
+        self._unresolved_recovery = True
+        execute_query(
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', exit_reason=%s WHERE id=%s",
+            (live.exit_reason, live.live_trade_id),
+        )
+        self._record_guardrail(
+            "rollover_open_position", live.market_ticker, live.side,
+            f"market rolled over with live trade #{live.live_trade_id} "
+            f"filled={live.filled_contracts} remaining={remaining} — flattening",
+        )
+        # Attempt an immediate flatten at the last bid we saw on this market.
+        if remaining >= 1 and live.last_bid is not None and not live.exit_order_id:
+            try:
+                self._submit_exit(live, live.last_bid, captured_at, live.exit_reason, remaining)
+            except KalshiTradingError as exc:
+                logger.error("rollover flatten submit failed #%d: %s", live.live_trade_id, exc)
+        # NOTE: trade intentionally REMAINS in self._active (flattening).
 
     # ── Projected stats + pause ───────────────────────────────────────────────
 
@@ -1283,36 +1850,309 @@ class MomentumLiveTrader:
         except Exception as exc:
             logger.warning("failed to record guardrail %s: %s", event_type, exc)
 
-    def _recover_orphans(self) -> None:
+    def _known_order_keys(self, trade_id: int, row: dict) -> tuple[set[str], set[str]]:
+        """Durable order keys already attributed to this trade."""
+        order_ids: set[str] = set()
+        client_order_ids: set[str] = set()
+        for key in ("entry_order_id", "exit_order_id"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                order_ids.add(value)
+        for key in ("entry_client_order_id", "exit_client_order_id"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                client_order_ids.add(value)
+        try:
+            events = fetch_all(
+                "SELECT order_id, client_order_id FROM momentum_live_order_events "
+                "WHERE live_trade_id=%s",
+                (trade_id,),
+            )
+        except Exception:
+            events = []
+        for event in events:
+            order_id = str(event.get("order_id") or "").strip()
+            client_order_id = str(event.get("client_order_id") or "").strip()
+            if order_id:
+                order_ids.add(order_id)
+            if client_order_id:
+                client_order_ids.add(client_order_id)
+        return order_ids, client_order_ids
+
+    def _reconcile_on_startup(self) -> None:
         """
-        On restart, flag any non-terminal live rows for human review.  We do NOT
-        auto-close real positions here (we cannot know fill state without the
-        API); we mark them and emit a guardrail so they are noticed.
+        On restart, reconcile every non-terminal live row against live API state
+        instead of merely logging it.  Real positions are rehydrated into
+        flatten-only management; stray orders are cancelled; already-flat rows
+        are marked reconciled.  Any unresolved exposure latches flatten-only so
+        no new entries open until it is cleared.
         """
         try:
             rows = fetch_all(
-                "SELECT id, status FROM momentum_live_trades "
+                "SELECT id, market_id, contract_id, market_ticker, side, "
+                "requested_contracts, filled_contracts, "
+                "exit_filled_contracts, exit_value_cents, exit_fees_total, "
+                "projected_entry_ask, actual_entry_price, actual_entry_fees, "
+                "signal_at, entry_order_id, entry_client_order_id, "
+                "exit_order_id, exit_client_order_id, status "
+                "FROM momentum_live_trades "
                 "WHERE status IN ('PENDING_ENTRY','ACTIVE','PENDING_EXIT')"
             )
         except Exception as exc:
             logger.info(
-                "MomentumLiveTrader: orphan check skipped (table may not exist "
-                "— run scripts/migrate_add_momentum_live.py): %s", exc,
+                "MomentumLiveTrader: startup reconcile skipped (table may not "
+                "exist — run scripts/migrate_add_momentum_live.py): %s", exc,
             )
             return
+        if not rows:
+            return
+        logger.warning(
+            "live startup reconciliation: %d non-terminal row(s) to resolve", len(rows)
+        )
         for r in rows:
-            logger.warning(
-                "live ORPHAN on restart: trade #%s status=%s — needs manual review",
-                r["id"], r["status"],
-            )
             try:
-                execute_query(
-                    "INSERT INTO momentum_live_guardrail_events "
-                    "(event_type, reason) VALUES ('orphan_on_restart', %s)",
-                    (f"live trade #{r['id']} was {r['status']} at restart",),
+                self._reconcile_one(r)
+            except Exception as exc:
+                # Unknown state — fail safe: block new entries.
+                self._flatten_only = True
+                self._unresolved_recovery = True
+                logger.error("reconcile failed for #%s: %s", r["id"], exc, exc_info=True)
+                self._record_guardrail(
+                    "reconcile_error", r.get("market_ticker"), r.get("side"),
+                    f"reconcile failed for trade #{r['id']}: {exc}",
                 )
-            except Exception:
+
+    def _reconcile_one(self, r: dict) -> None:
+        tid = int(r["id"])
+        ticker = r["market_ticker"]
+        side = r["side"]
+
+        # Without an API client we cannot verify exposure — fail safe.
+        if not self._armed or self._client is None:
+            self._flatten_only = True
+            self._unresolved_recovery = True
+            logger.warning(
+                "live ORPHAN #%d status=%s — no API to reconcile; blocking new entries",
+                tid, r["status"],
+            )
+            self._record_guardrail(
+                "orphan_unreconciled", ticker, side,
+                f"trade #{tid} was {r['status']} at restart; no API client to reconcile",
+            )
+            return
+
+        positions = self._client.get_positions(ticker=ticker)
+        pos_qty = net_position_for_side(positions, ticker, side)
+        ticker_open_orders = [
+            o for o in self._client.get_orders(ticker=ticker) if is_order_open(o)
+        ]
+        known_order_ids, known_client_order_ids = self._known_order_keys(tid, r)
+        open_orders, unknown_orders = partition_trade_orders(
+            ticker_open_orders, known_order_ids, known_client_order_ids
+        )
+        if unknown_orders:
+            self._flatten_only = True
+            self._unresolved_recovery = True
+            self._record_guardrail(
+                "reconcile_ambiguous_orders", ticker, side,
+                f"trade #{tid}: found {len(unknown_orders)} open order(s) on ticker "
+                f"that are not attributable to this strategy trade; manual review required",
+            )
+            logger.error(
+                "live ORPHAN #%d — found %d unowned open order(s) on %s; manual review",
+                tid, len(unknown_orders), ticker,
+            )
+            return
+
+        decision = reconcile_decision(pos_qty, len(open_orders) > 0)
+
+        if decision == "rehydrate_flatten":
+            self._rehydrate_flatten(r, pos_qty, open_orders)
+        elif decision == "cancel_then_close":
+            for o in open_orders:
+                try:
+                    self._client.cancel_order(str(o.get("order_id") or o.get("id") or ""))
+                except KalshiTradingError:
+                    pass
+            execute_query(
+                "UPDATE momentum_live_trades SET status='CANCELED', "
+                "exit_reason='reconciled_no_position' WHERE id=%s",
+                (tid,),
+            )
+            self._record_guardrail(
+                "reconciled_canceled", ticker, side,
+                f"trade #{tid}: no position; cancelled {len(open_orders)} stray order(s)",
+            )
+            logger.warning("live RECONCILED (cancelled stray orders) #%d", tid)
+        else:  # mark_reconciled — already flat
+            execute_query(
+                "UPDATE momentum_live_trades SET status='RECONCILED', "
+                "exit_at=UTC_TIMESTAMP() WHERE id=%s",
+                (tid,),
+            )
+            self._record_guardrail(
+                "reconciled_flat", ticker, side,
+                f"trade #{tid}: already flat at restart (no position, no open orders)",
+            )
+            logger.warning("live RECONCILED (already flat) #%d", tid)
+
+    def _rehydrate_flatten(self, r: dict, pos_qty: int, open_orders: list[dict]) -> None:
+        """
+        Rebuild a real open position into flatten-only management on restart,
+        preserving partial-exit history.
+
+        Safety-first sequencing (avoids oversell + preserves accounting):
+          1. Cancel ALL pre-crash open orders and CONFIRM them terminal.  If any
+             cannot be confirmed terminal, fail safe: latch flatten-only, record
+             a guardrail for manual review, and do NOT auto-manage this trade
+             (we will not auto-submit while a stale order might still fill).
+          2. Re-read the live position AFTER cancels — the authoritative remaining.
+          3. Reconstruct quantities with reconstruct_exit_state():
+                original_entry (never shrunk to remaining), exit_filled, remaining.
+          4. Seed the exit value/fees baseline from the persisted progress when it
+             matches the reconstructed exit count, else from the fills history;
+             flag a guardrail if neither agrees.
+          5. exit_order_ids stays empty (all prior orders cancelled), so the
+             baseline holds ALL prior exits and future flattening uses fresh
+             orders only — no double-counting, no oversell.
+        """
+        self._flatten_only = True
+        self._unresolved_recovery = True
+
+        tid = int(r["id"])
+        ticker = r["market_ticker"]
+        side = r["side"]
+
+        # 1. Cancel all pre-crash open orders and confirm terminal.
+        not_terminal = []
+        for o in open_orders:
+            oid = str(o.get("order_id") or o.get("id") or "")
+            if not oid:
+                continue
+            try:
+                self._client.cancel_order(oid)
+            except KalshiTradingError:
                 pass
+            if is_order_open(self._safe_get_order(oid)):
+                not_terminal.append(oid)
+        if not_terminal:
+            # Cannot guarantee no further fills — do NOT auto-manage; alert operator.
+            self._record_guardrail(
+                "orphan_cancel_unconfirmed", ticker, side,
+                f"trade #{tid}: {len(not_terminal)} order(s) not confirmed terminal "
+                f"after cancel; flatten-only latched, manual review required",
+            )
+            logger.error(
+                "live ORPHAN #%d — cancel not confirmed terminal; manual review", tid
+            )
+            return
+
+        # 2. Authoritative remaining AFTER cancels.
+        positions = self._client.get_positions(ticker=ticker)
+        remaining_pos = net_position_for_side(positions, ticker, side)
+
+        # 3. Quantity reconstruction (original entry preserved).
+        qty = reconstruct_exit_state(
+            db_entry_filled=int(r.get("filled_contracts") or 0),
+            db_exit_filled=int(r.get("exit_filled_contracts") or 0),
+            position_qty=remaining_pos,
+        )
+        original_entry = qty["original_entry"]
+        exit_filled = qty["exit_filled"]
+        remaining = qty["remaining"]
+
+        # 4. Exit value/fees baseline.
+        persisted_count = int(r.get("exit_filled_contracts") or 0)
+        rc, ravg, rfees = self._reconstruct_exit_from_fills(ticker, side)
+        baseline = resolve_recovery_baseline(
+            reconstructed_exit_count=exit_filled,
+            persisted_count=persisted_count,
+            persisted_value=(
+                float(r["exit_value_cents"]) if r.get("exit_value_cents") is not None else None
+            ),
+            persisted_fees=(
+                float(r["exit_fees_total"]) if r.get("exit_fees_total") is not None else None
+            ),
+            fills_count=rc,
+            fills_avg=ravg,
+            fills_fees=rfees,
+        )
+        base_value = baseline["value"]
+        base_fees = baseline["fees"]
+        accounting_verified = bool(baseline["verified"])
+        if not accounting_verified:
+            self._record_guardrail(
+                "exit_reconstruction_mismatch", ticker, side,
+                f"trade #{tid}: reconstructed exit count from position={exit_filled} "
+                f"did not match persisted ({persisted_count}) or fills ({rc}); "
+                f"flatten will continue but actual PnL/drift will stay unverified",
+            )
+
+        signal_at = r.get("signal_at") or datetime.now(timezone.utc)
+        signal_ts = signal_at.timestamp() if hasattr(signal_at, "timestamp") else 0.0
+        entry_ask = (
+            float(r["projected_entry_ask"])
+            if r.get("projected_entry_ask") is not None else 0.0
+        )
+        live = _ActiveLive(
+            live_trade_id=tid,
+            market_id=int(r["market_id"]),
+            contract_id=int(r["contract_id"]),
+            market_ticker=ticker,
+            side=side,
+            signal_at=signal_at,
+            signal_ts=signal_ts,
+            entry_ask=entry_ask,
+            horizon_ts=0.0,                          # already past — flatten now
+            requested_contracts=int(r.get("requested_contracts") or original_entry),
+            status="PENDING_EXIT",
+            filled_contracts=original_entry,         # ORIGINAL size preserved
+            actual_entry_price=(
+                float(r["actual_entry_price"])
+                if r.get("actual_entry_price") is not None else None
+            ),
+            actual_entry_fees=(
+                float(r["actual_entry_fees"])
+                if r.get("actual_entry_fees") is not None else None
+            ),
+            exit_filled_contracts=exit_filled,
+            exit_value=base_value,
+            exit_fees=base_fees,
+            exit_accounting_verified=accounting_verified,
+            exit_baseline_count=exit_filled,         # prior exits held as baseline
+            exit_baseline_value=base_value,
+            exit_baseline_fees=base_fees,
+            flattening=True,
+            exit_reason=EXIT_FIXED_TIME,
+            # Best-effort flatten price on restart (no live quote yet) — operator
+            # should verify; only seeds an initial limit when needed.
+            last_bid=entry_ask or None,
+        )
+
+        self._active[live.contract_id] = live
+        # 5. Persist reconstructed progress. NOTE: filled_contracts (original
+        # entry) is repaired upward only — never shrunk to the remaining size.
+        execute_query(
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
+            "filled_contracts=%s, exit_filled_contracts=%s, "
+            "exit_value_cents=%s, exit_fees_total=%s WHERE id=%s",
+            (
+                original_entry,
+                exit_filled,
+                round(base_value, 6) if accounting_verified else None,
+                base_fees if accounting_verified else None,
+                tid,
+            ),
+        )
+        self._record_guardrail(
+            "recovered_position", ticker, side,
+            f"trade #{tid}: rehydrated original_entry={original_entry} "
+            f"exit_filled={exit_filled} remaining={remaining} into flatten-only",
+        )
+        logger.warning(
+            "live RECOVERED position #%d | %s %s | original=%d sold=%d remaining=%d "
+            "-> flatten-only", tid, ticker, side, original_entry, exit_filled, remaining,
+        )
 
 
 # ── small format helpers ────────────────────────────────────────────────────
