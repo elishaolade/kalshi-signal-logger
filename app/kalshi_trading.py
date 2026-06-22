@@ -18,13 +18,18 @@ Design goals
 Price units
 -----------
 The rest of the system uses *dollar fractions* in [0.01, 0.99] (e.g. 0.42).
-Kalshi's order API expects *integer cents* in [1, 99] (e.g. 42).  Conversion
-happens at the boundary in ``place_order`` via ``dollars_to_cents``.
+Kalshi's V2 event-order API expects *fixed-point dollar strings* from the YES
+side of the book (e.g. "0.4200"). When our strategy wants to trade the NO leg,
+we translate it into the economically-equivalent YES-book order:
+
+    buy  YES @ p   -> side=bid, price=p
+    sell YES @ p   -> side=ask, price=p
+    buy  NO  @ p   -> side=ask, price=1-p
+    sell NO  @ p   -> side=bid, price=1-p
 """
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -48,10 +53,7 @@ _API_PATH_PREFIX = urlsplit(KALSHI_API_BASE).path.rstrip("/")
 
 
 def dollars_to_cents(price: float) -> int:
-    """Convert a dollar-fraction price (0.42) to Kalshi integer cents (42).
-
-    Clamped to the tradable [1, 99] range.  Rounds to the nearest cent.
-    """
+    """Compatibility helper: convert a dollar fraction to integer cents."""
     cents = int(round(price * 100))
     return max(1, min(99, cents))
 
@@ -136,7 +138,7 @@ class KalshiTradingClient:
         side: str,            # "YES" | "NO"  (our convention)
         action: str,          # "buy" | "sell"
         count: int,
-        limit_price: float,   # dollar fraction (0.42); converted to cents here
+        limit_price: float,   # dollar fraction from our YES/NO side view
         order_type: str = "limit",
         client_order_id: Optional[str] = None,
         time_in_force: Optional[str] = None,
@@ -150,6 +152,8 @@ class KalshiTradingClient:
         """
         if count < 1:
             raise KalshiTradingError(f"refusing to place order with count={count}")
+        if not client_order_id:
+            raise KalshiTradingError("client_order_id is required for V2 order placement")
         side_l = side.strip().lower()
         if side_l not in ("yes", "no"):
             raise KalshiTradingError(f"side must be YES or NO, got {side!r}")
@@ -157,34 +161,47 @@ class KalshiTradingClient:
         if action_l not in ("buy", "sell"):
             raise KalshiTradingError(f"action must be buy or sell, got {action!r}")
 
-        cents = dollars_to_cents(limit_price)
+        if order_type != "limit":
+            raise KalshiTradingError(f"only limit orders are supported, got {order_type!r}")
+
+        yes_side: str
+        yes_price = float(limit_price)
+        if side_l == "yes":
+            yes_side = "bid" if action_l == "buy" else "ask"
+        else:
+            yes_side = "ask" if action_l == "buy" else "bid"
+            yes_price = 1.0 - yes_price
+        yes_price = max(0.01, min(0.99, round(yes_price, 4)))
+
+        tif = (time_in_force or "good_till_canceled").strip().lower()
+        if tif not in ("good_till_canceled", "immediate_or_cancel", "fill_or_kill"):
+            raise KalshiTradingError(f"unsupported time_in_force {time_in_force!r}")
+
         body: dict[str, Any] = {
             "ticker": ticker,
-            "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": side_l,
-            "action": action_l,
-            "count": int(count),
-            "type": order_type,
+            "client_order_id": client_order_id,
+            "side": yes_side,
+            "count": f"{int(count):.2f}",
+            "price": f"{yes_price:.4f}",
+            "time_in_force": tif,
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": False,
+            "cancel_order_on_pause": False,
+            "reduce_only": False,
+            "subaccount": 0,
+            "exchange_index": 0,
         }
-        # Kalshi takes the limit price on the field matching the side.
-        if side_l == "yes":
-            body["yes_price"] = cents
-        else:
-            body["no_price"] = cents
-        if time_in_force:
-            body["time_in_force"] = time_in_force
 
         logger.info(
-            "kalshi place_order | %s %s %s x%d @ %dc (type=%s, coid=%s)",
-            ticker, action_l, side_l, count, cents, order_type, body["client_order_id"],
+            "kalshi place_order_v2 | %s %s %s -> %s x%d @ %.4f (tif=%s, coid=%s)",
+            ticker, action_l, side_l, yes_side, count, yes_price, tif, body["client_order_id"],
         )
-        payload = self._request("POST", "/portfolio/orders", body=body)
-        return payload.get("order", payload)
+        return self._request("POST", "/portfolio/events/orders", body=body)
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         """Cancel a resting order by Kalshi order id. Returns the response payload."""
         logger.info("kalshi cancel_order | %s", order_id)
-        return self._request("DELETE", f"/portfolio/orders/{order_id}")
+        return self._request("DELETE", f"/portfolio/events/orders/{order_id}")
 
     def get_order(self, order_id: str) -> dict[str, Any]:
         """Fetch a single order's current status. Returns the ``order`` payload."""

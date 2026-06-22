@@ -43,7 +43,7 @@ from app.momentum_live_trader import (
     partition_trade_orders,
     resolve_recovery_baseline,
 )
-from app.kalshi_trading import dollars_to_cents, cents_to_dollars
+from app.kalshi_trading import KalshiTradingClient, dollars_to_cents, cents_to_dollars
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,6 +325,71 @@ class TestPriceConversion:
     def test_cents_to_dollars(self):
         assert cents_to_dollars(42) == pytest.approx(0.42)
         assert cents_to_dollars(None) is None
+
+
+class TestKalshiOrderV2Mapping:
+    def test_place_yes_buy_maps_to_bid_at_same_price(self, monkeypatch):
+        seen = {}
+
+        def fake_request(self, method, path, *, body=None, params=None):
+            seen.update({"method": method, "path": path, "body": body, "params": params})
+            return {"order_id": "o1", "client_order_id": body["client_order_id"]}
+
+        monkeypatch.setattr(KalshiTradingClient, "_request", fake_request)
+
+        client = KalshiTradingClient(require_auth=False)
+        client.place_order(
+            ticker="KXBTC15M-TEST",
+            side="YES",
+            action="buy",
+            count=10,
+            limit_price=0.42,
+            client_order_id="coid-yes-buy",
+        )
+
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/portfolio/events/orders"
+        assert seen["body"]["side"] == "bid"
+        assert seen["body"]["price"] == "0.4200"
+        assert seen["body"]["count"] == "10.00"
+
+    def test_place_no_buy_maps_to_yes_ask_at_one_minus_price(self, monkeypatch):
+        seen = {}
+
+        def fake_request(self, method, path, *, body=None, params=None):
+            seen.update({"method": method, "path": path, "body": body, "params": params})
+            return {"order_id": "o2", "client_order_id": body["client_order_id"]}
+
+        monkeypatch.setattr(KalshiTradingClient, "_request", fake_request)
+
+        client = KalshiTradingClient(require_auth=False)
+        client.place_order(
+            ticker="KXBTC15M-TEST",
+            side="NO",
+            action="buy",
+            count=7,
+            limit_price=0.37,
+            client_order_id="coid-no-buy",
+        )
+
+        assert seen["path"] == "/portfolio/events/orders"
+        assert seen["body"]["side"] == "ask"
+        assert seen["body"]["price"] == "0.6300"
+        assert seen["body"]["count"] == "7.00"
+
+    def test_cancel_uses_v2_event_orders_path(self, monkeypatch):
+        seen = {}
+
+        def fake_request(self, method, path, *, body=None, params=None):
+            seen.update({"method": method, "path": path})
+            return {"order_id": "o3"}
+
+        monkeypatch.setattr(KalshiTradingClient, "_request", fake_request)
+
+        client = KalshiTradingClient(require_auth=False)
+        client.cancel_order("o3")
+
+        assert seen == {"method": "DELETE", "path": "/portfolio/events/orders/o3"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

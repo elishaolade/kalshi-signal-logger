@@ -464,9 +464,11 @@ def is_order_open(order: Optional[dict]) -> bool:
     rem = order.get("remaining_count")
     if rem is None:
         rem = order.get("remaining")
+    if rem is None:
+        rem = order.get("remaining_count_fp")
     if rem is not None:
         try:
-            return int(rem) > 0
+            return float(rem) > 0
         except (TypeError, ValueError):
             pass
     return True
