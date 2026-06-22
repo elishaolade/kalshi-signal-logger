@@ -22,6 +22,8 @@ from app.momentum_live_trader import (
     compute_full_kelly_fraction,
     compute_position_size,
     compute_drift_fields,
+    compute_actual_pnl,
+    build_pause_windows,
     summarize_pnls,
     evaluate_pause,
     kill_switch_engaged,
@@ -310,3 +312,130 @@ class TestPriceConversion:
     def test_cents_to_dollars(self):
         assert cents_to_dollars(42) == pytest.approx(0.42)
         assert cents_to_dollars(None) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Actual PnL — BOTH entry and exit fees must be charged (Issue 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestActualPnL:
+    def test_both_fees_charged_single_contract(self):
+        # entry 0.40, exit 0.46 -> gross +0.06; fees 0.01 (entry) + 0.01 (exit)
+        r = compute_actual_pnl(
+            actual_entry_price=0.40, actual_exit_price=0.46,
+            entry_fees_total=0.01, exit_fees_total=0.01, filled_contracts=1,
+        )
+        assert r["actual_profit_cents"] == pytest.approx(0.04)   # 0.06 - 0.02
+        assert r["fees_per_contract"] == pytest.approx(0.02)
+        assert r["actual_profit_dollars"] == pytest.approx(0.04)
+        assert r["actual_trade_won"] == 1
+
+    def test_entry_fee_not_ignored_vs_exit_only(self):
+        # Regression for the bug: ignoring entry fee overstates profit.
+        both = compute_actual_pnl(
+            actual_entry_price=0.40, actual_exit_price=0.46,
+            entry_fees_total=0.02, exit_fees_total=0.02, filled_contracts=1,
+        )
+        exit_only = compute_actual_pnl(
+            actual_entry_price=0.40, actual_exit_price=0.46,
+            entry_fees_total=None, exit_fees_total=0.02, filled_contracts=1,
+        )
+        assert both["actual_profit_cents"] < exit_only["actual_profit_cents"]
+        assert both["actual_profit_cents"] == pytest.approx(0.02)  # 0.06 - 0.04
+
+    def test_fees_normalized_per_contract(self):
+        # Totals from fills are across all contracts -> divide by count.
+        r = compute_actual_pnl(
+            actual_entry_price=0.40, actual_exit_price=0.50,
+            entry_fees_total=0.10, exit_fees_total=0.10, filled_contracts=10,
+        )
+        # per-contract fee = (0.10+0.10)/10 = 0.02 ; profit = 0.10 - 0.02 = 0.08
+        assert r["fees_per_contract"] == pytest.approx(0.02)
+        assert r["actual_profit_cents"] == pytest.approx(0.08)
+        assert r["actual_profit_dollars"] == pytest.approx(0.80)
+
+    def test_unknown_fees_treated_as_zero_but_reported_none(self):
+        r = compute_actual_pnl(
+            actual_entry_price=0.40, actual_exit_price=0.46,
+            entry_fees_total=None, exit_fees_total=None, filled_contracts=1,
+        )
+        assert r["fees_per_contract"] is None
+        assert r["actual_profit_cents"] == pytest.approx(0.06)
+
+    def test_unfilled_leg_is_none(self):
+        r = compute_actual_pnl(
+            actual_entry_price=None, actual_exit_price=0.46,
+            entry_fees_total=0.01, exit_fees_total=0.01, filled_contracts=1,
+        )
+        assert r["actual_profit_cents"] is None
+        assert r["actual_trade_won"] is None
+
+    def test_drift_reflects_corrected_actual_profit(self):
+        # Projected (shadow) profit 0.05; actual with both fees should yield a
+        # smaller actual profit, so capture < 1 and total_execution_drift > 0.
+        actual = compute_actual_pnl(
+            actual_entry_price=0.41, actual_exit_price=0.45,
+            entry_fees_total=0.01, exit_fees_total=0.01, filled_contracts=1,
+        )
+        # actual: 0.04 gross - 0.02 fees = 0.02
+        assert actual["actual_profit_cents"] == pytest.approx(0.02)
+        d = compute_drift_fields(
+            projected_entry_ask=0.40, projected_exit_bid=0.46,
+            projected_profit=0.05, projected_expectancy=0.03,
+            actual_entry_price=0.41, actual_exit_price=0.45,
+            actual_profit=actual["actual_profit_cents"],
+        )
+        assert d["profit_delta_cents"] == pytest.approx(-0.03)        # 0.02 - 0.05
+        assert d["total_execution_drift_cents"] == pytest.approx(0.03)
+        assert d["profit_capture_ratio"] == pytest.approx(0.02 / 0.05)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Paired rolling windows for pause (Issue 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPairedPauseWindows:
+    def test_unpaired_rows_excluded(self):
+        # 3 fully-paired + 2 with a NULL leg must not unbalance the samples.
+        rows = [
+            (0.05, 0.04),
+            (0.03, None),     # live unexecutable -> excluded
+            (None, 0.02),     # shadow-only       -> excluded
+            (0.06, 0.05),
+            (-0.02, -0.03),
+        ]
+        windows = build_pause_windows(rows, (25, 50, 100))
+        w = windows[25]
+        assert w["n"] == 3                      # only the 3 paired rows
+        assert w["projected"]["n"] == 3
+        assert w["actual"]["n"] == 3            # equal length == apples-to-apples
+
+    def test_window_slices_most_recent(self):
+        rows = [(0.01 * i, 0.01 * i) for i in range(1, 11)]   # 10 paired, newest first
+        windows = build_pause_windows(rows, (3, 5, 100))
+        assert windows[3]["n"] == 3
+        assert windows[5]["n"] == 5
+        assert windows[100]["n"] == 10
+
+    def test_paired_then_pause_decision(self):
+        # Build paired windows where actual badly trails projected -> pause.
+        rows = [(0.05, -0.05) for _ in range(30)]   # 30 paired, big gap
+        windows = build_pause_windows(rows, (25, 50, 100))
+        res = evaluate_pause(
+            windows, min_trades=25, win_rate_gap_pct=15,
+            expectancy_gap=0.02, profit_factor_gap=0.5,
+        )
+        assert res is not None
+        assert res["window"] == 25
+        assert res["n"] == 25
+
+    def test_small_paired_sample_does_not_pause(self):
+        # Only 10 paired rows (rest unpaired) -> below min_trades -> no pause.
+        rows = [(0.05, -0.05) for _ in range(10)] + [(0.05, None) for _ in range(40)]
+        windows = build_pause_windows(rows, (25, 50, 100))
+        assert windows[25]["n"] == 10
+        res = evaluate_pause(
+            windows, min_trades=25, win_rate_gap_pct=15,
+            expectancy_gap=0.02, profit_factor_gap=0.5,
+        )
+        assert res is None

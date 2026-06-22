@@ -172,6 +172,79 @@ def summarize_pnls(pnls: list[float]) -> dict[str, Optional[float]]:
     }
 
 
+def compute_actual_pnl(
+    *,
+    actual_entry_price: Optional[float],
+    actual_exit_price: Optional[float],
+    entry_fees_total: Optional[float],
+    exit_fees_total: Optional[float],
+    filled_contracts: int,
+) -> dict[str, Optional[float]]:
+    """
+    Per-contract realized live pnl, charging BOTH entry and exit fees.
+
+    Kalshi fill fees from ``_summarize_fills`` are TOTALS across all contracts in
+    that order, so they are normalized to per-contract here to stay comparable
+    with the per-contract projected pnl.  Unknown fees (None) are treated as 0
+    for the pnl but reported as None in ``fees_per_contract`` (never fabricated;
+    if EITHER leg reports a fee, the known total is used).
+
+    Returns a dict: fees_per_contract, actual_profit_cents,
+    actual_profit_dollars, actual_trade_won.  All None when the trade did not
+    fill on both legs.
+    """
+    if (
+        actual_entry_price is None
+        or actual_exit_price is None
+        or filled_contracts < 1
+    ):
+        return {
+            "fees_per_contract": None,
+            "actual_profit_cents": None,
+            "actual_profit_dollars": None,
+            "actual_trade_won": None,
+        }
+    known = [f for f in (entry_fees_total, exit_fees_total) if f is not None]
+    total_fees = sum(known) if known else None
+    fee_for_pnl = (total_fees or 0.0) / filled_contracts
+    fees_per_contract = (
+        round(total_fees / filled_contracts, 6) if total_fees is not None else None
+    )
+    profit = round(actual_exit_price - actual_entry_price - fee_for_pnl, 6)
+    return {
+        "fees_per_contract": fees_per_contract,
+        "actual_profit_cents": profit,
+        "actual_profit_dollars": round(profit * filled_contracts, 6),
+        "actual_trade_won": 1 if profit > 1e-9 else 0,
+    }
+
+
+def build_pause_windows(
+    rows: list[tuple[Optional[float], Optional[float]]],
+    window_sizes,
+) -> dict[int, dict]:
+    """
+    Build rolling projected-vs-actual windows from PAIRED completed trades.
+
+    ``rows`` is (projected_profit, actual_profit) ordered most-recent-first.
+    Only rows where BOTH values are present are kept, so projected and actual
+    samples in every window are strictly paired — same trades, equal length —
+    which makes the pause comparison apples-to-apples.
+    """
+    paired = [(p, a) for (p, a) in rows if p is not None and a is not None]
+    out: dict[int, dict] = {}
+    for w in window_sizes:
+        chunk = paired[:w]
+        proj = [p for p, _ in chunk]
+        act = [a for _, a in chunk]
+        out[w] = {
+            "n": len(chunk),
+            "projected": summarize_pnls(proj),
+            "actual": summarize_pnls(act),
+        }
+    return out
+
+
 def compute_drift_fields(
     *,
     projected_entry_ask: Optional[float],
@@ -376,6 +449,7 @@ class _ActiveLive:
     # Fills
     filled_contracts:   int = 0
     actual_entry_price: Optional[float] = None
+    actual_entry_fees:  Optional[float] = None   # total entry-side fees from fills
 
     # Projected exit tracking (identical to shadow _advance_active)
     peak_bid:    float = float("-inf")
@@ -784,7 +858,7 @@ class MomentumLiveTrader:
         if not live.entry_order_id:
             return
         fills = self._client.get_fills(order_id=live.entry_order_id)
-        count, avg_price, _fees = _summarize_fills(fills, live.side)
+        count, avg_price, entry_fees = _summarize_fills(fills, live.side)
 
         elapsed = datetime.now(timezone.utc).timestamp() - (live.entry_submit_ts or 0)
         timed_out = elapsed > config.MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS
@@ -794,6 +868,7 @@ class MomentumLiveTrader:
             # (Partial or full) entry achieved.
             live.filled_contracts = count
             live.actual_entry_price = avg_price
+            live.actual_entry_fees = entry_fees   # preserved for round-trip pnl
             live.status = "ACTIVE"
             execute_query(
                 "UPDATE momentum_live_trades SET status='ACTIVE', "
@@ -872,9 +947,9 @@ class MomentumLiveTrader:
             return
 
         fills = self._client.get_fills(order_id=live.exit_order_id)
-        count, avg_price, fees = _summarize_fills(fills, live.side)
+        count, avg_price, exit_fees = _summarize_fills(fills, live.side)
         if count >= live.filled_contracts and count >= 1:
-            self._finalize_complete(live, avg_price, fees, captured_at)
+            self._finalize_complete(live, avg_price, exit_fees, captured_at)
             return
 
         # Not (fully) filled — chase the bid to get flat: cancel + re-submit.
@@ -946,7 +1021,7 @@ class MomentumLiveTrader:
 
     def _finalize_complete(
         self, live: _ActiveLive, actual_exit_price: Optional[float],
-        actual_fees: Optional[float], captured_at: datetime,
+        exit_fees_total: Optional[float], captured_at: datetime,
     ) -> None:
         """Compute projected/actual/drift, persist COMPLETE, evaluate pause."""
         # Projected (shadow-of-this-trade) pnl on observed quotes.
@@ -956,17 +1031,19 @@ class MomentumLiveTrader:
                 live.projected_exit_bid - live.entry_ask - _PROJ_FEE - _PROJ_SLIPPAGE, 6
             )
 
-        # Actual pnl from real fills.
-        actual_profit = None
-        actual_profit_dollars = None
-        actual_won = None
-        if actual_exit_price is not None and live.actual_entry_price is not None:
-            fee = actual_fees or 0.0
-            actual_profit = round(
-                actual_exit_price - live.actual_entry_price - fee, 6
-            )
-            actual_profit_dollars = round(actual_profit * live.filled_contracts, 6)
-            actual_won = 1 if actual_profit > 1e-9 else 0
+        # Actual pnl from real fills — charges BOTH entry and exit fees,
+        # normalized to per-contract (see compute_actual_pnl).
+        actual = compute_actual_pnl(
+            actual_entry_price=live.actual_entry_price,
+            actual_exit_price=actual_exit_price,
+            entry_fees_total=live.actual_entry_fees,
+            exit_fees_total=exit_fees_total,
+            filled_contracts=live.filled_contracts,
+        )
+        actual_profit           = actual["actual_profit_cents"]
+        actual_profit_dollars   = actual["actual_profit_dollars"]
+        actual_won              = actual["actual_trade_won"]
+        actual_fees_per_contract = actual["fees_per_contract"]
 
         # Projected strategy expectancy stored at entry (re-read for drift).
         row = fetch_one(
@@ -1005,7 +1082,7 @@ class MomentumLiveTrader:
             """,
             (
                 captured_at, live.exit_reason, holding_s,
-                actual_exit_price, actual_fees,
+                actual_exit_price, actual_fees_per_contract,
                 actual_profit, actual_profit_dollars, actual_won,
                 live.projected_exit_bid, projected_profit,
                 drift["profit_delta_cents"], drift["expectancy_delta_cents"],
@@ -1081,32 +1158,30 @@ class MomentumLiveTrader:
         return summarize_pnls(pnls)
 
     def _load_pause_windows(self) -> dict[int, dict]:
-        """Projected vs actual stats over rolling windows of completed live trades."""
-        out: dict[int, dict] = {}
+        """
+        Paired projected-vs-actual stats over rolling windows of completed live
+        trades.  Only rows with BOTH projected and actual profit are considered,
+        so each window compares the same trades (e.g. shadow-unexecutable or
+        live-flattened rows with a NULL leg are excluded).
+        """
         max_w = max(config.LIVE_PAUSE_WINDOWS)
         rows = fetch_all(
             """
             SELECT projected_profit_cents, actual_profit_cents
             FROM momentum_live_trades
             WHERE status='COMPLETE'
+              AND projected_profit_cents IS NOT NULL
+              AND actual_profit_cents IS NOT NULL
             ORDER BY signal_at DESC
             LIMIT %s
             """,
             (max_w,),
         )
-        for w in config.LIVE_PAUSE_WINDOWS:
-            chunk = rows[:w]
-            proj = [float(r["projected_profit_cents"]) for r in chunk
-                    if r["projected_profit_cents"] is not None]
-            act = [float(r["actual_profit_cents"]) for r in chunk
-                   if r["actual_profit_cents"] is not None]
-            # Use the count of paired actual trades as the window n.
-            out[w] = {
-                "n": len(act),
-                "projected": summarize_pnls(proj),
-                "actual": summarize_pnls(act),
-            }
-        return out
+        pairs = [
+            (float(r["projected_profit_cents"]), float(r["actual_profit_cents"]))
+            for r in rows
+        ]
+        return build_pause_windows(pairs, config.LIVE_PAUSE_WINDOWS)
 
     def _evaluate_and_maybe_pause(self) -> None:
         if self._is_paused():

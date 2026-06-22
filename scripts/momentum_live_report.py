@@ -133,20 +133,22 @@ def _pause_state() -> None:
 
 
 def _projected_vs_actual_overall() -> None:
+    # Paired only: both projected and actual present, so the comparison covers
+    # the same trades (matches the pause logic).
     rows = fetch_all(
         """
         SELECT projected_profit_cents, actual_profit_cents
         FROM momentum_live_trades
         WHERE status='COMPLETE'
+          AND projected_profit_cents IS NOT NULL
+          AND actual_profit_cents IS NOT NULL
         """
     )
-    proj = [float(r["projected_profit_cents"]) for r in rows
-            if r["projected_profit_cents"] is not None]
-    act = [float(r["actual_profit_cents"]) for r in rows
-           if r["actual_profit_cents"] is not None]
+    proj = [float(r["projected_profit_cents"]) for r in rows]
+    act = [float(r["actual_profit_cents"]) for r in rows]
     ps, as_ = _summarize(proj), _summarize(act)
 
-    _h2("Projected vs Actual — All Completed Live Trades")
+    _h2("Projected vs Actual — All Completed Live Trades (paired)")
     _row("Paired completed trades:", str(as_["n"]))
     _pair_line("Win rate", ps["win_rate"], as_["win_rate"], _pct)
     _pair_line("Expectancy / contract", ps["expectancy"], as_["expectancy"], _money)
@@ -157,26 +159,27 @@ def _projected_vs_actual_overall() -> None:
 
 def _projected_vs_actual_windows() -> None:
     max_w = max(_WINDOWS)
+    # Paired only, newest first — windows compare the same trades.
     rows = fetch_all(
         """
         SELECT projected_profit_cents, actual_profit_cents
         FROM momentum_live_trades
         WHERE status='COMPLETE'
+          AND projected_profit_cents IS NOT NULL
+          AND actual_profit_cents IS NOT NULL
         ORDER BY signal_at DESC
         LIMIT %s
         """,
         (max_w,),
     )
-    _h2("Projected vs Actual — Rolling Windows (most recent N)")
+    _h2("Projected vs Actual — Rolling Windows (most recent N paired)")
     print(f"  {'window':>7}  {'n':>4}  {'win proj/act':>18}  "
           f"{'exp proj/act':>20}  {'pf proj/act':>18}")
     print("  " + "-" * 74)
     for w in _WINDOWS:
         chunk = rows[:w]
-        proj = [float(r["projected_profit_cents"]) for r in chunk
-                if r["projected_profit_cents"] is not None]
-        act = [float(r["actual_profit_cents"]) for r in chunk
-               if r["actual_profit_cents"] is not None]
+        proj = [float(r["projected_profit_cents"]) for r in chunk]
+        act = [float(r["actual_profit_cents"]) for r in chunk]
         ps, as_ = _summarize(proj), _summarize(act)
         win = f"{_pct(ps['win_rate'])}/{_pct(as_['win_rate'])}"
         exp = f"{_money(ps['expectancy'])}/{_money(as_['expectancy'])}"
