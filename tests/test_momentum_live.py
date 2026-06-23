@@ -328,6 +328,32 @@ class TestFills:
         _, _, fees = _summarize_fills(fills, "YES")
         assert fees == pytest.approx(0.01)
 
+    def test_v2_dollar_fields_are_parsed(self):
+        fills = [
+            {"count_fp": "20.00", "yes_price_dollars": "0.2900", "fee_cost": "0.288300"},
+        ]
+        count, avg, fees = _summarize_fills(fills, "YES")
+        assert count == 20
+        assert avg == pytest.approx(0.29)
+        assert fees == pytest.approx(0.2883)
+
+    def test_v2_fixed_point_counts_sum_and_round(self):
+        fills = [
+            {"count_fp": "9.49", "yes_price_dollars": "0.3000", "fee_cost": "0.139600"},
+            {"count_fp": "10.51", "yes_price_dollars": "0.3000", "fee_cost": "0.154500"},
+        ]
+        count, avg, fees = _summarize_fills(fills, "YES")
+        assert count == 20
+        assert avg == pytest.approx(0.30)
+        assert fees == pytest.approx(0.2941)
+
+    def test_v2_no_side_dollar_fields_are_parsed(self):
+        fills = [{"count_fp": "10.00", "no_price_dollars": "0.7600", "fee_cost": "0.127700"}]
+        count, avg, fees = _summarize_fills(fills, "NO")
+        assert count == 10
+        assert avg == pytest.approx(0.76)
+        assert fees == pytest.approx(0.1277)
+
 
 class TestPriceConversion:
     def test_dollars_to_cents(self):

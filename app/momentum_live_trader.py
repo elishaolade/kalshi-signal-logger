@@ -407,34 +407,54 @@ def _summarize_fills(fills: list[dict], side: str) -> tuple[int, Optional[float]
     """
     Aggregate Kalshi fills into (total_count, avg_price_dollars, total_fees_dollars).
 
-    Reads the price field matching ``side`` (yes_price / no_price, integer cents)
-    and an optional fee field if present.  Never fabricates — returns (0, None,
-    None) when there are no fills.
+    Supports both older integer-cent payloads (``count``, ``yes_price``,
+    ``no_price``, ``fee``/``fee_dollars``) and the current V2 fixed-point
+    payloads (``count_fp``, ``yes_price_dollars``, ``no_price_dollars``,
+    ``fee_cost``). Never fabricates — returns (0, None, None) when there are
+    no fills.
     """
     price_key = "yes_price" if side == "YES" else "no_price"
-    total = 0
+    price_dollars_key = f"{price_key}_dollars"
+    total_fp = 0.0
     weighted = 0.0
     fees = 0.0
     saw_fee = False
     for f in fills:
-        cnt = int(f.get("count") or 0)
+        cnt_raw = f.get("count_fp")
+        if cnt_raw is None:
+            cnt_raw = f.get("count")
+        try:
+            cnt = float(cnt_raw or 0.0)
+        except (TypeError, ValueError):
+            continue
         if cnt <= 0:
             continue
-        px = cents_to_dollars(f.get(price_key))
+
+        px_raw = f.get(price_dollars_key)
+        if px_raw is not None:
+            try:
+                px = round(float(px_raw), 4)
+            except (TypeError, ValueError):
+                px = None
+        else:
+            px = cents_to_dollars(f.get(price_key))
         if px is None:
             continue
-        total += cnt
+        total_fp += cnt
         weighted += px * cnt
-        fee = f.get("fee") or f.get("fee_dollars")
+        fee = f.get("fee_cost")
+        if fee is None:
+            fee = f.get("fee") or f.get("fee_dollars")
         if fee is not None:
             try:
                 fees += float(fee)
                 saw_fee = True
             except (TypeError, ValueError):
                 pass
-    if total == 0:
+    if total_fp <= 0:
         return 0, None, None
-    avg = round(weighted / total, 4)
+    avg = round(weighted / total_fp, 4)
+    total = int(round(total_fp))
     return total, avg, (round(fees, 4) if saw_fee else None)
 
 
