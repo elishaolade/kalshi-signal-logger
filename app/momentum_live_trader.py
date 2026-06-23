@@ -146,6 +146,22 @@ def compute_position_size(
     return contracts, dollars_budgeted
 
 
+def compute_live_entry_limit_price(
+    projected_entry_ask: float,
+    price_offset_cents: float,
+) -> float:
+    """
+    Live entry limit derived from the shadow entry ask plus a small configurable
+    nudge toward marketability.
+
+    ``price_offset_cents`` uses the repo's dollar-fraction convention
+    (0.01 = 1 cent). The projected shadow entry is left unchanged; this helper
+    only controls the actual live order price.
+    """
+    adjusted = round(projected_entry_ask + (price_offset_cents or 0.0), 4)
+    return max(0.01, min(0.99, adjusted))
+
+
 def summarize_pnls(pnls: list[float]) -> dict[str, Optional[float]]:
     """
     Win-rate / expectancy / profit-factor / profit-loss-ratio for a list of
@@ -906,12 +922,7 @@ class MomentumLiveTrader:
                 continue
 
             # Frozen signal fired — attempt a live entry behind the risk gates.
-            opened = self._try_open_live(sig, market_ticker, captured_at)
-            if opened:
-                # Match shadow cooldown semantics regardless of fill outcome.
-                self._cooldown_until[contract_id] = (
-                    row.ts + _SHADOW_CONFIG.cooldown_seconds
-                )
+            self._try_open_live(sig, market_ticker, captured_at)
 
     # ── Risk gates ────────────────────────────────────────────────────────────
 
@@ -969,14 +980,15 @@ class MomentumLiveTrader:
     def _try_open_live(self, sig, market_ticker: str, captured_at: datetime) -> bool:
         """
         Evaluate gates + sizing and, if all pass, place a real entry order and
-        persist a momentum_live_trades row.  Returns True if a signal was acted
-        on (whether or not an order was placed) so cooldown applies.
+        persist a momentum_live_trades row. Returns True only when a real entry
+        order was submitted/adopted; cooldown now starts on ACTUAL fill, not on
+        blocked or canceled attempts.
         """
         ok, event_type, reason = self._check_risk_gates(sig, captured_at)
         if not ok:
             self._record_guardrail(event_type, market_ticker, sig.side, reason)
             logger.warning("live BLOCKED | %s %s | %s", market_ticker, sig.side, reason)
-            return True   # signal handled (blocked) — apply cooldown
+            return False
 
         # Projected strategy stats (rolling shadow window) → Kelly inputs.
         proj = self._load_projected_stats()
@@ -987,7 +999,12 @@ class MomentumLiveTrader:
                 f"(have {None if proj is None else proj['n']}, "
                 f"need {config.MOMENTUM_LIVE_MIN_SHADOW_TRADES})",
             )
-            return True
+            return False
+
+        entry_limit_price = compute_live_entry_limit_price(
+            sig.entry_ask,
+            config.MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS,
+        )
 
         full_kelly = compute_full_kelly_fraction(
             proj["win_rate"], proj["profit_loss_ratio"]
@@ -998,16 +1015,16 @@ class MomentumLiveTrader:
             full_kelly_fraction=full_kelly,
             max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
             max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
-            price_per_contract=sig.entry_ask,
+            price_per_contract=entry_limit_price,
         )
         if contracts < 1:
             self._record_guardrail(
                 "blocked_sizing", market_ticker, sig.side,
                 f"sizing rounded down to 0 contracts "
                 f"(full_kelly={full_kelly:.3f}, budget=${dollars_budgeted:.2f}, "
-                f"price={sig.entry_ask:.3f})",
+                f"price={entry_limit_price:.3f})",
             )
-            return True
+            return False
 
         target_ask = round(sig.entry_ask + _TP, 4)
         now = datetime.now(timezone.utc)
@@ -1072,7 +1089,7 @@ class MomentumLiveTrader:
         try:
             order = self._client.place_order(
                 ticker=market_ticker, side=sig.side, action="buy",
-                count=contracts, limit_price=sig.entry_ask, order_type="limit",
+                count=contracts, limit_price=entry_limit_price, order_type="limit",
                 client_order_id=coid,
             )
         except KalshiTradingError as exc:
@@ -1086,11 +1103,11 @@ class MomentumLiveTrader:
                 )
                 self._record_order_event(
                     live, "entry_rejected", action="buy",
-                    requested_count=contracts, limit_price=sig.entry_ask,
+                    requested_count=contracts, limit_price=entry_limit_price,
                     client_order_id=coid, detail=str(exc)[:480],
                 )
                 logger.error("live ENTRY REJECTED #%d | %s", live_trade_id, exc)
-                return True
+                return False
             logger.warning(
                 "live ENTRY adopted after ambiguous submission #%d (coid=%s)",
                 live_trade_id, coid,
@@ -1103,14 +1120,14 @@ class MomentumLiveTrader:
         )
         self._record_order_event(
             live, "entry_submitted", action="buy",
-            requested_count=contracts, limit_price=sig.entry_ask,
+            requested_count=contracts, limit_price=entry_limit_price,
             order_id=live.entry_order_id, client_order_id=coid, raw=order,
         )
         self._active[sig.contract_id] = live
         logger.warning(
-            "live ENTRY SUBMITTED #%d | %s %s | x%d @ %.3f (order=%s)",
+            "live ENTRY SUBMITTED #%d | %s %s | x%d @ %.3f (shadow %.3f, order=%s)",
             live_trade_id, market_ticker, sig.side, contracts,
-            sig.entry_ask, live.entry_order_id,
+            entry_limit_price, sig.entry_ask, live.entry_order_id,
         )
         return True
 
@@ -1221,6 +1238,10 @@ class MomentumLiveTrader:
         """Lock in the final entry fill and move to ACTIVE (no residual qty)."""
         count = live.filled_contracts
         live.status = "ACTIVE"
+        self._cooldown_until[live.contract_id] = max(
+            self._cooldown_until.get(live.contract_id, float("-inf")),
+            live.signal_ts + _SHADOW_CONFIG.cooldown_seconds,
+        )
         execute_query(
             "UPDATE momentum_live_trades SET status='ACTIVE', "
             "filled_contracts=%s, actual_entry_price=%s, actual_entry_fees=%s, "

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import sys
 import os
+from collections import deque
 from datetime import datetime, timezone
+from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
@@ -24,6 +26,7 @@ from app.momentum_live_trader import (
     _ActiveLive,
     compute_full_kelly_fraction,
     compute_position_size,
+    compute_live_entry_limit_price,
     compute_drift_fields,
     compute_actual_pnl,
     build_pause_windows,
@@ -44,6 +47,7 @@ from app.momentum_live_trader import (
     resolve_recovery_baseline,
 )
 from app.kalshi_trading import KalshiTradingClient, dollars_to_cents, cents_to_dollars
+from backtest.loader import MarketRow
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,6 +132,15 @@ class TestPositionSize:
             bankroll_dollars=1000, kelly_fraction=0, full_kelly_fraction=0.2,
             max_dollars_per_trade=50, max_contracts_per_trade=0,
             price_per_contract=0.42)[0] == 0
+
+
+class TestEntryLimitPrice:
+    def test_adds_small_aggressive_offset(self):
+        assert compute_live_entry_limit_price(0.40, 0.01) == pytest.approx(0.41)
+
+    def test_clamps_to_valid_contract_range(self):
+        assert compute_live_entry_limit_price(0.995, 0.01) == pytest.approx(0.99)
+        assert compute_live_entry_limit_price(0.01, -0.02) == pytest.approx(0.01)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,6 +746,129 @@ class TestExitSubmitSequencing:
         assert live.exit_order_id == "exit-1"
         assert any(c[0] == "event" and c[1] == "exit_submit_intent" for c in calls)
         assert any(c[0] == "event" and c[1] == "exit_submitted" for c in calls)
+
+
+class TestEntryCooldownBehavior:
+    def test_detect_does_not_start_cooldown_on_attempt(self, monkeypatch):
+        trader = object.__new__(MomentumLiveTrader)
+        trader._window = deque()
+        trader._cooldown_until = {}
+        trader._active = {}
+
+        from app.momentum_live_trader import _SHADOW_CONFIG
+        lookback = _SHADOW_CONFIG.lookback_seconds
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        trader._window.extend(
+            [
+                MarketRow(1, 1, start, 0.0, 100_000.0, 600, 0.49, 0.50, 0.01, 0.50, 0.51, 0.01, None, None, None, None, None, None, None, None),
+                MarketRow(2, 2, start, lookback * 0.1, 100_000.0, 590, 0.49, 0.50, 0.01, 0.50, 0.51, 0.01, None, None, None, None, None, None, None, None),
+                MarketRow(3, 3, start, lookback, 100_000.0, 580, 0.49, 0.50, 0.01, 0.50, 0.51, 0.01, None, None, None, None, None, None, None, None),
+            ]
+        )
+
+        row = trader._window[-1]
+        monkeypatch.setattr(
+            "app.momentum_live_trader.detect_signal",
+            lambda **kwargs: SimpleNamespace(contract_id=1, side="YES"),
+        )
+        monkeypatch.setattr(
+            MomentumLiveTrader,
+            "_try_open_live",
+            lambda self, sig, market_ticker, captured_at: True,
+        )
+
+        trader._detect(
+            market_db_id=1,
+            market_id="m1",
+            market_ticker="KXBTC15M-TEST",
+            contract_ids={"YES": 1},
+            target_price=100_000.0,
+            row=row,
+            captured_at=start,
+        )
+
+        assert trader._cooldown_until == {}
+
+    def test_promote_entry_starts_shadow_style_cooldown(self, monkeypatch):
+        trader = object.__new__(MomentumLiveTrader)
+        trader._cooldown_until = {}
+        trader._record_order_event = lambda *args, **kwargs: None
+
+        monkeypatch.setattr("app.momentum_live_trader.execute_query", lambda *args, **kwargs: None)
+
+        live = _ActiveLive(
+            live_trade_id=11,
+            market_id=1,
+            contract_id=7,
+            market_ticker="KXBTC15M-TEST",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.40,
+            horizon_ts=220.0,
+            requested_contracts=5,
+            status="PENDING_ENTRY",
+            filled_contracts=5,
+            actual_entry_price=0.41,
+        )
+
+        from app.momentum_live_trader import _SHADOW_CONFIG
+
+        trader._promote_entry_to_active(live, datetime.now(timezone.utc))
+
+        assert trader._cooldown_until[7] == pytest.approx(
+            100.0 + _SHADOW_CONFIG.cooldown_seconds
+        )
+
+
+class TestAggressiveEntrySubmission:
+    def test_try_open_live_uses_adjusted_entry_price(self, monkeypatch):
+        seen = {}
+
+        class FakeClient:
+            def place_order(self, **kwargs):
+                seen.update(kwargs)
+                return {"order_id": "entry-1", "client_order_id": kwargs["client_order_id"]}
+
+        trader = object.__new__(MomentumLiveTrader)
+        trader._client = FakeClient()
+        trader._active = {}
+        trader._cooldown_until = {}
+        trader._record_guardrail = lambda *args, **kwargs: None
+        trader._record_order_event = lambda *args, **kwargs: None
+        trader._reconcile_ambiguous_order = lambda *args, **kwargs: None
+        trader._check_risk_gates = lambda sig, captured_at: (True, "", "")
+        trader._load_projected_stats = lambda: {
+            "n": 100,
+            "win_rate": 0.60,
+            "profit_loss_ratio": 1.0,
+            "expectancy": 0.03,
+            "profit_factor": 1.5,
+        }
+
+        monkeypatch.setattr("app.momentum_live_trader.insert_and_get_id", lambda *args, **kwargs: 99)
+        monkeypatch.setattr("app.momentum_live_trader.execute_query", lambda *args, **kwargs: None)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS", 0.01)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_BANKROLL_DOLLARS", 100.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_KELLY_FRACTION", 0.10)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE", 10.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE", 20)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MIN_SHADOW_TRADES", 50)
+
+        sig = SimpleNamespace(
+            market_id=1,
+            contract_id=2,
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.40,
+        )
+
+        opened = trader._try_open_live(sig, "KXBTC15M-TEST", datetime.now(timezone.utc))
+
+        assert opened is True
+        assert seen["limit_price"] == pytest.approx(0.41)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

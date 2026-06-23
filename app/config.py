@@ -132,6 +132,12 @@ MOMENTUM_LIVE_MIN_SHADOW_TRADES      = int(os.getenv("MOMENTUM_LIVE_MIN_SHADOW_T
 # Rolling window (most-recent COMPLETE shadow trades) used to derive projected
 # win-rate / expectancy / profit-factor for Kelly sizing.
 MOMENTUM_LIVE_PROJECTED_WINDOW       = int(os.getenv("MOMENTUM_LIVE_PROJECTED_WINDOW", "100"))
+# Small positive offset (dollar fraction) added to the shadow entry ask when
+# placing a LIVE entry order. 0.01 = pay up 1 cent to improve fill odds while
+# keeping the projected shadow entry unchanged for comparison.
+MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS", "0.01")
+)
 # How long (seconds) a resting entry order may sit unfilled before it is
 # cancelled (do not chase; do not fabricate fills).
 MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS = float(
