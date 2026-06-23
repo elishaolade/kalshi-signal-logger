@@ -138,6 +138,12 @@ MOMENTUM_LIVE_PROJECTED_WINDOW       = int(os.getenv("MOMENTUM_LIVE_PROJECTED_WI
 MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS = float(
     os.getenv("MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS", "0.01")
 )
+# After a REJECTED or unfilled CANCELED entry, wait this many seconds before
+# retrying the same contract/side. This is intentionally much shorter than the
+# full trade cooldown used after an actual fill.
+MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS", "20")
+)
 # How long (seconds) a resting entry order may sit unfilled before it is
 # cancelled (do not chase; do not fabricate fills).
 MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS = float(

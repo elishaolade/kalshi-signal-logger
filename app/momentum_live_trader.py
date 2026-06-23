@@ -1106,6 +1106,11 @@ class MomentumLiveTrader:
                     requested_count=contracts, limit_price=entry_limit_price,
                     client_order_id=coid, detail=str(exc)[:480],
                 )
+                self._start_retry_cooldown(
+                    sig.contract_id,
+                    max(sig.signal_ts, captured_at.timestamp()),
+                    "entry rejected",
+                )
                 logger.error("live ENTRY REJECTED #%d | %s", live_trade_id, exc)
                 return False
             logger.warning(
@@ -1223,7 +1228,7 @@ class MomentumLiveTrader:
         if count >= 1:
             self._promote_entry_to_active(live, captured_at)
         else:
-            self._abandon_entry(live, "unfilled (order terminal)")
+            self._abandon_entry(live, "unfilled (order terminal)", retry_from_ts=row.ts)
 
     def _cancel_entry_remainder(self, live: _ActiveLive, reason: str) -> None:
         """Cancel the resting entry order; promotion/abandon resolves next tick."""
@@ -1262,7 +1267,22 @@ class MomentumLiveTrader:
             count, live.requested_contracts, live.actual_entry_price or 0.0,
         )
 
-    def _abandon_entry(self, live: _ActiveLive, reason: str) -> None:
+    def _start_retry_cooldown(self, contract_id: int, retry_from_ts: float, reason: str) -> None:
+        """Short retry throttle after an unfilled/rejected entry attempt."""
+        delay = config.MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS
+        if delay <= 0:
+            return
+        until = retry_from_ts + delay
+        self._cooldown_until[contract_id] = max(
+            self._cooldown_until.get(contract_id, float("-inf")),
+            until,
+        )
+        logger.info(
+            "live ENTRY retry cooldown | contract=%s | %.1fs | %s",
+            contract_id, delay, reason,
+        )
+
+    def _abandon_entry(self, live: _ActiveLive, reason: str, retry_from_ts: Optional[float] = None) -> None:
         """No position taken — mark CANCELED and drop from active management."""
         execute_query(
             "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
@@ -1272,6 +1292,11 @@ class MomentumLiveTrader:
             live, "entry_canceled", action="buy",
             requested_count=live.requested_contracts, filled_count=0,
             order_id=live.entry_order_id, detail=reason,
+        )
+        self._start_retry_cooldown(
+            live.contract_id,
+            retry_from_ts if retry_from_ts is not None else datetime.now(timezone.utc).timestamp(),
+            reason,
         )
         logger.info("live ENTRY CANCELED (%s) #%d", reason, live.live_trade_id)
         self._active.pop(live.contract_id, None)

@@ -821,6 +821,34 @@ class TestEntryCooldownBehavior:
             100.0 + _SHADOW_CONFIG.cooldown_seconds
         )
 
+    def test_abandon_entry_starts_short_retry_cooldown(self, monkeypatch):
+        trader = object.__new__(MomentumLiveTrader)
+        trader._cooldown_until = {}
+        trader._active = {7: object()}
+        trader._record_order_event = lambda *args, **kwargs: None
+
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS", 20.0)
+        monkeypatch.setattr("app.momentum_live_trader.execute_query", lambda *args, **kwargs: None)
+
+        live = _ActiveLive(
+            live_trade_id=12,
+            market_id=1,
+            contract_id=7,
+            market_ticker="KXBTC15M-TEST",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.40,
+            horizon_ts=220.0,
+            requested_contracts=5,
+            status="PENDING_ENTRY",
+        )
+
+        trader._abandon_entry(live, "unfilled (order terminal)", retry_from_ts=130.0)
+
+        assert trader._cooldown_until[7] == pytest.approx(150.0)
+        assert 7 not in trader._active
+
 
 class TestAggressiveEntrySubmission:
     def test_try_open_live_uses_adjusted_entry_price(self, monkeypatch):
@@ -869,6 +897,58 @@ class TestAggressiveEntrySubmission:
 
         assert opened is True
         assert seen["limit_price"] == pytest.approx(0.41)
+
+    def test_rejected_entry_sets_retry_cooldown(self, monkeypatch):
+        class FakeClient:
+            def place_order(self, **kwargs):
+                raise Exception("should not be used")
+
+        trader = object.__new__(MomentumLiveTrader)
+        trader._client = FakeClient()
+        trader._active = {}
+        trader._cooldown_until = {}
+        trader._record_guardrail = lambda *args, **kwargs: None
+        trader._record_order_event = lambda *args, **kwargs: None
+        trader._check_risk_gates = lambda sig, captured_at: (True, "", "")
+        trader._load_projected_stats = lambda: {
+            "n": 100,
+            "win_rate": 0.60,
+            "profit_loss_ratio": 1.0,
+            "expectancy": 0.03,
+            "profit_factor": 1.5,
+        }
+
+        monkeypatch.setattr("app.momentum_live_trader.insert_and_get_id", lambda *args, **kwargs: 100)
+        monkeypatch.setattr("app.momentum_live_trader.execute_query", lambda *args, **kwargs: None)
+        monkeypatch.setattr("app.momentum_live_trader.KalshiTradingError", RuntimeError)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS", 0.01)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS", 20.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_BANKROLL_DOLLARS", 100.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_KELLY_FRACTION", 0.10)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE", 10.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE", 20)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_MIN_SHADOW_TRADES", 50)
+        trader._reconcile_ambiguous_order = lambda *args, **kwargs: None
+
+        class RejectClient:
+            def place_order(self, **kwargs):
+                raise RuntimeError("rejected")
+
+        trader._client = RejectClient()
+
+        sig = SimpleNamespace(
+            market_id=1,
+            contract_id=2,
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.40,
+        )
+        captured_at = datetime.fromtimestamp(105.0, tz=timezone.utc)
+        opened = trader._try_open_live(sig, "KXBTC15M-TEST", captured_at)
+
+        assert opened is False
+        assert trader._cooldown_until[2] == pytest.approx(125.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
