@@ -30,6 +30,8 @@ services:
     container_name: kalshi_logger
     env_file:
       - .env
+    volumes:
+      - ./kalshi-key.pem:/app/kalshi-key.pem:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -41,6 +43,8 @@ services:
     command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - .env
+    volumes:
+      - ./kalshi-key.pem:/app/kalshi-key.pem:ro
     depends_on:
       mysql:
         condition: service_healthy
