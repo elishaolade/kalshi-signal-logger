@@ -165,3 +165,43 @@ LIVE_PAUSE_EXPECTANCY_GAP_CENTS  = float(os.getenv("LIVE_PAUSE_EXPECTANCY_GAP_CE
 LIVE_PAUSE_PROFIT_FACTOR_GAP     = float(os.getenv("LIVE_PAUSE_PROFIT_FACTOR_GAP", "0.5"))
 # Rolling windows evaluated for pause.
 LIVE_PAUSE_WINDOWS = (25, 50, 100)
+
+# ── Optional WebSocket state layer for live trading ───────────────────────────
+# REST order placement remains the source of writes; the WebSocket provides
+# fresher quote + order-state observation when available.
+MOMENTUM_LIVE_USE_WEBSOCKET = _env_bool("MOMENTUM_LIVE_USE_WEBSOCKET", "false")
+KALSHI_WS_URL = os.getenv("KALSHI_WS_URL", "").strip()
+MOMENTUM_LIVE_WS_RECONNECT_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_WS_RECONNECT_SECONDS", "3")
+)
+MOMENTUM_LIVE_WS_STALE_AFTER_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_WS_STALE_AFTER_SECONDS", "5")
+)
+MOMENTUM_LIVE_WS_PING_INTERVAL_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_WS_PING_INTERVAL_SECONDS", "20")
+)
+MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS", "20")
+)
+
+# ── Optional exit experiments (disabled by default) ───────────────────────────
+MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
+MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.05"))
+MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED", "false"
+)
+MOMENTUM_LIVE_PROFIT_PROTECTION_TRIGGER_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_PROFIT_PROTECTION_TRIGGER_CENTS", "0.03")
+)
+MOMENTUM_LIVE_PROFIT_PROTECTION_FLOOR_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_PROFIT_PROTECTION_FLOOR_CENTS", "0.01")
+)
+MOMENTUM_LIVE_TIME_PROGRESS_EXIT_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_TIME_PROGRESS_EXIT_ENABLED", "false"
+)
+MOMENTUM_LIVE_TIME_PROGRESS_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_TIME_PROGRESS_SECONDS", "60")
+)
+MOMENTUM_LIVE_TIME_PROGRESS_MIN_PROFIT_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_TIME_PROGRESS_MIN_PROFIT_CENTS", "0")
+)

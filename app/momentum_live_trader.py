@@ -49,6 +49,7 @@ from app.kalshi_trading import (
     cents_to_dollars,
     is_authenticated,
 )
+from app.kalshi_ws import KalshiMarketStream, WSOrderState
 from backtest.loader import MarketInfo, MarketRow, get_bid
 from backtest.signals import detect_signal
 
@@ -747,13 +748,53 @@ class _ActiveLive:
     grace_start: Optional[float] = None
     projected_exit_bid: Optional[float] = None
     exit_reason: Optional[str] = None
+    exit_signal_ts: Optional[float] = None
 
     # Last bid observed on THIS market (used to price a flatten after rollover,
     # when the main loop no longer feeds this market's quotes).
     last_bid: Optional[float] = None
+    last_ask: Optional[float] = None
     # True once this trade must be flattened off the main quote stream
     # (market rolled over, or rehydrated on restart): managed by _advance_flattening.
     flattening: bool = False
+
+    # WS / execution instrumentation
+    ws_enabled: bool = False
+    ws_quote_age_at_entry: Optional[float] = None
+    ws_spread_at_entry: Optional[float] = None
+    ws_entry_best_bid: Optional[float] = None
+    ws_entry_best_ask: Optional[float] = None
+    ws_exit_best_bid: Optional[float] = None
+    ws_exit_spread: Optional[float] = None
+    ws_spread_sum: float = 0.0
+    ws_spread_samples: int = 0
+    ws_max_quote_age_during_trade: float = 0.0
+    max_bid_after_entry: Optional[float] = None
+    max_profit_cents: Optional[float] = None
+    time_to_max_bid_seconds: Optional[float] = None
+    seconds_above_1c: float = 0.0
+    seconds_above_2c: float = 0.0
+    seconds_above_3c: float = 0.0
+    seconds_above_4c: float = 0.0
+    seconds_above_5c: float = 0.0
+    bid_at_30s: Optional[float] = None
+    bid_at_60s: Optional[float] = None
+    bid_at_90s: Optional[float] = None
+    bid_at_120s: Optional[float] = None
+    target_touched: bool = False
+    target_touch_count: int = 0
+    target_first_touched_at: Optional[datetime] = None
+    target_total_visible_seconds: float = 0.0
+    entry_fill_detected_by: Optional[str] = None
+    exit_fill_detected_by: Optional[str] = None
+    entry_signal_to_order_ms: Optional[int] = None
+    entry_order_to_ack_ms: Optional[int] = None
+    entry_ack_to_fill_ms: Optional[int] = None
+    fill_to_exit_order_ms: Optional[int] = None
+    exit_signal_to_order_ms: Optional[int] = None
+    entry_ack_ts: Optional[float] = None
+    entry_fill_ts: Optional[float] = None
+    last_metrics_ts: Optional[float] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -772,6 +813,8 @@ class MomentumLiveTrader:
         self._current_market_id: Optional[str] = None
         self._cooldown_until: dict[int, float] = {}
         self._active: dict[int, _ActiveLive] = {}
+        self._ws = KalshiMarketStream() if config.MOMENTUM_LIVE_USE_WEBSOCKET else None
+        self._ws_stale_guardrail_emitted = False
 
         # Recovery / safety latches.  While set, _try_open_live refuses new
         # entries until open exposure from a restart or rollover is resolved.
@@ -788,12 +831,14 @@ class MomentumLiveTrader:
                 reason = str(exc)
 
         self._reconcile_on_startup()
+        if self._ws:
+            self._ws.start()
 
         if self._armed:
             logger.warning(
                 "MomentumLiveTrader ARMED — REAL ORDERS ENABLED | profile=%s "
                 "bankroll=$%.2f kelly=%.3f max$/trade=%.2f max_contracts=%d "
-                "max_active=%d max_spread=%.3f",
+                "max_active=%d max_spread=%.3f ws=%s",
                 _PROFILE,
                 config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
                 config.MOMENTUM_LIVE_KELLY_FRACTION,
@@ -801,6 +846,7 @@ class MomentumLiveTrader:
                 config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
                 config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES,
                 config.MOMENTUM_LIVE_MAX_SPREAD,
+                "on" if self._ws else "off",
             )
         else:
             logger.info(
@@ -816,6 +862,164 @@ class MomentumLiveTrader:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    def _best_bid_for_side(self, market_ticker: str, side: str, row: MarketRow) -> Optional[float]:
+        ws = getattr(self, "_ws", None)
+        if ws:
+            bid = ws.get_best_bid(market_ticker, side)
+            age = ws.get_quote_age_seconds(market_ticker)
+            if bid is not None and age is not None and age <= config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
+                return bid
+        return get_bid(row, side)
+
+    def _best_ask_for_side(self, market_ticker: str, side: str) -> Optional[float]:
+        ws = getattr(self, "_ws", None)
+        if ws:
+            return ws.get_best_ask(market_ticker, side)
+        return None
+
+    def _quote_age_seconds(self, market_ticker: str, captured_at: datetime) -> float:
+        ws = getattr(self, "_ws", None)
+        if ws:
+            age = ws.get_quote_age_seconds(market_ticker)
+            if age is not None:
+                return age
+        return (datetime.now(timezone.utc) - captured_at).total_seconds()
+
+    def _spread_for_side(self, market_ticker: str, side: str, fallback: Optional[float]) -> Optional[float]:
+        ws = getattr(self, "_ws", None)
+        if ws:
+            spread = ws.get_spread(market_ticker, side)
+            if spread is not None:
+                return spread
+        return fallback
+
+    def _ws_order_state(self, live: _ActiveLive) -> Optional[WSOrderState]:
+        ws = getattr(self, "_ws", None)
+        if not ws:
+            return None
+        return ws.get_order_state(
+            order_id=live.entry_order_id or live.exit_order_id,
+            client_order_id=live.entry_client_order_id or None,
+        )
+
+    def _subscribe_ws_interest(self, market_ticker: str) -> None:
+        if not self._ws:
+            return
+        self._ws.subscribe_market(market_ticker)
+        for live in self._active.values():
+            self._ws.subscribe_market(live.market_ticker)
+
+    def _target_cents(self) -> float:
+        return config.MOMENTUM_LIVE_TP_CENTS or _TP
+
+    def _experimental_exit_decision(
+        self,
+        live: _ActiveLive,
+        row: MarketRow,
+        bid: Optional[float],
+    ) -> tuple[Optional[str], Optional[float]]:
+        if bid is None:
+            return None, None
+        entry_price = live.actual_entry_price if live.actual_entry_price is not None else live.entry_ask
+        current_profit = round(bid - entry_price, 6)
+
+        if (
+            config.MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED
+            and live.max_profit_cents is not None
+            and live.max_profit_cents >= config.MOMENTUM_LIVE_PROFIT_PROTECTION_TRIGGER_CENTS
+            and current_profit <= config.MOMENTUM_LIVE_PROFIT_PROTECTION_FLOOR_CENTS
+        ):
+            return "profit_protection", bid
+
+        if (
+            config.MOMENTUM_LIVE_TIME_PROGRESS_EXIT_ENABLED
+            and (row.ts - live.signal_ts) >= config.MOMENTUM_LIVE_TIME_PROGRESS_SECONDS
+            and current_profit < config.MOMENTUM_LIVE_TIME_PROGRESS_MIN_PROFIT_CENTS
+        ):
+            return "time_progress", bid
+        return None, None
+
+    def _update_trade_metrics(
+        self,
+        live: _ActiveLive,
+        *,
+        bid: Optional[float],
+        quote_age: Optional[float],
+        spread: Optional[float],
+        captured_at: datetime,
+    ) -> None:
+        if live.status not in ("ACTIVE", "PENDING_EXIT") or live.actual_entry_price is None:
+            return
+
+        now_ts = captured_at.timestamp()
+        if live.entry_fill_ts is None:
+            live.entry_fill_ts = now_ts
+        elapsed = max(0.0, now_ts - live.entry_fill_ts)
+        last_ts = live.last_metrics_ts or live.entry_fill_ts
+        delta = max(0.0, now_ts - last_ts)
+        prior_bid = live.last_bid
+
+        if quote_age is not None:
+            live.ws_max_quote_age_during_trade = max(live.ws_max_quote_age_during_trade, quote_age)
+        if spread is not None:
+            live.ws_spread_sum += spread
+            live.ws_spread_samples += 1
+            if live.status == "PENDING_EXIT":
+                live.ws_exit_spread = spread
+        if bid is not None:
+            live.last_bid = bid
+            if live.status == "PENDING_EXIT":
+                live.ws_exit_best_bid = bid
+            profit = round(bid - live.actual_entry_price, 6)
+            if live.max_bid_after_entry is None or bid > live.max_bid_after_entry:
+                live.max_bid_after_entry = bid
+                live.max_profit_cents = profit
+                live.time_to_max_bid_seconds = round(elapsed, 2)
+            thresholds = (
+                ("seconds_above_1c", 0.01),
+                ("seconds_above_2c", 0.02),
+                ("seconds_above_3c", 0.03),
+                ("seconds_above_4c", 0.04),
+                ("seconds_above_5c", 0.05),
+            )
+            for attr, threshold in thresholds:
+                if profit >= threshold:
+                    setattr(live, attr, round(getattr(live, attr) + delta, 2))
+
+            for mark, attr in (
+                (30, "bid_at_30s"),
+                (60, "bid_at_60s"),
+                (90, "bid_at_90s"),
+                (120, "bid_at_120s"),
+            ):
+                if elapsed >= mark and getattr(live, attr) is None:
+                    setattr(live, attr, bid)
+
+            target_bid = round(live.entry_ask + self._target_cents(), 4)
+            if bid >= target_bid:
+                if not live.target_touched:
+                    live.target_touched = True
+                    live.target_first_touched_at = captured_at
+                if live.target_touch_count == 0 or live.last_metrics_ts is None or prior_bid is None or prior_bid < target_bid:
+                    live.target_touch_count += 1
+                live.target_total_visible_seconds = round(live.target_total_visible_seconds + delta, 2)
+
+        live.last_metrics_ts = now_ts
+
+    def _maybe_record_ws_guardrail(self) -> None:
+        if not self._ws:
+            return
+        if self._ws.degraded and self._active and not self._ws_stale_guardrail_emitted:
+            self._record_guardrail(
+                "blocked_ws_stale",
+                None,
+                None,
+                "websocket stale/degraded while position open; new entries blocked until quote stream recovers",
+            )
+            self._ws_stale_guardrail_emitted = True
+        elif not self._ws.degraded:
+            self._ws_stale_guardrail_emitted = False
 
     def on_tick(
         self,
@@ -845,6 +1049,8 @@ class MomentumLiveTrader:
             return
         if target_price is None:
             return
+        self._subscribe_ws_interest(market_ticker)
+        self._maybe_record_ws_guardrail()
 
         # ── Market rollover ───────────────────────────────────────────────────
         if market_id != self._current_market_id:
@@ -946,7 +1152,9 @@ class MomentumLiveTrader:
 
     # ── Risk gates ────────────────────────────────────────────────────────────
 
-    def _check_risk_gates(self, sig, captured_at: datetime) -> tuple[bool, str, str]:
+    def _check_risk_gates(
+        self, sig, market_ticker: str, captured_at: datetime
+    ) -> tuple[bool, str, str]:
         """
         Pre-order risk gates.  Returns (ok, guardrail_event_type, reason).
         Order matters: hard stops first, then per-trade conditions.
@@ -969,8 +1177,14 @@ class MomentumLiveTrader:
                 f"max active live trades reached ({config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES})",
             )
 
+        if self._ws and self._ws.degraded and self._active:
+            return (
+                False, "blocked_ws_stale",
+                "websocket stream stale/degraded while managing an open live position",
+            )
+
         # Quote freshness — the quote we are acting on must be recent.
-        age = (datetime.now(timezone.utc) - captured_at).total_seconds()
+        age = self._quote_age_seconds(market_ticker, captured_at)
         if age > config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
             return (
                 False, "blocked_quote_stale",
@@ -978,10 +1192,11 @@ class MomentumLiveTrader:
             )
 
         # Spread gate.
-        if sig.entry_spread is None or sig.entry_spread > config.MOMENTUM_LIVE_MAX_SPREAD:
+        spread = self._spread_for_side(market_ticker, sig.side, sig.entry_spread)
+        if spread is None or spread > config.MOMENTUM_LIVE_MAX_SPREAD:
             return (
                 False, "blocked_spread",
-                f"spread {sig.entry_spread} > {config.MOMENTUM_LIVE_MAX_SPREAD}",
+                f"spread {spread} > {config.MOMENTUM_LIVE_MAX_SPREAD}",
             )
 
         # Daily-loss gate.
@@ -1004,7 +1219,10 @@ class MomentumLiveTrader:
         order was submitted/adopted; cooldown now starts on ACTUAL fill, not on
         blocked or canceled attempts.
         """
-        ok, event_type, reason = self._check_risk_gates(sig, captured_at)
+        try:
+            ok, event_type, reason = self._check_risk_gates(sig, market_ticker, captured_at)
+        except TypeError:
+            ok, event_type, reason = self._check_risk_gates(sig, captured_at)
         if not ok:
             self._record_guardrail(event_type, market_ticker, sig.side, reason)
             logger.warning("live BLOCKED | %s %s | %s", market_ticker, sig.side, reason)
@@ -1048,6 +1266,13 @@ class MomentumLiveTrader:
 
         target_ask = round(sig.entry_ask + _TP, 4)
         now = datetime.now(timezone.utc)
+        ws = getattr(self, "_ws", None)
+        ws_best_bid = ws.get_best_bid(market_ticker, sig.side) if ws else None
+        ws_best_ask = self._best_ask_for_side(market_ticker, sig.side)
+        ws_spread = self._spread_for_side(
+            market_ticker, sig.side, getattr(sig, "entry_spread", None)
+        )
+        ws_quote_age = self._quote_age_seconds(market_ticker, captured_at)
 
         # Idempotency: generate the client_order_id and PERSIST it (with the row)
         # BEFORE the POST, so an ambiguous submission can be reconciled by id.
@@ -1064,6 +1289,8 @@ class MomentumLiveTrader:
                 projected_entry_ask, projected_target_ask,
                 projected_expectancy_cents, projected_win_rate,
                 projected_profit_factor, projected_profit_loss_ratio,
+                ws_enabled, ws_quote_age_at_entry, ws_spread_at_entry,
+                ws_entry_best_bid, ws_entry_best_ask, entry_signal_to_order_ms,
                 entry_client_order_id, status, created_at
             ) VALUES (
                 %s, %s, %s, %s,
@@ -1073,6 +1300,8 @@ class MomentumLiveTrader:
                 %s, %s,
                 %s, %s,
                 %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
                 %s, 'PENDING_ENTRY', %s
             )
             """,
@@ -1085,6 +1314,9 @@ class MomentumLiveTrader:
                 sig.entry_ask, target_ask,
                 _safe(proj["expectancy"]), _safe(proj["win_rate"]),
                 _safe(proj["profit_factor"]), _safe(proj["profit_loss_ratio"]),
+                1 if ws else 0, _safe(ws_quote_age), _safe(ws_spread),
+                _safe(ws_best_bid), _safe(ws_best_ask),
+                int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
                 coid, now,
             ),
         )
@@ -1102,6 +1334,12 @@ class MomentumLiveTrader:
             requested_contracts=contracts,
             status="PENDING_ENTRY",
             entry_client_order_id=coid,
+            ws_enabled=bool(ws),
+            ws_quote_age_at_entry=ws_quote_age,
+            ws_spread_at_entry=ws_spread,
+            ws_entry_best_bid=ws_best_bid,
+            ws_entry_best_ask=ws_best_ask,
+            entry_signal_to_order_ms=int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
         )
 
         # Place the real entry order (limit buy at the observed ask).
@@ -1139,9 +1377,17 @@ class MomentumLiveTrader:
             )
 
         live.entry_order_id = str(order.get("order_id") or order.get("id") or "")
+        live.entry_ack_ts = datetime.now(timezone.utc).timestamp()
+        if live.entry_submit_ts is not None:
+            live.entry_order_to_ack_ms = int(max(0.0, (live.entry_ack_ts - live.entry_submit_ts) * 1000.0))
         execute_query(
-            "UPDATE momentum_live_trades SET entry_order_id=%s WHERE id=%s",
-            (live.entry_order_id, live_trade_id),
+            "UPDATE momentum_live_trades SET entry_order_id=%s, entry_order_to_ack_ms=%s WHERE id=%s",
+            (live.entry_order_id, live.entry_order_to_ack_ms, live_trade_id),
+        )
+        self._record_order_event(
+            live, "order_acknowledged", action="buy",
+            requested_count=contracts, limit_price=entry_limit_price,
+            order_id=live.entry_order_id, client_order_id=coid, raw=order,
         )
         self._record_order_event(
             live, "entry_submitted", action="buy",
@@ -1172,9 +1418,10 @@ class MomentumLiveTrader:
                     )
                 continue
 
-            bid = get_bid(row, live.side)
+            bid = self._best_bid_for_side(live.market_ticker, live.side, row)
             if bid is not None:
                 live.last_bid = bid
+            live.last_ask = self._best_ask_for_side(live.market_ticker, live.side)
 
             # Projected excursion tracking (identical to shadow tracker).
             if row.ts <= live.horizon_ts and bid is not None:
@@ -1212,8 +1459,13 @@ class MomentumLiveTrader:
         if not live.entry_order_id:
             return
 
+        ws_state = self._ws_order_state(live)
         fills = self._client.get_fills(order_id=live.entry_order_id)
         count, avg_price, entry_fees = _summarize_fills(fills, live.side)
+        if ws_state and ws_state.filled_count and int(round(ws_state.filled_count)) > count:
+            count = int(round(ws_state.filled_count))
+            avg_price = ws_state.avg_fill_price or avg_price
+            entry_fees = ws_state.fee_total if ws_state.fee_total is not None else entry_fees
         # Keep partial state current at all times (residual is never lost).
         live.filled_contracts = count
         live.actual_entry_price = avg_price
@@ -1224,7 +1476,12 @@ class MomentumLiveTrader:
             self._promote_entry_to_active(live, captured_at)
             return
 
-        order = self._safe_get_order(live.entry_order_id)
+        order = None if (ws_state and ws_state.status) else self._safe_get_order(live.entry_order_id)
+        if ws_state and ws_state.status:
+            order = {
+                "status": ws_state.status,
+                "remaining_count_fp": ws_state.remaining_count,
+            }
         order_open = is_order_open(order)
 
         if order_open:
@@ -1257,12 +1514,23 @@ class MomentumLiveTrader:
         except KalshiTradingError as exc:
             logger.warning("entry cancel failed #%d: %s", live.live_trade_id, exc)
         live.entry_cancel_requested = True
+        self._record_order_event(
+            live, "cancel_requested", action="buy",
+            requested_count=live.requested_contracts,
+            filled_count=live.filled_contracts,
+            order_id=live.entry_order_id,
+            detail=reason,
+        )
         logger.info("live ENTRY cancel requested #%d | %s", live.live_trade_id, reason)
 
     def _promote_entry_to_active(self, live: _ActiveLive, captured_at: datetime) -> None:
         """Lock in the final entry fill and move to ACTIVE (no residual qty)."""
         count = live.filled_contracts
         live.status = "ACTIVE"
+        live.entry_fill_ts = captured_at.timestamp()
+        live.entry_fill_detected_by = "websocket" if (self._ws_order_state(live) and self._ws_order_state(live).filled_count) else "rest"
+        if live.entry_ack_ts is not None:
+            live.entry_ack_to_fill_ms = int(max(0.0, (live.entry_fill_ts - live.entry_ack_ts) * 1000.0))
         self._cooldown_until[live.contract_id] = max(
             self._cooldown_until.get(live.contract_id, float("-inf")),
             live.signal_ts + _SHADOW_CONFIG.cooldown_seconds,
@@ -1270,9 +1538,9 @@ class MomentumLiveTrader:
         execute_query(
             "UPDATE momentum_live_trades SET status='ACTIVE', "
             "filled_contracts=%s, actual_entry_price=%s, actual_entry_fees=%s, "
-            "entry_at=%s WHERE id=%s",
+            "entry_at=%s, entry_fill_detected_by=%s, entry_ack_to_fill_ms=%s WHERE id=%s",
             (count, live.actual_entry_price, live.actual_entry_fees,
-             captured_at, live.live_trade_id),
+             captured_at, live.entry_fill_detected_by, live.entry_ack_to_fill_ms, live.live_trade_id),
         )
         self._record_order_event(
             live,
@@ -1339,6 +1607,15 @@ class MomentumLiveTrader:
         (so a failed submit or a price that no longer re-qualifies can never
         strand the position before its horizon).
         """
+        quote_age = self._ws.get_quote_age_seconds(live.market_ticker) if self._ws else None
+        spread = self._ws.get_spread(live.market_ticker, live.side) if self._ws else None
+        self._update_trade_metrics(
+            live,
+            bid=bid,
+            quote_age=quote_age,
+            spread=spread,
+            captured_at=captured_at,
+        )
         exit_reason, exit_bid = self._frozen_exit_decision(live, row, bid)
         if exit_reason is None:
             return
@@ -1346,6 +1623,8 @@ class MomentumLiveTrader:
         # Lock projected exit (shadow outcome) at first firing; commit to exit.
         live.exit_reason = exit_reason
         live.projected_exit_bid = exit_bid   # may be None for "unexecutable"
+        if live.exit_signal_ts is None:
+            live.exit_signal_ts = captured_at.timestamp()
         live.status = "PENDING_EXIT"
         execute_query(
             "UPDATE momentum_live_trades SET status='PENDING_EXIT', exit_reason=%s WHERE id=%s",
@@ -1429,6 +1708,15 @@ class MomentumLiveTrader:
         when cumulative exit fills cover the full entry position, and only ever
         resubmits the REMAINING quantity (never the original full size).
         """
+        quote_age = self._ws.get_quote_age_seconds(live.market_ticker) if self._ws else None
+        spread = self._ws.get_spread(live.market_ticker, live.side) if self._ws else None
+        self._update_trade_metrics(
+            live,
+            bid=bid,
+            quote_age=quote_age,
+            spread=spread,
+            captured_at=captured_at,
+        )
         if not live.exit_order_ids:
             # We owe an exit but never placed one (no bid earlier) — try now.
             remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
@@ -1438,6 +1726,9 @@ class MomentumLiveTrader:
             return
 
         count, avg_price, exit_fees = self._aggregate_exit_fills(live)
+        ws_state = self._ws_order_state(live)
+        if ws_state and ws_state.filled_count and int(round(ws_state.filled_count)) >= count:
+            live.exit_fill_detected_by = "websocket"
         if count >= live.filled_contracts and count >= 1:
             self._finalize_complete(live, avg_price, exit_fees, count, captured_at)
             return
@@ -1491,6 +1782,9 @@ class MomentumLiveTrader:
         observed bid until flat.
         """
         count, avg_price, exit_fees = self._aggregate_exit_fills(live)
+        ws_state = self._ws_order_state(live)
+        if ws_state and ws_state.filled_count and int(round(ws_state.filled_count)) >= count:
+            live.exit_fill_detected_by = "websocket"
         if count >= live.filled_contracts and count >= 1:
             self._finalize_complete(live, avg_price, exit_fees, count, captured_at)
             return
@@ -1516,6 +1810,9 @@ class MomentumLiveTrader:
         """
         if bid is not None and bid >= live.entry_ask + _TP:
             return EXIT_PROFIT_TARGET, bid
+        experimental_reason, experimental_bid = self._experimental_exit_decision(live, row, bid)
+        if experimental_reason is not None:
+            return experimental_reason, experimental_bid
         if row.ts >= live.horizon_ts:
             if bid is not None:
                 return EXIT_FIXED_TIME, bid
@@ -1539,10 +1836,16 @@ class MomentumLiveTrader:
             return
         coid = str(uuid.uuid4())
         live.exit_submit_ts = datetime.now(timezone.utc).timestamp()
+        if live.exit_signal_ts is None:
+            live.exit_signal_ts = captured_at.timestamp()
+            live.exit_signal_to_order_ms = int(max(0.0, (live.exit_submit_ts - live.exit_signal_ts) * 1000.0))
+        if live.entry_fill_ts is not None:
+            live.fill_to_exit_order_ms = int(max(0.0, (live.exit_submit_ts - live.entry_fill_ts) * 1000.0))
         execute_query(
             "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
-            "exit_client_order_id=%s, exit_reason=%s WHERE id=%s",
-            (coid, exit_reason, live.live_trade_id),
+            "exit_client_order_id=%s, exit_reason=%s, fill_to_exit_order_ms=%s, "
+            "exit_signal_to_order_ms=%s WHERE id=%s",
+            (coid, exit_reason, live.fill_to_exit_order_ms, live.exit_signal_to_order_ms, live.live_trade_id),
         )
         self._record_order_event(
             live, "exit_submit_intent", action="sell",
@@ -1574,6 +1877,9 @@ class MomentumLiveTrader:
         if oid and oid not in live.exit_order_ids:
             live.exit_order_ids.append(oid)
         live.exit_order_id = oid
+        live.ws_exit_best_bid = bid
+        ws = getattr(self, "_ws", None)
+        live.ws_exit_spread = ws.get_spread(live.market_ticker, live.side) if ws else live.ws_exit_spread
         live.status = "PENDING_EXIT"
         execute_query(
             "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
@@ -1663,6 +1969,12 @@ class MomentumLiveTrader:
 
         holding_s = round(captured_at.timestamp() - live.signal_ts, 1)
 
+        if actual_exit_price is not None:
+            live.ws_exit_best_bid = actual_exit_price
+        ws_avg_spread = (
+            round(live.ws_spread_sum / live.ws_spread_samples, 6)
+            if live.ws_spread_samples > 0 else None
+        )
         execute_query(
             """
             UPDATE momentum_live_trades SET
@@ -1670,6 +1982,13 @@ class MomentumLiveTrader:
                 actual_exit_price=%s, actual_fees_cents=%s,
                 actual_profit_cents=%s, actual_profit_dollars=%s, actual_trade_won=%s,
                 projected_exit_bid=%s, projected_profit_cents=%s,
+                ws_exit_best_bid=%s, ws_exit_spread=%s, ws_avg_spread_during_trade=%s,
+                ws_max_quote_age_during_trade=%s, max_bid_after_entry=%s, max_profit_cents=%s,
+                time_to_max_bid_seconds=%s, seconds_above_1c=%s, seconds_above_2c=%s,
+                seconds_above_3c=%s, seconds_above_4c=%s, seconds_above_5c=%s,
+                bid_at_30s=%s, bid_at_60s=%s, bid_at_90s=%s, bid_at_120s=%s,
+                target_touched=%s, target_touch_count=%s, target_first_touched_at=%s,
+                target_total_visible_seconds=%s, exit_fill_detected_by=%s,
                 profit_delta_cents=%s, expectancy_delta_cents=%s,
                 entry_price_drift_cents=%s, exit_price_drift_cents=%s,
                 total_execution_drift_cents=%s,
@@ -1681,6 +2000,15 @@ class MomentumLiveTrader:
                 actual_exit_price, actual_fees_per_contract,
                 actual_profit, actual_profit_dollars, actual_won,
                 live.projected_exit_bid, projected_profit,
+                live.ws_exit_best_bid, live.ws_exit_spread, ws_avg_spread,
+                live.ws_max_quote_age_during_trade or None, live.max_bid_after_entry,
+                live.max_profit_cents, live.time_to_max_bid_seconds,
+                live.seconds_above_1c, live.seconds_above_2c, live.seconds_above_3c,
+                live.seconds_above_4c, live.seconds_above_5c,
+                live.bid_at_30s, live.bid_at_60s, live.bid_at_90s, live.bid_at_120s,
+                1 if live.target_touched else 0, live.target_touch_count,
+                live.target_first_touched_at, live.target_total_visible_seconds,
+                live.exit_fill_detected_by or "rest",
                 drift["profit_delta_cents"], drift["expectancy_delta_cents"],
                 drift["entry_price_drift_cents"], drift["exit_price_drift_cents"],
                 drift["total_execution_drift_cents"],

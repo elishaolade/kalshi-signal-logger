@@ -9,12 +9,6 @@ This report is meant for the "refine before giving up" stage. It emphasizes:
   - canceled-entry behavior
   - spread-related blockers
 
-Important limitation:
-  Completed live trades currently do NOT persist entry spread as a first-class
-  column, so this report cannot yet compare completed-trade outcomes by spread.
-  It does summarize `blocked_spread` guardrails so we can still see how often
-  spread prevented participation.
-
 Usage:
     python scripts/momentum_live_diagnostics.py
     python scripts/momentum_live_diagnostics.py --hours 24
@@ -90,6 +84,19 @@ def _load_live_rows(hours: Optional[int]) -> list[dict]:
                projected_profit_cents, actual_profit_cents,
                projected_expectancy_cents,
                actual_profit_dollars, actual_trade_won,
+               ws_enabled, ws_quote_age_at_entry, ws_spread_at_entry,
+               ws_entry_best_bid, ws_entry_best_ask, ws_exit_best_bid,
+               ws_exit_spread, ws_avg_spread_during_trade,
+               ws_max_quote_age_during_trade,
+               max_bid_after_entry, max_profit_cents, time_to_max_bid_seconds,
+               seconds_above_1c, seconds_above_2c, seconds_above_3c,
+               seconds_above_4c, seconds_above_5c,
+               bid_at_30s, bid_at_60s, bid_at_90s, bid_at_120s,
+               target_touched, target_touch_count, target_first_touched_at,
+               target_total_visible_seconds,
+               entry_fill_detected_by, exit_fill_detected_by,
+               entry_signal_to_order_ms, entry_order_to_ack_ms,
+               entry_ack_to_fill_ms, fill_to_exit_order_ms, exit_signal_to_order_ms,
                entry_price_drift_cents, exit_price_drift_cents,
                profit_delta_cents, total_execution_drift_cents,
                profit_capture_ratio, expectancy_capture_ratio
@@ -139,12 +146,21 @@ def _summarize_completed(rows: Iterable[dict]) -> dict[str, Optional[float]]:
         "win_rate": (len(wins) / len(completed)) if completed else None,
         "avg_actual_pnl": statistics.mean(pnls) if pnls else None,
         "avg_projected_pnl": statistics.mean(projected) if projected else None,
+        "avg_entry_drift": statistics.mean(
+            [_safe_float(r.get("entry_price_drift_cents")) for r in completed if r.get("entry_price_drift_cents") is not None]
+        ) if any(r.get("entry_price_drift_cents") is not None for r in completed) else None,
+        "avg_exit_drift": statistics.mean(
+            [_safe_float(r.get("exit_price_drift_cents")) for r in completed if r.get("exit_price_drift_cents") is not None]
+        ) if any(r.get("exit_price_drift_cents") is not None for r in completed) else None,
         "avg_profit_delta": statistics.mean(
             [_safe_float(r.get("profit_delta_cents")) for r in completed if r.get("profit_delta_cents") is not None]
         ) if any(r.get("profit_delta_cents") is not None for r in completed) else None,
         "avg_exec_drift": statistics.mean(
             [_safe_float(r.get("total_execution_drift_cents")) for r in completed if r.get("total_execution_drift_cents") is not None]
         ) if any(r.get("total_execution_drift_cents") is not None for r in completed) else None,
+        "avg_mfe": statistics.mean(
+            [_safe_float(r.get("max_profit_cents")) for r in completed if r.get("max_profit_cents") is not None]
+        ) if any(r.get("max_profit_cents") is not None for r in completed) else None,
     }
 
 
@@ -167,8 +183,11 @@ def _print_completed_summary(rows: list[dict]) -> None:
     _row("Win rate:", _fmt_pct(summary["win_rate"]))
     _row("Avg actual pnl / contract:", _fmt_num(summary["avg_actual_pnl"], signed=True))
     _row("Avg projected pnl / contract:", _fmt_num(summary["avg_projected_pnl"], signed=True))
+    _row("Avg entry drift:", _fmt_num(summary["avg_entry_drift"], signed=True))
+    _row("Avg exit drift:", _fmt_num(summary["avg_exit_drift"], signed=True))
     _row("Avg profit delta:", _fmt_num(summary["avg_profit_delta"], signed=True))
     _row("Avg execution drift:", _fmt_num(summary["avg_exec_drift"], signed=True))
+    _row("Avg MFE:", _fmt_num(summary["avg_mfe"], signed=True))
 
 
 def _print_group_breakdown(rows: list[dict], title: str, key_fn) -> None:
@@ -187,7 +206,8 @@ def _print_group_breakdown(rows: list[dict], title: str, key_fn) -> None:
           "act pnl".rjust(10) + "  " +
           "proj pnl".rjust(10) + "  " +
           "delta".rjust(10) + "  " +
-          "exec drift".rjust(10))
+          "exec drift".rjust(10) + "  " +
+          "mfe".rjust(8))
     print("  " + "-" * 74)
     for group, chunk in sorted(groups.items()):
         stats = _summarize_completed(chunk)
@@ -206,8 +226,10 @@ def _print_canceled_entries(rows: list[dict], cutoffs: list[float]) -> None:
         r for r in rows
         if r.get("status") == "CANCELED" and int(r.get("filled_contracts") or 0) == 0
     ]
+    rejected = [r for r in rows if r.get("status") == "REJECTED"]
     _h2("Canceled Entry Diagnostics")
     _row("Canceled zero-fill rows:", str(len(canceled)))
+    _row("Rejected rows:", str(len(rejected)))
     if not canceled:
         return
 
@@ -279,8 +301,47 @@ def _print_recent_completed(rows: list[dict], limit: int = 10) -> None:
             f"{_fmt_num(_safe_float(r.get('actual_exit_price')), 3, signed=True):>6} "
             f"{_fmt_num(_safe_float(r.get('projected_profit_cents')), 3, signed=True):>6} "
             f"{_fmt_num(_safe_float(r.get('actual_profit_cents')), 3, signed=True):>6} "
-            f"{_fmt_num(_safe_float(r.get('total_execution_drift_cents')), 3, signed=True):>8}"
+            f"{_fmt_num(_safe_float(r.get('total_execution_drift_cents')), 3, signed=True):>8}  "
+            f"{_fmt_num(_safe_float(r.get('max_profit_cents')), 3, signed=True):>8}"
         )
+
+
+def _print_target_touch(rows: list[dict]) -> None:
+    completed = [r for r in rows if r.get("status") == "COMPLETE"]
+    touched = [r for r in completed if int(r.get("target_touched") or 0) == 1]
+    fixed_time_green = [
+        r for r in completed
+        if (r.get("exit_reason") == "fixed_time" or r.get("exit_reason") == "fixed_time".upper())
+        and _safe_float(r.get("actual_profit_cents")) is not None
+        and _safe_float(r.get("actual_profit_cents")) < 0
+    ]
+    _h2("Target Touch / MFE")
+    _row("Completed trades touching target:", str(len(touched)))
+    _row("Avg target visible seconds:", _fmt_num(statistics.mean([
+        _safe_float(r.get("target_total_visible_seconds")) for r in touched if r.get("target_total_visible_seconds") is not None
+    ]) if touched and any(r.get("target_total_visible_seconds") is not None for r in touched) else None, nd=2))
+    for cents, field in ((1, "seconds_above_1c"), (2, "seconds_above_2c"), (3, "seconds_above_3c"), (4, "seconds_above_4c"), (5, "seconds_above_5c")):
+        count = sum(
+            1 for r in fixed_time_green
+            if _safe_float(r.get(field)) is not None and _safe_float(r.get(field)) > 0
+        )
+        _row(f"Fixed-time losers that saw +{cents}c:", str(count))
+
+
+def _print_ws_stats(rows: list[dict]) -> None:
+    completed = [r for r in rows if r.get("status") == "COMPLETE"]
+    _h2("WebSocket Quote Stats")
+    if not completed:
+        print("  No completed live trades yet.")
+        return
+    for label, key in (
+        ("Avg quote age at entry:", "ws_quote_age_at_entry"),
+        ("Avg spread at entry:", "ws_spread_at_entry"),
+        ("Avg spread during trade:", "ws_avg_spread_during_trade"),
+        ("Max quote age during trade:", "ws_max_quote_age_during_trade"),
+    ):
+        values = [_safe_float(r.get(key)) for r in completed if r.get(key) is not None]
+        _row(label, _fmt_num(statistics.mean(values) if values else None, nd=4))
 
 
 def main() -> None:
@@ -319,6 +380,8 @@ def main() -> None:
         lambda r: _bucket_label(_safe_float(r.get("projected_entry_ask")), cutoffs),
     )
     _print_canceled_entries(rows, cutoffs)
+    _print_target_touch(rows)
+    _print_ws_stats(rows)
     _print_spread_guardrails(guardrails)
     _print_recent_completed(rows)
     print()
