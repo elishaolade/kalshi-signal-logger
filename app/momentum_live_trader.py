@@ -163,6 +163,71 @@ def compute_live_entry_limit_price(
     return max(0.01, min(0.99, adjusted))
 
 
+def price_to_cents(price: Optional[float]) -> Optional[float]:
+    """
+    Convert a contract price from repo-standard dollar-fraction units
+    (0.074 == 7.4c) into explicit cents.
+    """
+    if price is None:
+        return None
+    return round(float(price) * 100.0, 4)
+
+
+def price_delta_to_cents(
+    current_exit_bid: Optional[float],
+    actual_entry_price: Optional[float],
+) -> Optional[float]:
+    """
+    Convert a price delta into profit cents.
+
+    Example:
+      entry 0.074, bid 0.097 -> (0.097 - 0.074) * 100 = 2.3c
+    """
+    if current_exit_bid is None or actual_entry_price is None:
+        return None
+    return round((float(current_exit_bid) - float(actual_entry_price)) * 100.0, 4)
+
+
+def determine_ws_shadow_exit_reasons(
+    *,
+    current_profit_cents: float,
+    max_profit_cents: float,
+    age_seconds: float,
+) -> list[str]:
+    """
+    Return the hypothetical WS-aware exit triggers that are satisfied now.
+
+    These thresholds operate in literal cents, not repo price units:
+      +3.0 means +3 cents of per-contract profit.
+    """
+    reasons: list[str] = []
+    if config.MOMENTUM_LIVE_WS_SHADOW_TP2_ENABLED and current_profit_cents >= 2.0:
+        reasons.append("ws_shadow_tp2")
+    if config.MOMENTUM_LIVE_WS_SHADOW_TP3_ENABLED and current_profit_cents >= 3.0:
+        reasons.append("ws_shadow_tp3")
+    if config.MOMENTUM_LIVE_WS_SHADOW_TP5_ENABLED and current_profit_cents >= 5.0:
+        reasons.append("ws_shadow_tp5")
+    if (
+        config.MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_ENABLED
+        and max_profit_cents >= config.MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_TRIGGER_CENTS
+        and current_profit_cents <= config.MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_FLOOR_CENTS
+    ):
+        reasons.append("ws_shadow_profit_protection")
+    if (
+        config.MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_ENABLED
+        and max_profit_cents >= config.MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_TRIGGER_CENTS
+        and current_profit_cents <= config.MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_FLOOR_CENTS
+    ):
+        reasons.append("ws_shadow_giveback")
+    if (
+        config.MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_ENABLED
+        and age_seconds >= config.MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_SECONDS
+        and current_profit_cents <= config.MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS
+    ):
+        reasons.append("ws_shadow_time_progress")
+    return reasons
+
+
 def summarize_pnls(pnls: list[float]) -> dict[str, Optional[float]]:
     """
     Win-rate / expectancy / profit-factor / profit-loss-ratio for a list of
@@ -781,6 +846,7 @@ class _ActiveLive:
     bid_at_60s: Optional[float] = None
     bid_at_90s: Optional[float] = None
     bid_at_120s: Optional[float] = None
+    went_green: bool = False
     target_touched: bool = False
     target_touch_count: int = 0
     target_first_touched_at: Optional[datetime] = None
@@ -795,6 +861,7 @@ class _ActiveLive:
     entry_ack_ts: Optional[float] = None
     entry_fill_ts: Optional[float] = None
     last_metrics_ts: Optional[float] = None
+    ws_shadow_triggered_reasons: set[str] = field(default_factory=set)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -940,6 +1007,88 @@ class MomentumLiveTrader:
             return "time_progress", bid
         return None, None
 
+    def _record_ws_shadow_exit(
+        self,
+        live: _ActiveLive,
+        *,
+        reason: str,
+        captured_at: datetime,
+        age_seconds: float,
+        exit_price: float,
+        current_profit_cents: float,
+        max_profit_cents: float,
+    ) -> None:
+        if reason in live.ws_shadow_triggered_reasons:
+            return
+
+        existing = fetch_one(
+            "SELECT id FROM momentum_live_shadow_exits "
+            "WHERE live_trade_id=%s AND shadow_exit_reason=%s",
+            (live.live_trade_id, reason),
+        )
+        if existing:
+            live.ws_shadow_triggered_reasons.add(reason)
+            return
+
+        execute_query(
+            """
+            INSERT INTO momentum_live_shadow_exits (
+                live_trade_id, ticker, side, shadow_exit_reason,
+                triggered_at, age_seconds, exit_price, profit_cents,
+                current_profit_cents, max_profit_cents
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                live.live_trade_id,
+                live.market_ticker,
+                live.side,
+                reason,
+                captured_at,
+                round(age_seconds, 2),
+                exit_price,
+                current_profit_cents,
+                current_profit_cents,
+                max_profit_cents,
+            ),
+        )
+        live.ws_shadow_triggered_reasons.add(reason)
+        logger.info(
+            "[WS_SHADOW_EXIT] trade_id=%s reason=%s price=%.3f profit_cents=%.2f age=%.2f",
+            live.live_trade_id,
+            reason,
+            exit_price,
+            current_profit_cents,
+            age_seconds,
+        )
+
+    def _maybe_record_ws_shadow_exits(
+        self,
+        live: _ActiveLive,
+        *,
+        bid: float,
+        captured_at: datetime,
+        current_profit_cents: float,
+        age_seconds: float,
+    ) -> None:
+        if not config.MOMENTUM_LIVE_WS_EXIT_SHADOW:
+            return
+        max_profit_cents = float(live.max_profit_cents or current_profit_cents)
+        reasons = determine_ws_shadow_exit_reasons(
+            current_profit_cents=current_profit_cents,
+            max_profit_cents=max_profit_cents,
+            age_seconds=age_seconds,
+        )
+        for reason in reasons:
+            self._record_ws_shadow_exit(
+                live,
+                reason=reason,
+                captured_at=captured_at,
+                age_seconds=age_seconds,
+                exit_price=bid,
+                current_profit_cents=current_profit_cents,
+                max_profit_cents=max_profit_cents,
+            )
+
     def _update_trade_metrics(
         self,
         live: _ActiveLive,
@@ -971,20 +1120,27 @@ class MomentumLiveTrader:
             live.last_bid = bid
             if live.status == "PENDING_EXIT":
                 live.ws_exit_best_bid = bid
-            profit = round(bid - live.actual_entry_price, 6)
+            # Contract prices are stored as dollar fractions (0.074 == 7.4c).
+            # The instrumentation fields below are intended to be literal cents,
+            # so convert the bid/entry delta explicitly once here.
+            profit_cents = price_delta_to_cents(bid, live.actual_entry_price)
+            if profit_cents is None:
+                return
+            if profit_cents > 0:
+                live.went_green = True
             if live.max_bid_after_entry is None or bid > live.max_bid_after_entry:
                 live.max_bid_after_entry = bid
-                live.max_profit_cents = profit
+                live.max_profit_cents = profit_cents
                 live.time_to_max_bid_seconds = round(elapsed, 2)
             thresholds = (
-                ("seconds_above_1c", 0.01),
-                ("seconds_above_2c", 0.02),
-                ("seconds_above_3c", 0.03),
-                ("seconds_above_4c", 0.04),
-                ("seconds_above_5c", 0.05),
+                ("seconds_above_1c", 1.0),
+                ("seconds_above_2c", 2.0),
+                ("seconds_above_3c", 3.0),
+                ("seconds_above_4c", 4.0),
+                ("seconds_above_5c", 5.0),
             )
             for attr, threshold in thresholds:
-                if profit >= threshold:
+                if profit_cents >= threshold:
                     setattr(live, attr, round(getattr(live, attr) + delta, 2))
 
             for mark, attr in (
@@ -1004,6 +1160,14 @@ class MomentumLiveTrader:
                 if live.target_touch_count == 0 or live.last_metrics_ts is None or prior_bid is None or prior_bid < target_bid:
                     live.target_touch_count += 1
                 live.target_total_visible_seconds = round(live.target_total_visible_seconds + delta, 2)
+
+            self._maybe_record_ws_shadow_exits(
+                live,
+                bid=bid,
+                captured_at=captured_at,
+                current_profit_cents=profit_cents,
+                age_seconds=elapsed,
+            )
 
         live.last_metrics_ts = now_ts
 
@@ -1986,7 +2150,7 @@ class MomentumLiveTrader:
                 ws_max_quote_age_during_trade=%s, max_bid_after_entry=%s, max_profit_cents=%s,
                 time_to_max_bid_seconds=%s, seconds_above_1c=%s, seconds_above_2c=%s,
                 seconds_above_3c=%s, seconds_above_4c=%s, seconds_above_5c=%s,
-                bid_at_30s=%s, bid_at_60s=%s, bid_at_90s=%s, bid_at_120s=%s,
+                bid_at_30s=%s, bid_at_60s=%s, bid_at_90s=%s, bid_at_120s=%s, went_green=%s,
                 target_touched=%s, target_touch_count=%s, target_first_touched_at=%s,
                 target_total_visible_seconds=%s, exit_fill_detected_by=%s,
                 profit_delta_cents=%s, expectancy_delta_cents=%s,
@@ -2006,6 +2170,7 @@ class MomentumLiveTrader:
                 live.seconds_above_1c, live.seconds_above_2c, live.seconds_above_3c,
                 live.seconds_above_4c, live.seconds_above_5c,
                 live.bid_at_30s, live.bid_at_60s, live.bid_at_90s, live.bid_at_120s,
+                1 if live.went_green else 0,
                 1 if live.target_touched else 0, live.target_touch_count,
                 live.target_first_touched_at, live.target_total_visible_seconds,
                 live.exit_fill_detected_by or "rest",

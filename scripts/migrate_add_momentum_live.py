@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS momentum_live_trades (
     bid_at_60s                      DECIMAL(10,4),
     bid_at_90s                      DECIMAL(10,4),
     bid_at_120s                     DECIMAL(10,4),
+    went_green                      TINYINT(1),
     target_touched                  TINYINT(1),
     target_touch_count              INT             NOT NULL DEFAULT 0,
     target_first_touched_at         DATETIME(3),

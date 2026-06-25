@@ -27,6 +27,9 @@ from app.momentum_live_trader import (
     compute_full_kelly_fraction,
     compute_position_size,
     compute_live_entry_limit_price,
+    price_to_cents,
+    price_delta_to_cents,
+    determine_ws_shadow_exit_reasons,
     compute_drift_fields,
     compute_actual_pnl,
     build_pause_windows,
@@ -141,6 +144,64 @@ class TestEntryLimitPrice:
     def test_clamps_to_valid_contract_range(self):
         assert compute_live_entry_limit_price(0.995, 0.01) == pytest.approx(0.99)
         assert compute_live_entry_limit_price(0.01, -0.02) == pytest.approx(0.01)
+
+
+class TestExplicitCentsMath:
+    def test_price_to_cents(self):
+        assert price_to_cents(0.074) == pytest.approx(7.4)
+        assert price_to_cents(None) is None
+
+    def test_price_delta_to_cents(self):
+        assert price_delta_to_cents(0.097, 0.074) == pytest.approx(2.3)
+        assert price_delta_to_cents(None, 0.074) is None
+
+
+class TestWSShadowExitCandidates:
+    def test_tp2_tp3_tp5_thresholds(self, monkeypatch):
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TP2_ENABLED", True)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TP3_ENABLED", True)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TP5_ENABLED", True)
+        reasons = determine_ws_shadow_exit_reasons(
+            current_profit_cents=5.0,
+            max_profit_cents=5.0,
+            age_seconds=10.0,
+        )
+        assert "ws_shadow_tp2" in reasons
+        assert "ws_shadow_tp3" in reasons
+        assert "ws_shadow_tp5" in reasons
+
+    def test_profit_protection_trigger(self, monkeypatch):
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_ENABLED", True)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_TRIGGER_CENTS", 3.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_FLOOR_CENTS", 1.0)
+        reasons = determine_ws_shadow_exit_reasons(
+            current_profit_cents=1.0,
+            max_profit_cents=3.0,
+            age_seconds=10.0,
+        )
+        assert "ws_shadow_profit_protection" in reasons
+
+    def test_giveback_trigger(self, monkeypatch):
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_ENABLED", True)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_TRIGGER_CENTS", 2.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_FLOOR_CENTS", 0.0)
+        reasons = determine_ws_shadow_exit_reasons(
+            current_profit_cents=0.0,
+            max_profit_cents=2.0,
+            age_seconds=10.0,
+        )
+        assert "ws_shadow_giveback" in reasons
+
+    def test_time_progress_trigger(self, monkeypatch):
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_ENABLED", True)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_SECONDS", 60.0)
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS", 0.0)
+        reasons = determine_ws_shadow_exit_reasons(
+            current_profit_cents=0.0,
+            max_profit_cents=1.0,
+            age_seconds=60.0,
+        )
+        assert "ws_shadow_time_progress" in reasons
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -874,6 +935,120 @@ class TestEntryCooldownBehavior:
 
         assert trader._cooldown_until[7] == pytest.approx(150.0)
         assert 7 not in trader._active
+
+
+class TestTradeMetricTracking:
+    def test_update_trade_metrics_tracks_green_and_mfe_in_cents(self):
+        trader = object.__new__(MomentumLiveTrader)
+        live = _ActiveLive(
+            live_trade_id=1,
+            market_id=1,
+            contract_id=1,
+            market_ticker="KXBTC15M-TEST",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.20,
+            horizon_ts=220.0,
+            requested_contracts=5,
+            status="ACTIVE",
+            filled_contracts=5,
+            actual_entry_price=0.20,
+            entry_fill_ts=100.0,
+        )
+
+        trader._update_trade_metrics(
+            live,
+            bid=0.223,
+            quote_age=0.5,
+            spread=0.01,
+            captured_at=datetime.fromtimestamp(130.0, tz=timezone.utc),
+        )
+
+        assert live.went_green is True
+        assert live.max_bid_after_entry == pytest.approx(0.223)
+        assert live.max_profit_cents == pytest.approx(2.3)
+        assert live.time_to_max_bid_seconds == pytest.approx(30.0)
+        assert live.seconds_above_1c == pytest.approx(30.0)
+        assert live.seconds_above_2c == pytest.approx(30.0)
+        assert live.seconds_above_3c == pytest.approx(0.0)
+        assert live.bid_at_30s == pytest.approx(0.223)
+
+    def test_ws_shadow_mode_disabled_records_nothing(self, monkeypatch):
+        trader = object.__new__(MomentumLiveTrader)
+        recorded = []
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_EXIT_SHADOW", False)
+        trader._record_ws_shadow_exit = lambda *args, **kwargs: recorded.append(kwargs)
+        live = _ActiveLive(
+            live_trade_id=2,
+            market_id=1,
+            contract_id=1,
+            market_ticker="KXBTC15M-TEST",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.20,
+            horizon_ts=220.0,
+            requested_contracts=5,
+            status="ACTIVE",
+            filled_contracts=5,
+            actual_entry_price=0.20,
+            entry_fill_ts=100.0,
+        )
+
+        trader._update_trade_metrics(
+            live,
+            bid=0.230,
+            quote_age=0.5,
+            spread=0.01,
+            captured_at=datetime.fromtimestamp(130.0, tz=timezone.utc),
+        )
+
+        assert recorded == []
+
+    def test_ws_shadow_first_trigger_only(self, monkeypatch):
+        trader = object.__new__(MomentumLiveTrader)
+        inserts = []
+        monkeypatch.setattr(config, "MOMENTUM_LIVE_WS_EXIT_SHADOW", True)
+        monkeypatch.setattr("app.momentum_live_trader.fetch_one", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "app.momentum_live_trader.execute_query",
+            lambda sql, params=(): inserts.append(params),
+        )
+        live = _ActiveLive(
+            live_trade_id=3,
+            market_id=1,
+            contract_id=1,
+            market_ticker="KXBTC15M-TEST",
+            side="YES",
+            signal_at=datetime.now(timezone.utc),
+            signal_ts=100.0,
+            entry_ask=0.20,
+            horizon_ts=220.0,
+            requested_contracts=5,
+            status="ACTIVE",
+            filled_contracts=5,
+            actual_entry_price=0.20,
+            entry_fill_ts=100.0,
+        )
+
+        trader._maybe_record_ws_shadow_exits(
+            live,
+            bid=0.230,
+            captured_at=datetime.fromtimestamp(130.0, tz=timezone.utc),
+            current_profit_cents=3.0,
+            age_seconds=30.0,
+        )
+        trader._maybe_record_ws_shadow_exits(
+            live,
+            bid=0.231,
+            captured_at=datetime.fromtimestamp(131.0, tz=timezone.utc),
+            current_profit_cents=3.1,
+            age_seconds=31.0,
+        )
+
+        tp3_rows = [params for params in inserts if params[3] == "ws_shadow_tp3"]
+        assert len(tp3_rows) == 1
 
 
 class TestAggressiveEntrySubmission:

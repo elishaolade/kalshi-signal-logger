@@ -184,6 +184,49 @@ MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS = float(
     os.getenv("MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS", "20")
 )
 
+# ── WebSocket shadow-only exit audit (diagnostics only) ───────────────────────
+# These rules never place/cancel/modify real orders. They only record the first
+# time a hypothetical WS-aware exit would have triggered for a live trade.
+MOMENTUM_LIVE_WS_EXIT_SHADOW = _env_bool("MOMENTUM_LIVE_WS_EXIT_SHADOW", "false")
+MOMENTUM_LIVE_WS_SHADOW_TP2_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_TP2_ENABLED", "true"
+)
+MOMENTUM_LIVE_WS_SHADOW_TP3_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_TP3_ENABLED", "true"
+)
+MOMENTUM_LIVE_WS_SHADOW_TP5_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_TP5_ENABLED", "true"
+)
+MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_ENABLED", "true"
+)
+# Shadow-exit thresholds below are literal cents, not repo price units:
+# 3 means +3c, 1 means +1c, 0 means breakeven.
+MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_TRIGGER_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_TRIGGER_CENTS", "3")
+)
+MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_FLOOR_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_PROFIT_PROTECTION_FLOOR_CENTS", "1")
+)
+MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_ENABLED", "true"
+)
+MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_TRIGGER_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_TRIGGER_CENTS", "2")
+)
+MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_FLOOR_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_GIVEBACK_FLOOR_CENTS", "0")
+)
+MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_ENABLED = _env_bool(
+    "MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_ENABLED", "true"
+)
+MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_SECONDS", "60")
+)
+MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS", "0")
+)
+
 # ── Optional exit experiments (disabled by default) ───────────────────────────
 MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
 MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.05"))

@@ -42,6 +42,7 @@ _COLUMNS = [
     ("bid_at_60s", "DECIMAL(10,4) DEFAULT NULL"),
     ("bid_at_90s", "DECIMAL(10,4) DEFAULT NULL"),
     ("bid_at_120s", "DECIMAL(10,4) DEFAULT NULL"),
+    ("went_green", "TINYINT(1) DEFAULT NULL"),
     ("target_touched", "TINYINT(1) DEFAULT NULL"),
     ("target_touch_count", "INT NOT NULL DEFAULT 0"),
     ("target_first_touched_at", "DATETIME(3) DEFAULT NULL"),

@@ -52,6 +52,13 @@ def _row(label: str, value: str, width: int = 34) -> None:
     print(f"  {label:<{width}} {value}")
 
 
+def _print_notes() -> None:
+    print("  Note: projected_profit_cents is the shadow outcome for the completed")
+    print("  trade's projected exit path, not the target profit assumed at entry.")
+    print("  Values are stored in repo price units where 0.05 = 5 cents, even")
+    print("  when some legacy column names still end in '_cents'.")
+
+
 def _fmt_num(v: Optional[float], nd: int = 4, signed: bool = False) -> str:
     if v is None:
         return "n/a"
@@ -64,6 +71,12 @@ def _fmt_pct(v: Optional[float]) -> str:
 
 def _safe_float(v) -> Optional[float]:
     return float(v) if v is not None else None
+
+
+def _repo_units_to_cents(v: Optional[float]) -> Optional[float]:
+    if v is None:
+        return None
+    return round(float(v) * 100.0, 4)
 
 
 def _build_time_filter(hours: Optional[int]) -> tuple[str, tuple]:
@@ -92,6 +105,7 @@ def _load_live_rows(hours: Optional[int]) -> list[dict]:
                seconds_above_1c, seconds_above_2c, seconds_above_3c,
                seconds_above_4c, seconds_above_5c,
                bid_at_30s, bid_at_60s, bid_at_90s, bid_at_120s,
+               went_green,
                target_touched, target_touch_count, target_first_touched_at,
                target_total_visible_seconds,
                entry_fill_detected_by, exit_fill_detected_by,
@@ -129,8 +143,45 @@ def _load_guardrails(hours: Optional[int]) -> list[dict]:
     )
 
 
+def _table_exists(table: str) -> bool:
+    row = fetch_one(
+        "SELECT COUNT(*) AS n FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+        (table,),
+    )
+    return bool(row and int(row["n"]) > 0)
+
+
+def _load_shadow_exits(rows: list[dict]) -> list[dict]:
+    if not rows or not _table_exists("momentum_live_shadow_exits"):
+        return []
+    trade_ids = [int(r["id"]) for r in rows if r.get("id") is not None]
+    if not trade_ids:
+        return []
+    placeholders = ",".join(["%s"] * len(trade_ids))
+    return fetch_all(
+        f"""
+        SELECT id, live_trade_id, ticker, side, shadow_exit_reason,
+               triggered_at, age_seconds, exit_price, profit_cents,
+               current_profit_cents, max_profit_cents, created_at
+        FROM momentum_live_shadow_exits
+        WHERE live_trade_id IN ({placeholders})
+        ORDER BY triggered_at DESC, id DESC
+        """,
+        tuple(trade_ids),
+    )
+
+
+def _completed_filled_rows(rows: Iterable[dict]) -> list[dict]:
+    return [
+        r for r in rows
+        if r.get("status") == "COMPLETE"
+        and int(r.get("filled_contracts") or 0) > 0
+    ]
+
+
 def _summarize_completed(rows: Iterable[dict]) -> dict[str, Optional[float]]:
-    completed = [r for r in rows if r.get("status") == "COMPLETE"]
+    completed = _completed_filled_rows(rows)
     pnls = [_safe_float(r.get("actual_profit_cents")) for r in completed]
     pnls = [p for p in pnls if p is not None]
     projected = [_safe_float(r.get("projected_profit_cents")) for r in completed]
@@ -152,7 +203,7 @@ def _summarize_completed(rows: Iterable[dict]) -> dict[str, Optional[float]]:
         "avg_exit_drift": statistics.mean(
             [_safe_float(r.get("exit_price_drift_cents")) for r in completed if r.get("exit_price_drift_cents") is not None]
         ) if any(r.get("exit_price_drift_cents") is not None for r in completed) else None,
-        "avg_profit_delta": statistics.mean(
+        "avg_live_decay": statistics.mean(
             [_safe_float(r.get("profit_delta_cents")) for r in completed if r.get("profit_delta_cents") is not None]
         ) if any(r.get("profit_delta_cents") is not None for r in completed) else None,
         "avg_exec_drift": statistics.mean(
@@ -175,6 +226,55 @@ def _bucket_label(price: Optional[float], cutoffs: list[float]) -> str:
     return f"[{cutoffs[-1]:.2f},1.00]"
 
 
+def _entry_price_bucket_cents(price: Optional[float]) -> str:
+    if price is None:
+        return "unknown"
+    cents = float(price) * 100.0
+    if cents < 5:
+        return "0-5c"
+    if cents < 10:
+        return "5-10c"
+    if cents < 15:
+        return "10-15c"
+    if cents < 25:
+        return "15-25c"
+    if cents < 40:
+        return "25-40c"
+    return "40c+"
+
+
+def _went_green(row: dict) -> bool:
+    return bool(
+        int(row.get("went_green") or 0) == 1
+        or (_safe_float(row.get("max_profit_cents")) or 0.0) > 0
+    )
+
+
+def _fixed_time_failure_bucket(row: dict) -> str:
+    max_profit_cents = _safe_float(row.get("max_profit_cents")) or 0.0
+    if not _went_green(row):
+        return "never green"
+    for threshold in (5, 4, 3, 2, 1):
+        if max_profit_cents >= threshold:
+            return f"reached +{threshold}c then failed"
+    return "went green (<1c) then failed"
+
+
+def _shadow_exits_by_trade(shadow_rows: Iterable[dict]) -> dict[int, list[dict]]:
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for row in shadow_rows:
+        grouped[int(row["live_trade_id"])].append(row)
+    for events in grouped.values():
+        events.sort(
+            key=lambda r: (
+                _safe_float(r.get("profit_cents")) if r.get("profit_cents") is not None else float("-inf"),
+                str(r.get("triggered_at") or ""),
+            ),
+            reverse=True,
+        )
+    return grouped
+
+
 def _print_completed_summary(rows: list[dict]) -> None:
     summary = _summarize_completed(rows)
     _h2("Completed Live Trades")
@@ -182,19 +282,21 @@ def _print_completed_summary(rows: list[dict]) -> None:
     _row("Wins:", str(summary["wins"]))
     _row("Win rate:", _fmt_pct(summary["win_rate"]))
     _row("Avg actual pnl / contract:", _fmt_num(summary["avg_actual_pnl"], signed=True))
-    _row("Avg projected pnl / contract:", _fmt_num(summary["avg_projected_pnl"], signed=True))
+    _row(
+        "Avg projected exit-path pnl / contract:",
+        _fmt_num(summary["avg_projected_pnl"], signed=True),
+    )
     _row("Avg entry drift:", _fmt_num(summary["avg_entry_drift"], signed=True))
     _row("Avg exit drift:", _fmt_num(summary["avg_exit_drift"], signed=True))
-    _row("Avg profit delta:", _fmt_num(summary["avg_profit_delta"], signed=True))
+    _row("Avg live decay:", _fmt_num(summary["avg_live_decay"], signed=True))
     _row("Avg execution drift:", _fmt_num(summary["avg_exec_drift"], signed=True))
     _row("Avg MFE:", _fmt_num(summary["avg_mfe"], signed=True))
 
 
 def _print_group_breakdown(rows: list[dict], title: str, key_fn) -> None:
     groups: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        if row.get("status") == "COMPLETE":
-            groups[str(key_fn(row))].append(row)
+    for row in _completed_filled_rows(rows):
+        groups[str(key_fn(row))].append(row)
 
     _h2(title)
     if not groups:
@@ -204,7 +306,7 @@ def _print_group_breakdown(rows: list[dict], title: str, key_fn) -> None:
     print("  group".ljust(18) + "n".rjust(4) + "  " +
           "win".rjust(8) + "  " +
           "act pnl".rjust(10) + "  " +
-          "proj pnl".rjust(10) + "  " +
+          "proj path".rjust(10) + "  " +
           "delta".rjust(10) + "  " +
           "exec drift".rjust(10) + "  " +
           "mfe".rjust(8))
@@ -216,8 +318,9 @@ def _print_group_breakdown(rows: list[dict], title: str, key_fn) -> None:
             f"{_fmt_pct(stats['win_rate']):>8}  "
             f"{_fmt_num(stats['avg_actual_pnl'], signed=True):>10}  "
             f"{_fmt_num(stats['avg_projected_pnl'], signed=True):>10}  "
-            f"{_fmt_num(stats['avg_profit_delta'], signed=True):>10}  "
-            f"{_fmt_num(stats['avg_exec_drift'], signed=True):>10}"
+            f"{_fmt_num(stats['avg_live_decay'], signed=True):>10}  "
+            f"{_fmt_num(stats['avg_exec_drift'], signed=True):>10}  "
+            f"{_fmt_num(stats['avg_mfe'], signed=True):>8}"
         )
 
 
@@ -264,7 +367,6 @@ def _print_spread_guardrails(guardrails: list[dict]) -> None:
     _row("blocked_spread events:", str(len(blocked)))
     if not blocked:
         print("  No blocked spread events in this window.")
-        print("  Note: completed live trades do not currently persist entry spread.")
         return
 
     spreads = [_parse_spread_value(str(g.get("reason") or "")) for g in blocked]
@@ -273,19 +375,18 @@ def _print_spread_guardrails(guardrails: list[dict]) -> None:
         _row("Avg blocked spread:", _fmt_num(statistics.mean(spreads)))
         _row("Min blocked spread:", _fmt_num(min(spreads)))
         _row("Max blocked spread:", _fmt_num(max(spreads)))
-    print("  Note: completed live trades do not currently persist entry spread,")
-    print("  so this section only reflects trades blocked by the spread gate.")
+    print("  This section reflects trades blocked by the spread gate.")
 
 
 def _print_recent_completed(rows: list[dict], limit: int = 10) -> None:
-    completed = [r for r in rows if r.get("status") == "COMPLETE"][:limit]
+    completed = _completed_filled_rows(rows)[:limit]
     _h2(f"Recent Completed Trades (last {limit})")
     if not completed:
         print("  No completed live trades yet.")
         return
     hdr = (
         "  signal_at            ticker                 sd  "
-        "exit_reason     p_entry a_entry p_exit a_exit p_pnl  a_pnl  e_drift"
+        "exit_reason     p_entry a_entry p_exit a_exit p_path a_pnl  e_drift"
     )
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
@@ -307,11 +408,11 @@ def _print_recent_completed(rows: list[dict], limit: int = 10) -> None:
 
 
 def _print_target_touch(rows: list[dict]) -> None:
-    completed = [r for r in rows if r.get("status") == "COMPLETE"]
+    completed = _completed_filled_rows(rows)
     touched = [r for r in completed if int(r.get("target_touched") or 0) == 1]
     fixed_time_green = [
         r for r in completed
-        if (r.get("exit_reason") == "fixed_time" or r.get("exit_reason") == "fixed_time".upper())
+        if str(r.get("exit_reason") or "").lower() == "fixed_time"
         and _safe_float(r.get("actual_profit_cents")) is not None
         and _safe_float(r.get("actual_profit_cents")) < 0
     ]
@@ -328,8 +429,57 @@ def _print_target_touch(rows: list[dict]) -> None:
         _row(f"Fixed-time losers that saw +{cents}c:", str(count))
 
 
+def _print_fixed_time_audit(rows: list[dict]) -> None:
+    completed = _completed_filled_rows(rows)
+    fixed = [r for r in completed if str(r.get("exit_reason") or "").lower() == "fixed_time"]
+    losers = [r for r in fixed if (_safe_float(r.get("actual_profit_cents")) or 0.0) < 0]
+
+    _h2("Fixed-Time Exit Audit")
+    _row("Fixed-time exits:", str(len(fixed)))
+    if not fixed:
+        print("  No fixed-time exits in this window.")
+        return
+
+    avg_pnl = statistics.mean(
+        [_safe_float(r.get("actual_profit_cents")) for r in fixed if r.get("actual_profit_cents") is not None]
+    ) if any(r.get("actual_profit_cents") is not None for r in fixed) else None
+    avg_mfe = statistics.mean(
+        [_safe_float(r.get("max_profit_cents")) for r in fixed if r.get("max_profit_cents") is not None]
+    ) if any(r.get("max_profit_cents") is not None for r in fixed) else None
+    avg_ttmfe = statistics.mean(
+        [_safe_float(r.get("time_to_max_bid_seconds")) for r in fixed if r.get("time_to_max_bid_seconds") is not None]
+    ) if any(r.get("time_to_max_bid_seconds") is not None for r in fixed) else None
+    went_green_count = sum(1 for r in fixed if _went_green(r))
+
+    _row("Average fixed-time pnl:", _fmt_num(avg_pnl, signed=True))
+    _row("Went green first:", f"{went_green_count} ({(went_green_count / len(fixed)) * 100:.1f}%)")
+    for threshold in (1, 2, 3, 4, 5):
+        count = sum(1 for r in fixed if (_safe_float(r.get("max_profit_cents")) or 0.0) >= threshold)
+        _row(f"Reached +{threshold}c:", str(count))
+    _row("Average max favorable excursion:", _fmt_num(avg_mfe, signed=True))
+    _row("Average time to MFE (s):", _fmt_num(avg_ttmfe, nd=2))
+
+    _h2("Fixed-Time Loser Classification")
+    if not losers:
+        print("  No fixed-time losers in this window.")
+        return
+    buckets: dict[str, int] = defaultdict(int)
+    for row in losers:
+        buckets[_fixed_time_failure_bucket(row)] += 1
+    for label in (
+        "never green",
+        "went green (<1c) then failed",
+        "reached +1c then failed",
+        "reached +2c then failed",
+        "reached +3c then failed",
+        "reached +4c then failed",
+        "reached +5c then failed",
+    ):
+        _row(label + ":", str(buckets.get(label, 0)))
+
+
 def _print_ws_stats(rows: list[dict]) -> None:
-    completed = [r for r in rows if r.get("status") == "COMPLETE"]
+    completed = _completed_filled_rows(rows)
     _h2("WebSocket Quote Stats")
     if not completed:
         print("  No completed live trades yet.")
@@ -342,6 +492,148 @@ def _print_ws_stats(rows: list[dict]) -> None:
     ):
         values = [_safe_float(r.get(key)) for r in completed if r.get(key) is not None]
         _row(label, _fmt_num(statistics.mean(values) if values else None, nd=4))
+
+
+def _print_ws_shadow_exit_audit(rows: list[dict], shadow_rows: list[dict]) -> None:
+    _h2("WebSocket Shadow Exit Audit")
+    if not shadow_rows:
+        print("  No WebSocket shadow-exit data yet.")
+        if not _table_exists("momentum_live_shadow_exits"):
+            print("  Run scripts/migrate_add_momentum_live_shadow_exits.py, then enable")
+            print("  MOMENTUM_LIVE_WS_EXIT_SHADOW=true to start collecting it.")
+        return
+
+    completed = {int(r["id"]): r for r in _completed_filled_rows(rows) if r.get("id") is not None}
+    grouped = _shadow_exits_by_trade(shadow_rows)
+    completed_with_shadow = {
+        trade_id: completed[trade_id]
+        for trade_id in grouped
+        if trade_id in completed
+    }
+
+    _row("Completed filled trades with shadow data:", str(len(completed_with_shadow)))
+    counts = defaultdict(int)
+    for event in shadow_rows:
+        counts[str(event.get("shadow_exit_reason") or "unknown")] += 1
+    for reason, label in (
+        ("ws_shadow_tp2", "TP2 triggered:"),
+        ("ws_shadow_tp3", "TP3 triggered:"),
+        ("ws_shadow_tp5", "TP5 triggered:"),
+        ("ws_shadow_profit_protection", "Profit protection triggered:"),
+        ("ws_shadow_giveback", "Giveback triggered:"),
+        ("ws_shadow_time_progress", "Time-progress triggered:"),
+    ):
+        _row(label, str(counts.get(reason, 0)))
+
+    fixed_time_losers = [
+        row for row in completed_with_shadow.values()
+        if str(row.get("exit_reason") or "").lower() == "fixed_time"
+        and (_safe_float(row.get("actual_profit_cents")) or 0.0) < 0
+    ]
+    _row("Fixed-time losers with shadow data:", str(len(fixed_time_losers)))
+
+    candidate_green_counts = defaultdict(int)
+    best_shadow_pnls_cents: list[float] = []
+    actual_fixed_time_pnls_cents: list[float] = []
+    improvements_cents: list[float] = []
+    recent_examples: list[tuple[dict, dict]] = []
+
+    for row in fixed_time_losers:
+        trade_id = int(row["id"])
+        events = grouped.get(trade_id, [])
+        if not events:
+            continue
+        actual_pnl_cents = _repo_units_to_cents(_safe_float(row.get("actual_profit_cents")))
+        if actual_pnl_cents is None:
+            continue
+        actual_fixed_time_pnls_cents.append(actual_pnl_cents)
+        for reason in (
+            "ws_shadow_tp2",
+            "ws_shadow_tp3",
+            "ws_shadow_tp5",
+            "ws_shadow_profit_protection",
+            "ws_shadow_giveback",
+            "ws_shadow_time_progress",
+        ):
+            event = next((e for e in events if e.get("shadow_exit_reason") == reason), None)
+            if not event:
+                continue
+            profit_cents = _safe_float(event.get("profit_cents"))
+            if profit_cents is not None and profit_cents >= 0:
+                candidate_green_counts[reason] += 1
+
+        best_event = max(
+            events,
+            key=lambda e: (
+                _safe_float(e.get("profit_cents")) if e.get("profit_cents") is not None else float("-inf"),
+                str(e.get("triggered_at") or ""),
+            ),
+        )
+        best_profit_cents = _safe_float(best_event.get("profit_cents"))
+        if best_profit_cents is None:
+            continue
+        best_shadow_pnls_cents.append(best_profit_cents)
+        improvements_cents.append(best_profit_cents - actual_pnl_cents)
+        recent_examples.append((row, best_event))
+
+    for reason, label in (
+        ("ws_shadow_tp2", "Fixed-time losers TP2 green:"),
+        ("ws_shadow_tp3", "Fixed-time losers TP3 green:"),
+        ("ws_shadow_tp5", "Fixed-time losers TP5 green:"),
+        ("ws_shadow_profit_protection", "Fixed-time losers profit-protection green:"),
+        ("ws_shadow_giveback", "Fixed-time losers giveback green:"),
+        ("ws_shadow_time_progress", "Fixed-time losers time-progress green:"),
+    ):
+        _row(label, str(candidate_green_counts.get(reason, 0)))
+
+    _row(
+        "Avg actual fixed-time loser pnl (c):",
+        _fmt_num(statistics.mean(actual_fixed_time_pnls_cents) if actual_fixed_time_pnls_cents else None, signed=True),
+    )
+    _row(
+        "Avg best shadow exit pnl (c):",
+        _fmt_num(statistics.mean(best_shadow_pnls_cents) if best_shadow_pnls_cents else None, signed=True),
+    )
+    _row(
+        "Avg improvement vs actual (c):",
+        _fmt_num(statistics.mean(improvements_cents) if improvements_cents else None, signed=True),
+    )
+
+    print()
+    print("  Note: WebSocket shadow exits are simulated decision triggers only.")
+    print("  They do not prove fillability unless depth/order-fill simulation is added.")
+
+    _h2("WebSocket Shadow Exit Examples")
+    if not recent_examples:
+        print("  No fixed-time loser examples with shadow data yet.")
+        return
+    recent_examples.sort(
+        key=lambda pair: str(pair[0].get("signal_at") or ""),
+        reverse=True,
+    )
+    hdr = (
+        "  signal_at            ticker                 sd  actual_reason    "
+        "actual(c)  best_shadow_reason               best(c) improve(c)"
+    )
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for row, best_event in recent_examples[:10]:
+        actual_pnl_cents = _repo_units_to_cents(_safe_float(row.get("actual_profit_cents")))
+        best_profit_cents = _safe_float(best_event.get("profit_cents"))
+        improvement = (
+            None if actual_pnl_cents is None or best_profit_cents is None
+            else best_profit_cents - actual_pnl_cents
+        )
+        print(
+            f"  {str(row['signal_at'])[:19]:<19}  "
+            f"{str(row['market_ticker'])[:21]:<21}  "
+            f"{str(row['side']):<2}  "
+            f"{str(row.get('exit_reason') or '')[:14]:<14}  "
+            f"{_fmt_num(actual_pnl_cents, 2, signed=True):>9}  "
+            f"{str(best_event.get('shadow_exit_reason') or '')[:31]:<31}  "
+            f"{_fmt_num(best_profit_cents, 2, signed=True):>7}  "
+            f"{_fmt_num(improvement, 2, signed=True):>10}"
+        )
 
 
 def main() -> None:
@@ -357,6 +649,7 @@ def main() -> None:
     )
     rows = _load_live_rows(args.hours)
     guardrails = _load_guardrails(args.hours)
+    shadow_rows = _load_shadow_exits(rows)
 
     label = (
         f"Momentum LIVE Diagnostics — Last {args.hours}h"
@@ -366,6 +659,8 @@ def main() -> None:
     _h1(label)
     _row("Rows loaded:", str(len(rows)))
     _row("Guardrail rows loaded:", str(len(guardrails)))
+    print()
+    _print_notes()
 
     _print_completed_summary(rows)
     _print_group_breakdown(rows, "Completed Trades by Side", lambda r: r.get("side") or "unknown")
@@ -377,10 +672,12 @@ def main() -> None:
     _print_group_breakdown(
         rows,
         "Completed Trades by Projected Entry Bucket",
-        lambda r: _bucket_label(_safe_float(r.get("projected_entry_ask")), cutoffs),
+        lambda r: _entry_price_bucket_cents(_safe_float(r.get("projected_entry_ask"))),
     )
     _print_canceled_entries(rows, cutoffs)
+    _print_fixed_time_audit(rows)
     _print_target_touch(rows)
+    _print_ws_shadow_exit_audit(rows, shadow_rows)
     _print_ws_stats(rows)
     _print_spread_guardrails(guardrails)
     _print_recent_completed(rows)
