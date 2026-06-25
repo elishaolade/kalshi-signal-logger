@@ -10,6 +10,7 @@ import pytest
 
 from app.kalshi_ws import (
     KalshiMarketStream,
+    build_connect_kwargs,
     compute_depth_at_or_better,
     compute_spread,
     infer_no_ask,
@@ -29,6 +30,26 @@ class TestQuoteMath:
     def test_depth_at_or_better(self):
         levels = {0.25: 10, 0.24: 7, 0.20: 5}
         assert compute_depth_at_or_better(levels, 0.24) == pytest.approx(17.0)
+
+
+class TestConnectKwargs:
+    def test_uses_additional_headers_when_supported(self, monkeypatch):
+        class FakeWebsockets:
+            def connect(self, uri, *, additional_headers=None, ping_interval=None):
+                return None
+
+        monkeypatch.setattr("app.kalshi_ws.websockets", FakeWebsockets())
+        kwargs = build_connect_kwargs({"Authorization": "x"})
+        assert kwargs == {"additional_headers": {"Authorization": "x"}}
+
+    def test_uses_extra_headers_when_supported(self, monkeypatch):
+        class FakeWebsockets:
+            def connect(self, uri, *, extra_headers=None, ping_interval=None):
+                return None
+
+        monkeypatch.setattr("app.kalshi_ws.websockets", FakeWebsockets())
+        kwargs = build_connect_kwargs({"Authorization": "x"})
+        assert kwargs == {"extra_headers": {"Authorization": "x"}}
 
 
 class TestStreamCache:

@@ -15,6 +15,7 @@ raising. The live trader only uses cached values when they are fresh.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import threading
@@ -33,6 +34,27 @@ try:
     import websockets
 except Exception:  # pragma: no cover - optional dependency guard
     websockets = None
+
+
+def build_connect_kwargs(headers: dict[str, str]) -> dict[str, Any]:
+    """
+    Support multiple `websockets` client APIs.
+
+    Older releases accept `extra_headers=...`; newer releases renamed this to
+    `additional_headers=...`. We inspect the installed runtime and choose the
+    matching kwarg so the WS layer degrades less awkwardly across environments.
+    """
+    if websockets is None:
+        return {}
+    try:
+        params = inspect.signature(websockets.connect).parameters
+    except Exception:
+        return {"extra_headers": headers}
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    if "extra_headers" in params:
+        return {"extra_headers": headers}
+    return {}
 
 
 def infer_yes_ask(best_no_bid: Optional[float]) -> Optional[float]:
@@ -438,9 +460,10 @@ class KalshiMarketStream:
             try:
                 url = self._ws_url()
                 headers = self._ws_headers(url)
+                connect_kwargs = build_connect_kwargs(headers)
                 async with websockets.connect(
                     url,
-                    extra_headers=headers,
+                    **connect_kwargs,
                     ping_interval=config.MOMENTUM_LIVE_WS_PING_INTERVAL_SECONDS,
                     ping_timeout=config.MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS,
                     open_timeout=config.KALSHI_API_TIMEOUT_SECONDS,
@@ -502,4 +525,3 @@ class KalshiMarketStream:
             for payload in payloads:
                 await ws.send(json.dumps(payload))
         await ws.send(json.dumps({"type": "subscribe", "channel": "user_orders"}))
-
