@@ -302,6 +302,150 @@ def compute_actual_pnl(
     }
 
 
+# ── True-cents slippage / decay helpers ──────────────────────────────────────
+# UNIT NOTE: The existing *_drift_cents columns store price-unit fractions
+# (0.05 = 5 cents).  These helpers return TRUE cents (5.0 = 5 cents) and feed
+# the new *_slippage_cents / *_pnl_cents columns added by
+# scripts/migrate_add_momentum_live_telemetry.py.
+
+def compute_entry_slippage_cents(
+    ideal_entry_ask: Optional[float],
+    actual_entry_price: Optional[float],
+) -> Optional[float]:
+    """
+    Entry slippage in true cents.
+    Positive => live paid more than the shadow/logger entry.
+    """
+    if ideal_entry_ask is None or actual_entry_price is None:
+        return None
+    return round((float(actual_entry_price) - float(ideal_entry_ask)) * 100.0, 4)
+
+
+def compute_exit_slippage_cents(
+    ideal_exit_bid: Optional[float],
+    actual_exit_price: Optional[float],
+) -> Optional[float]:
+    """
+    Exit slippage in true cents.
+    Positive => live received less than the shadow/logger exit.
+    """
+    if ideal_exit_bid is None or actual_exit_price is None:
+        return None
+    return round((float(ideal_exit_bid) - float(actual_exit_price)) * 100.0, 4)
+
+
+def compute_projected_path_pnl_cents(
+    ideal_entry_ask: Optional[float],
+    ideal_exit_bid: Optional[float],
+) -> Optional[float]:
+    """
+    Shadow path gain in true cents, NO fees.
+    """
+    if ideal_entry_ask is None or ideal_exit_bid is None:
+        return None
+    return round((float(ideal_exit_bid) - float(ideal_entry_ask)) * 100.0, 4)
+
+
+def compute_actual_path_pnl_cents(
+    actual_entry_price: Optional[float],
+    actual_exit_price: Optional[float],
+) -> Optional[float]:
+    """
+    Live path gain in true cents, NO fees.
+    Distinct from actual_profit_cents (which includes Kalshi fees).
+    """
+    if actual_entry_price is None or actual_exit_price is None:
+        return None
+    return round((float(actual_exit_price) - float(actual_entry_price)) * 100.0, 4)
+
+
+def compute_live_decay_cents(
+    projected_path_pnl_cents: Optional[float],
+    actual_path_pnl_cents: Optional[float],
+) -> Optional[float]:
+    """
+    Live underperformance vs shadow path in true cents.
+    Positive => live underperformed the logger/shadow path.
+    """
+    if projected_path_pnl_cents is None or actual_path_pnl_cents is None:
+        return None
+    return round(float(projected_path_pnl_cents) - float(actual_path_pnl_cents), 4)
+
+
+# ── Bucket classification helpers ─────────────────────────────────────────────
+
+def bucket_entry_price(price: Optional[float]) -> str:
+    """Classify contract entry price into broad range buckets."""
+    if price is None:
+        return "unknown"
+    p = float(price)
+    if p < 0.10:
+        return "0.00-0.10"
+    if p < 0.25:
+        return "0.10-0.25"
+    if p < 0.50:
+        return "0.25-0.50"
+    if p < 0.70:
+        return "0.50-0.70"
+    if p < 0.85:
+        return "0.70-0.85"
+    return "0.85-1.00"
+
+
+def bucket_spread(spread_price_units: Optional[float]) -> str:
+    """
+    Classify spread (in repo price-unit fractions, 0.01 = 1 cent) into buckets.
+    Spread of 0.01 = 1c, 0.02 = 2c, 0.04 = 4c.
+    """
+    if spread_price_units is None:
+        return "unknown"
+    c = float(spread_price_units) * 100.0
+    if c < 1.0:
+        return "0-1c"
+    if c < 2.0:
+        return "1-2c"
+    if c < 4.0:
+        return "2-4c"
+    return "4c+"
+
+
+def bucket_quote_age(age_seconds: Optional[float]) -> str:
+    """Classify quote age in seconds."""
+    if age_seconds is None:
+        return "unknown"
+    s = float(age_seconds)
+    if s < 1.0:
+        return "0-1s"
+    if s < 2.0:
+        return "1-2s"
+    if s < 5.0:
+        return "2-5s"
+    return "5s+"
+
+
+def bucket_time_remaining(seconds: Optional[float]) -> str:
+    """Classify time remaining in the hold window at exit signal."""
+    if seconds is None:
+        return "unknown"
+    s = float(seconds)
+    if s < 60.0:
+        return "0-60s"
+    if s < 180.0:
+        return "60-180s"
+    if s < 300.0:
+        return "180-300s"
+    return "300s+"
+
+
+def bucket_filled_contracts(requested: int, filled: int) -> str:
+    """Classify fill completeness."""
+    if filled <= 0:
+        return "zero-fill"
+    if filled < requested:
+        return "partial-fill"
+    return "full-fill"
+
+
 def build_pause_windows(
     rows: list[tuple[Optional[float], Optional[float]]],
     window_sizes,
@@ -851,6 +995,11 @@ class _ActiveLive:
     target_touch_count: int = 0
     target_first_touched_at: Optional[datetime] = None
     target_total_visible_seconds: float = 0.0
+    # Telemetry — order detail captured at submission time
+    entry_order_price:     Optional[float] = None   # limit price POSTed for entry
+    exit_order_price:      Optional[float] = None   # bid price POSTed for first exit
+    quote_age_at_exit_seconds: Optional[float] = None
+
     entry_fill_detected_by: Optional[str] = None
     exit_fill_detected_by: Optional[str] = None
     entry_signal_to_order_ms: Optional[int] = None
@@ -1185,6 +1334,18 @@ class MomentumLiveTrader:
         elif not self._ws.degraded:
             self._ws_stale_guardrail_emitted = False
 
+    def _write_phase(self, live_trade_id: int, phase: str) -> None:
+        try:
+            execute_query(
+                "UPDATE momentum_live_trades SET phase=%s WHERE id=%s",
+                (phase, live_trade_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                "phase column write failed — run migrate_add_momentum_live_telemetry.py: %s",
+                exc,
+            )
+
     def on_tick(
         self,
         market_db_id:  int,
@@ -1455,7 +1616,9 @@ class MomentumLiveTrader:
                 projected_profit_factor, projected_profit_loss_ratio,
                 ws_enabled, ws_quote_age_at_entry, ws_spread_at_entry,
                 ws_entry_best_bid, ws_entry_best_ask, entry_signal_to_order_ms,
-                entry_client_order_id, status, created_at
+                entry_client_order_id,
+                phase, entry_order_price, entry_order_type,
+                status, created_at
             ) VALUES (
                 %s, %s, %s, %s,
                 %s, %s,
@@ -1466,7 +1629,9 @@ class MomentumLiveTrader:
                 %s, %s,
                 %s, %s, %s,
                 %s, %s, %s,
-                %s, 'PENDING_ENTRY', %s
+                %s,
+                'ENTRY_SUBMITTED', %s, 'limit',
+                'PENDING_ENTRY', %s
             )
             """,
             (
@@ -1481,7 +1646,10 @@ class MomentumLiveTrader:
                 1 if ws else 0, _safe(ws_quote_age), _safe(ws_spread),
                 _safe(ws_best_bid), _safe(ws_best_ask),
                 int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
-                coid, now,
+                coid,
+                # phase=ENTRY_SUBMITTED, entry_order_price, entry_order_type=limit
+                _safe(entry_limit_price),
+                now,
             ),
         )
 
@@ -1504,6 +1672,7 @@ class MomentumLiveTrader:
             ws_entry_best_bid=ws_best_bid,
             ws_entry_best_ask=ws_best_ask,
             entry_signal_to_order_ms=int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
+            entry_order_price=entry_limit_price,
         )
 
         # Place the real entry order (limit buy at the observed ask).
@@ -1523,6 +1692,7 @@ class MomentumLiveTrader:
                     "UPDATE momentum_live_trades SET status='REJECTED' WHERE id=%s",
                     (live_trade_id,),
                 )
+                self._write_phase(live_trade_id, "REJECTED")
                 self._record_order_event(
                     live, "entry_rejected", action="buy",
                     requested_count=contracts, limit_price=entry_limit_price,
@@ -1544,9 +1714,14 @@ class MomentumLiveTrader:
         live.entry_ack_ts = datetime.now(timezone.utc).timestamp()
         if live.entry_submit_ts is not None:
             live.entry_order_to_ack_ms = int(max(0.0, (live.entry_ack_ts - live.entry_submit_ts) * 1000.0))
+        entry_submitted_at_dt = (
+            datetime.fromtimestamp(live.entry_submit_ts, tz=timezone.utc)
+            if live.entry_submit_ts is not None else None
+        )
         execute_query(
-            "UPDATE momentum_live_trades SET entry_order_id=%s, entry_order_to_ack_ms=%s WHERE id=%s",
-            (live.entry_order_id, live.entry_order_to_ack_ms, live_trade_id),
+            "UPDATE momentum_live_trades SET entry_order_id=%s, entry_order_to_ack_ms=%s, "
+            "entry_order_submitted_at=%s WHERE id=%s",
+            (live.entry_order_id, live.entry_order_to_ack_ms, entry_submitted_at_dt, live_trade_id),
         )
         self._record_order_event(
             live, "order_acknowledged", action="buy",
@@ -1706,6 +1881,7 @@ class MomentumLiveTrader:
             (count, live.actual_entry_price, live.actual_entry_fees,
              captured_at, live.entry_fill_detected_by, live.entry_ack_to_fill_ms, live.live_trade_id),
         )
+        self._write_phase(live.live_trade_id, "ENTRY_FILLED")
         self._record_order_event(
             live,
             "entry_filled" if count >= live.requested_contracts else "entry_partial",
@@ -1740,6 +1916,7 @@ class MomentumLiveTrader:
             "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
             (live.live_trade_id,),
         )
+        self._write_phase(live.live_trade_id, "CANCELED")
         self._record_order_event(
             live, "entry_canceled", action="buy",
             requested_count=live.requested_contracts, filled_count=0,
@@ -1790,10 +1967,14 @@ class MomentumLiveTrader:
         if live.exit_signal_ts is None:
             live.exit_signal_ts = captured_at.timestamp()
         live.status = "PENDING_EXIT"
+        exit_signal_at_dt = datetime.fromtimestamp(live.exit_signal_ts, tz=timezone.utc)
+        time_remaining = round(max(0.0, live.horizon_ts - live.exit_signal_ts), 2)
         execute_query(
-            "UPDATE momentum_live_trades SET status='PENDING_EXIT', exit_reason=%s WHERE id=%s",
-            (exit_reason, live.live_trade_id),
+            "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
+            "exit_reason=%s, exit_signal_at=%s, time_remaining_in_market_seconds=%s WHERE id=%s",
+            (exit_reason, exit_signal_at_dt, time_remaining, live.live_trade_id),
         )
+        self._write_phase(live.live_trade_id, "EXIT_SIGNALLED")
 
         remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
         if remaining < 1:
@@ -2000,17 +2181,50 @@ class MomentumLiveTrader:
             return
         coid = str(uuid.uuid4())
         live.exit_submit_ts = datetime.now(timezone.utc).timestamp()
+        exit_submitted_at_dt = datetime.fromtimestamp(live.exit_submit_ts, tz=timezone.utc)
         if live.exit_signal_ts is None:
             live.exit_signal_ts = captured_at.timestamp()
             live.exit_signal_to_order_ms = int(max(0.0, (live.exit_submit_ts - live.exit_signal_ts) * 1000.0))
+        if live.exit_signal_ts is not None and live.exit_signal_to_order_ms is None:
+            live.exit_signal_to_order_ms = int(
+                max(0.0, (live.exit_submit_ts - live.exit_signal_ts) * 1000.0)
+            )
         if live.entry_fill_ts is not None:
             live.fill_to_exit_order_ms = int(max(0.0, (live.exit_submit_ts - live.entry_fill_ts) * 1000.0))
+
+        # Capture exit-time market conditions on first exit submission only.
+        is_first_exit_submit = live.exit_order_price is None
+        if is_first_exit_submit:
+            live.exit_order_price = bid
+            ws_at_exit = getattr(self, "_ws", None)
+            live.quote_age_at_exit_seconds = (
+                ws_at_exit.get_quote_age_seconds(live.market_ticker)
+                if ws_at_exit else None
+            )
+            exit_signal_at_dt = (
+                datetime.fromtimestamp(live.exit_signal_ts, tz=timezone.utc)
+                if live.exit_signal_ts else None
+            )
+        else:
+            exit_signal_at_dt = None  # already persisted
+
         execute_query(
             "UPDATE momentum_live_trades SET status='PENDING_EXIT', "
             "exit_client_order_id=%s, exit_reason=%s, fill_to_exit_order_ms=%s, "
-            "exit_signal_to_order_ms=%s WHERE id=%s",
-            (coid, exit_reason, live.fill_to_exit_order_ms, live.exit_signal_to_order_ms, live.live_trade_id),
+            "exit_signal_to_order_ms=%s, exit_order_submitted_at=%s"
+            + (", exit_order_price=%s, exit_order_type='limit', "
+               "quote_age_at_exit_seconds=%s, exit_signal_at=%s"
+               if is_first_exit_submit else "")
+            + " WHERE id=%s",
+            (
+                coid, exit_reason, live.fill_to_exit_order_ms, live.exit_signal_to_order_ms,
+                exit_submitted_at_dt,
+            ) + (
+                (live.exit_order_price, live.quote_age_at_exit_seconds, exit_signal_at_dt)
+                if is_first_exit_submit else ()
+            ) + (live.live_trade_id,),
         )
+        self._write_phase(live.live_trade_id, "EXIT_SUBMITTED")
         self._record_order_event(
             live, "exit_submit_intent", action="sell",
             requested_count=qty, limit_price=bid, client_order_id=coid,
@@ -2139,6 +2353,34 @@ class MomentumLiveTrader:
             round(live.ws_spread_sum / live.ws_spread_samples, 6)
             if live.ws_spread_samples > 0 else None
         )
+        # ── True-cents slippage / decay (distinct from price-unit drift fields) ──
+        # ideal_entry_ask / ideal_exit_bid are the projected shadow prices.
+        entry_slippage = compute_entry_slippage_cents(live.entry_ask, live.actual_entry_price)
+        exit_slippage = compute_exit_slippage_cents(live.projected_exit_bid, actual_exit_price)
+        total_slippage = (
+            round(entry_slippage + exit_slippage, 4)
+            if entry_slippage is not None and exit_slippage is not None else None
+        )
+        proj_path_pnl = compute_projected_path_pnl_cents(live.entry_ask, live.projected_exit_bid)
+        actual_path_pnl = compute_actual_path_pnl_cents(live.actual_entry_price, actual_exit_price)
+        live_decay = compute_live_decay_cents(proj_path_pnl, actual_path_pnl)
+
+        # ── Bucket classification ─────────────────────────────────────────────
+        ep_bucket = bucket_entry_price(live.entry_ask)
+        sp_entry_bucket = bucket_spread(live.ws_spread_at_entry)
+        sp_exit_bucket = bucket_spread(live.ws_exit_spread)
+        qa_entry_bucket = bucket_quote_age(live.ws_quote_age_at_entry)
+        qa_exit_bucket = bucket_quote_age(live.quote_age_at_exit_seconds)
+        # time_remaining_in_market_seconds already persisted at exit signal; re-derive here
+        # from the data that's available (horizon - exit_signal_ts)
+        tr_seconds = (
+            round(max(0.0, live.horizon_ts - live.exit_signal_ts), 2)
+            if live.exit_signal_ts is not None else None
+        )
+        tr_bucket = bucket_time_remaining(tr_seconds)
+        fc_bucket = bucket_filled_contracts(live.requested_contracts, live.filled_contracts)
+        ot_bucket = "limit"
+
         execute_query(
             """
             UPDATE momentum_live_trades SET
@@ -2156,7 +2398,13 @@ class MomentumLiveTrader:
                 profit_delta_cents=%s, expectancy_delta_cents=%s,
                 entry_price_drift_cents=%s, exit_price_drift_cents=%s,
                 total_execution_drift_cents=%s,
-                profit_capture_ratio=%s, expectancy_capture_ratio=%s
+                profit_capture_ratio=%s, expectancy_capture_ratio=%s,
+                entry_slippage_cents=%s, exit_slippage_cents=%s,
+                total_execution_slippage_cents=%s,
+                projected_path_pnl_cents=%s, actual_pnl_cents=%s, live_decay_cents=%s,
+                entry_price_bucket=%s, spread_bucket_entry=%s, spread_bucket_exit=%s,
+                quote_age_bucket_entry=%s, quote_age_bucket_exit=%s,
+                time_remaining_bucket=%s, filled_contract_bucket=%s, order_type_bucket=%s
             WHERE id=%s
             """,
             (
@@ -2178,9 +2426,15 @@ class MomentumLiveTrader:
                 drift["entry_price_drift_cents"], drift["exit_price_drift_cents"],
                 drift["total_execution_drift_cents"],
                 drift["profit_capture_ratio"], drift["expectancy_capture_ratio"],
+                entry_slippage, exit_slippage, total_slippage,
+                proj_path_pnl, actual_path_pnl, live_decay,
+                ep_bucket, sp_entry_bucket, sp_exit_bucket,
+                qa_entry_bucket, qa_exit_bucket,
+                tr_bucket, fc_bucket, ot_bucket,
                 live.live_trade_id,
             ),
         )
+        self._write_phase(live.live_trade_id, "FINALIZED")
         if not live.exit_accounting_verified:
             self._record_guardrail(
                 "accounting_unverified", live.market_ticker, live.side,
@@ -2240,6 +2494,7 @@ class MomentumLiveTrader:
                 "UPDATE momentum_live_trades SET status='CANCELED' WHERE id=%s",
                 (live.live_trade_id,),
             )
+            self._write_phase(live.live_trade_id, "CANCELED")
             self._record_order_event(
                 live, "entry_canceled", action="buy",
                 detail="market rollover (unfilled)", order_id=live.entry_order_id,
@@ -2540,6 +2795,7 @@ class MomentumLiveTrader:
                 "exit_reason='reconciled_no_position' WHERE id=%s",
                 (tid,),
             )
+            self._write_phase(tid, "CANCELED")
             self._record_guardrail(
                 "reconciled_canceled", ticker, side,
                 f"trade #{tid}: no position; cancelled {len(open_orders)} stray order(s)",
@@ -2551,6 +2807,7 @@ class MomentumLiveTrader:
                 "exit_at=UTC_TIMESTAMP() WHERE id=%s",
                 (tid,),
             )
+            self._write_phase(tid, "RECONCILED")
             self._record_guardrail(
                 "reconciled_flat", ticker, side,
                 f"trade #{tid}: already flat at restart (no position, no open orders)",

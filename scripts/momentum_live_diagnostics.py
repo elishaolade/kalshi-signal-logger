@@ -111,6 +111,15 @@ def _load_live_rows(hours: Optional[int]) -> list[dict]:
                entry_fill_detected_by, exit_fill_detected_by,
                entry_signal_to_order_ms, entry_order_to_ack_ms,
                entry_ack_to_fill_ms, fill_to_exit_order_ms, exit_signal_to_order_ms,
+               entry_slippage_cents, exit_slippage_cents, total_execution_slippage_cents,
+               projected_path_pnl_cents, actual_pnl_cents, live_decay_cents,
+               entry_price_bucket, spread_bucket_entry, spread_bucket_exit,
+               quote_age_bucket_entry, quote_age_bucket_exit, time_remaining_bucket,
+               filled_contract_bucket, order_type_bucket,
+               phase, exit_signal_at, entry_order_price, entry_order_type,
+               entry_order_submitted_at, exit_order_price, exit_order_type,
+               exit_order_submitted_at, spread_at_exit, quote_age_at_exit_seconds,
+               time_remaining_in_market_seconds,
                entry_price_drift_cents, exit_price_drift_cents,
                profit_delta_cents, total_execution_drift_cents,
                profit_capture_ratio, expectancy_capture_ratio
@@ -636,6 +645,206 @@ def _print_ws_shadow_exit_audit(rows: list[dict], shadow_rows: list[dict]) -> No
         )
 
 
+def _column_present(rows: list[dict], col: str) -> bool:
+    """True if at least one row has the column (even if all values are None)."""
+    return any(col in r for r in rows)
+
+
+def _print_live_vs_shadow_summary(rows: list[dict]) -> None:
+    """Section 1: Live vs Shadow Execution Summary (true-cents slippage fields)."""
+    _h2("Live vs Shadow Execution Summary (true-cents slippage)")
+    completed = _completed_filled_rows(rows)
+    if not completed:
+        print("  No completed filled trades yet.")
+        return
+
+    if not _column_present(completed, "entry_slippage_cents"):
+        print("  entry_slippage_cents column not found — run")
+        print("  scripts/migrate_add_momentum_live_telemetry.py to add telemetry fields.")
+        return
+
+    def _vals(key: str) -> list[float]:
+        return [float(r[key]) for r in completed if r.get(key) is not None]
+
+    def _avg(lst: list[float]) -> Optional[float]:
+        return round(statistics.mean(lst), 4) if lst else None
+
+    def _med(lst: list[float]) -> Optional[float]:
+        return round(statistics.median(lst), 4) if lst else None
+
+    entry_slip = _vals("entry_slippage_cents")
+    exit_slip  = _vals("exit_slippage_cents")
+    total_slip = _vals("total_execution_slippage_cents")
+    proj_path  = _vals("projected_path_pnl_cents")
+    act_pnl    = _vals("actual_pnl_cents")
+    decay      = _vals("live_decay_cents")
+
+    _row("Completed filled trades:", str(len(completed)))
+    _row("Avg entry slippage (cents):", _fmt_num(_avg(entry_slip), signed=True))
+    _row("Median entry slippage (cents):", _fmt_num(_med(entry_slip), signed=True))
+    _row("Avg exit slippage (cents):", _fmt_num(_avg(exit_slip), signed=True))
+    _row("Median exit slippage (cents):", _fmt_num(_med(exit_slip), signed=True))
+    _row("Avg total execution slippage (cents):", _fmt_num(_avg(total_slip), signed=True))
+    _row("Avg projected path P/L (cents):", _fmt_num(_avg(proj_path), signed=True))
+    _row("Avg actual P/L no-fee (cents):", _fmt_num(_avg(act_pnl), signed=True))
+    _row("Avg live decay (cents):", _fmt_num(_avg(decay), signed=True))
+    print()
+    print("  Note: slippage fields are in TRUE cents (1.0 = 1¢).")
+    print("  Positive entry slippage = live paid more than shadow.")
+    print("  Positive exit slippage  = live received less than shadow.")
+    print("  Positive live decay     = live underperformed the shadow path.")
+
+
+def _print_bucket_performance(rows: list[dict]) -> None:
+    """Section 2: Bucket Performance grouped by key classification dimensions."""
+    _h2("Bucket Performance")
+    completed = _completed_filled_rows(rows)
+    if not completed:
+        print("  No completed filled trades yet.")
+        return
+
+    if not _column_present(completed, "entry_price_bucket"):
+        print("  Bucket columns not found — run scripts/migrate_add_momentum_live_telemetry.py.")
+        return
+
+    bucket_dims = [
+        ("side",                "Side"),
+        ("entry_price_bucket",  "Entry Price"),
+        ("spread_bucket_entry", "Spread @ Entry"),
+        ("quote_age_bucket_entry", "Quote Age @ Entry"),
+        ("exit_reason",         "Exit Reason"),
+        ("time_remaining_bucket", "Time Remaining"),
+        ("filled_contract_bucket", "Fill Status"),
+    ]
+
+    for col, label in bucket_dims:
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for r in completed:
+            key = str(r.get(col) or "unknown")
+            groups[key].append(r)
+        if not groups:
+            continue
+
+        print(f"\n  Grouped by {label}:")
+        hdr = ("    group".ljust(20) + "n".rjust(4) + "  " +
+               "proj_path".rjust(9) + "  " +
+               "act_pnl".rjust(8) + "  " +
+               "decay".rjust(8) + "  " +
+               "e_slip".rjust(7) + "  " +
+               "x_slip".rjust(7) + "  " +
+               "win%".rjust(6) + "  " +
+               "ft%".rjust(5))
+        print(hdr)
+        print("    " + "-" * 76)
+        for grp in sorted(groups):
+            chunk = groups[grp]
+            n = len(chunk)
+            proj_vals = [float(r["projected_path_pnl_cents"]) for r in chunk if r.get("projected_path_pnl_cents") is not None]
+            act_vals  = [float(r["actual_pnl_cents"]) for r in chunk if r.get("actual_pnl_cents") is not None]
+            dec_vals  = [float(r["live_decay_cents"]) for r in chunk if r.get("live_decay_cents") is not None]
+            es_vals   = [float(r["entry_slippage_cents"]) for r in chunk if r.get("entry_slippage_cents") is not None]
+            xs_vals   = [float(r["exit_slippage_cents"]) for r in chunk if r.get("exit_slippage_cents") is not None]
+            wins = sum(1 for r in chunk if (_safe_float(r.get("actual_pnl_cents")) or 0.0) > 0)
+            ft   = sum(1 for r in chunk if str(r.get("exit_reason") or "").lower() == "fixed_time")
+            avg = lambda lst: round(statistics.mean(lst), 2) if lst else None
+            print(
+                f"    {grp:<20}{n:>4}  "
+                f"{_fmt_num(avg(proj_vals), 2, signed=True):>9}  "
+                f"{_fmt_num(avg(act_vals), 2, signed=True):>8}  "
+                f"{_fmt_num(avg(dec_vals), 2, signed=True):>8}  "
+                f"{_fmt_num(avg(es_vals), 2, signed=True):>7}  "
+                f"{_fmt_num(avg(xs_vals), 2, signed=True):>7}  "
+                f"{_fmt_pct(wins/n if n else None):>6}  "
+                f"{_fmt_pct(ft/n if n else None):>5}"
+            )
+
+
+def _print_trade_lifecycle_samples(rows: list[dict], limit: int = 5) -> None:
+    """Section 3: Recent completed trade samples with full slippage/decay breakdown."""
+    _h2(f"Trade Lifecycle Samples (most recent {limit} completed)")
+    completed = _completed_filled_rows(rows)[:limit]
+    if not completed:
+        print("  No completed filled trades yet.")
+        return
+
+    for r in completed:
+        tid = r.get("id", "?")
+        sig = str(r.get("signal_at", ""))[:19]
+        side = r.get("side", "?")
+        ideal_e = _safe_float(r.get("projected_entry_ask"))
+        actual_e = _safe_float(r.get("actual_entry_price"))
+        ideal_x = _safe_float(r.get("projected_exit_bid"))
+        actual_x = _safe_float(r.get("actual_exit_price"))
+        e_slip = _safe_float(r.get("entry_slippage_cents"))
+        x_slip = _safe_float(r.get("exit_slippage_cents"))
+        xreason = r.get("exit_reason", "?")
+        act_pnl = _safe_float(r.get("actual_pnl_cents"))
+        decay = _safe_float(r.get("live_decay_cents"))
+        phase = r.get("phase", "n/a")
+        status = r.get("status", "?")
+        print(
+            f"  trade_id={tid}  signal={sig}  side={side}  "
+            f"phase={phase}  status={status}"
+        )
+        print(
+            f"    ideal_entry={_fmt_num(ideal_e, 4)}  actual_entry={_fmt_num(actual_e, 4)}  "
+            f"entry_slip={_fmt_num(e_slip, 2, signed=True)}c"
+        )
+        print(
+            f"    ideal_exit={_fmt_num(ideal_x, 4)}   actual_exit={_fmt_num(actual_x, 4)}   "
+            f"exit_slip={_fmt_num(x_slip, 2, signed=True)}c"
+        )
+        print(
+            f"    exit_reason={xreason}  actual_pnl={_fmt_num(act_pnl, 2, signed=True)}c  "
+            f"live_decay={_fmt_num(decay, 2, signed=True)}c"
+        )
+        print()
+
+
+def _print_missing_telemetry_audit(rows: list[dict]) -> None:
+    """Section 4: Missing Telemetry Audit — fields that are null/missing."""
+    _h2("Missing Telemetry Audit")
+    completed = _completed_filled_rows(rows)
+    n = len(completed)
+    if n == 0:
+        print("  No completed filled trades yet.")
+        return
+
+    audit_fields = [
+        ("projected_entry_ask",         "ideal_entry_ask (projected_entry_ask)"),
+        ("actual_entry_price",          "actual_entry_price"),
+        ("projected_exit_bid",          "ideal_exit_bid (projected_exit_bid)"),
+        ("actual_exit_price",           "actual_exit_price"),
+        ("ws_spread_at_entry",          "spread_at_entry"),
+        ("spread_at_exit",              "spread_at_exit"),
+        ("ws_quote_age_at_entry",       "quote_age_at_entry_seconds"),
+        ("quote_age_at_exit_seconds",   "quote_age_at_exit_seconds"),
+        ("entry_slippage_cents",        "entry_slippage_cents"),
+        ("exit_slippage_cents",         "exit_slippage_cents"),
+        ("max_profit_cents",            "max_profit_cents"),
+        ("target_touched",              "target_touched"),
+        ("projected_path_pnl_cents",    "projected_path_pnl_cents"),
+        ("actual_pnl_cents",            "actual_pnl_cents (no-fee path)"),
+        ("live_decay_cents",            "live_decay_cents"),
+        ("entry_price_bucket",          "entry_price_bucket"),
+        ("phase",                       "phase"),
+    ]
+
+    _row("Completed filled trades:", str(n))
+    print()
+    print(f"  {'field':<42} {'null_count':>10}  {'null_pct':>8}")
+    print("  " + "-" * 64)
+    for col, label in audit_fields:
+        null_count = sum(1 for r in completed if r.get(col) is None)
+        null_pct = null_count / n if n else 0.0
+        marker = "  ← needs migration?" if null_count == n and col not in ("spread_at_exit", "quote_age_at_exit_seconds") else ""
+        print(f"  {label:<42} {null_count:>10}  {_fmt_pct(null_pct):>8}{marker}")
+
+    print()
+    print("  Fields with 100% nulls on old rows are expected before the telemetry")
+    print("  migration ran.  New trades should populate these fields automatically.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Focused diagnostics for live momentum trades")
     ap.add_argument("--hours", type=int, default=None,
@@ -681,6 +890,12 @@ def main() -> None:
     _print_ws_stats(rows)
     _print_spread_guardrails(guardrails)
     _print_recent_completed(rows)
+
+    # ── New live-vs-shadow execution telemetry sections ───────────────────────
+    _print_live_vs_shadow_summary(rows)
+    _print_bucket_performance(rows)
+    _print_trade_lifecycle_samples(rows)
+    _print_missing_telemetry_audit(rows)
     print()
 
 
