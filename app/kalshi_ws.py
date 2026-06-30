@@ -29,6 +29,7 @@ from app import config
 from app.data_feed import _kalshi_auth_headers
 
 logger = logging.getLogger(__name__)
+_WS_SUBSCRIBE_ID = 1
 
 try:
     import websockets
@@ -119,14 +120,34 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _price_to_unit(value: Any) -> Optional[float]:
+    raw = _to_float(value)
+    if raw is None:
+        return None
+    # Kalshi WS v2 orderbook messages commonly use integer cents.
+    if raw > 1.0:
+        raw = raw / 100.0
+    return round(raw, 4)
+
+
+def _message_payload(message: dict[str, Any]) -> dict[str, Any]:
+    for key in ("msg", "data", "order"):
+        payload = message.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return message
+
+
 def _extract_ticker(message: dict[str, Any]) -> Optional[str]:
-    for key in ("ticker", "market_ticker", "marketTicker", "sid", "symbol"):
+    for key in ("ticker", "market_ticker", "marketTicker", "symbol"):
         value = message.get(key)
         if value:
             return str(value)
-    data = message.get("data")
-    if isinstance(data, dict):
-        for key in ("ticker", "market_ticker", "marketTicker", "sid", "symbol"):
+    for nested_key in ("msg", "data"):
+        data = message.get(nested_key)
+        if not isinstance(data, dict):
+            continue
+        for key in ("ticker", "market_ticker", "marketTicker", "symbol"):
             value = data.get(key)
             if value:
                 return str(value)
@@ -137,7 +158,7 @@ def _iter_levels(value: Any) -> list[tuple[float, float]]:
     out: list[tuple[float, float]] = []
     if isinstance(value, dict):
         for price, size in value.items():
-            p = _to_float(price)
+            p = _price_to_unit(price)
             s = _to_float(size)
             if p is not None and s is not None and s > 0:
                 out.append((round(p, 4), s))
@@ -145,10 +166,10 @@ def _iter_levels(value: Any) -> list[tuple[float, float]]:
     if isinstance(value, list):
         for item in value:
             if isinstance(item, dict):
-                p = _to_float(item.get("price") or item.get("px") or item.get("rate"))
+                p = _price_to_unit(item.get("price") or item.get("px") or item.get("rate"))
                 s = _to_float(item.get("size") or item.get("count") or item.get("quantity"))
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                p = _to_float(item[0])
+                p = _price_to_unit(item[0])
                 s = _to_float(item[1])
             else:
                 continue
@@ -161,25 +182,23 @@ def _extract_book_sides(message: dict[str, Any]) -> tuple[list[tuple[float, floa
     """
     Return (yes_bids, no_bids) from a permissive set of payload shapes.
     """
-    yes_src = (
-        message.get("yes_bids")
-        or message.get("yes")
-        or message.get("bids_yes")
-    )
-    no_src = (
-        message.get("no_bids")
-        or message.get("no")
-        or message.get("bids_no")
-    )
-    data = message.get("data")
-    if isinstance(data, dict):
-        yes_src = yes_src or data.get("yes_bids") or data.get("yes") or data.get("bids_yes")
-        no_src = no_src or data.get("no_bids") or data.get("no") or data.get("bids_no")
-        if yes_src is None and isinstance(data.get("yes"), dict):
-            yes_src = data.get("yes")
-        if no_src is None and isinstance(data.get("no"), dict):
-            no_src = data.get("no")
+    payload = _message_payload(message)
+    yes_src = payload.get("yes_bids") or payload.get("yes") or payload.get("bids_yes")
+    no_src = payload.get("no_bids") or payload.get("no") or payload.get("bids_no")
     return _iter_levels(yes_src), _iter_levels(no_src)
+
+
+def _extract_delta(message: dict[str, Any]) -> tuple[Optional[str], list[tuple[float, float]]]:
+    payload = _message_payload(message)
+    side = payload.get("side")
+    price = _price_to_unit(payload.get("price") or payload.get("yes_price") or payload.get("no_price"))
+    delta = _to_float(payload.get("delta") or payload.get("size_delta"))
+    if side is None or price is None or delta is None:
+        return None, []
+    side_s = str(side).upper()
+    if side_s not in ("YES", "NO"):
+        return None, []
+    return side_s, [(price, delta)]
 
 
 @dataclass
@@ -240,6 +259,8 @@ class KalshiMarketStream:
         self._client_index: dict[str, str] = {}
         self._subscribed_markets: set[str] = set()
         self._ws_thread: Optional[threading.Thread] = None
+        self._active_ws: Any = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop = threading.Event()
         self._connected = False
         self._last_message_ts = 0.0
@@ -295,8 +316,12 @@ class KalshiMarketStream:
     def subscribe_market(self, market_ticker: str) -> None:
         if not market_ticker:
             return
+        should_send = False
         with self._lock:
+            should_send = market_ticker not in self._subscribed_markets
             self._subscribed_markets.add(market_ticker)
+        if should_send:
+            self._send_subscriptions()
 
     def unsubscribe_market(self, market_ticker: str) -> None:
         with self._lock:
@@ -367,13 +392,21 @@ class KalshiMarketStream:
             self._quotes[market_ticker] = quote
             self._last_message_ts = quote.updated_at_ts
 
-    def apply_orderbook_delta(self, market_ticker: str, side: str, levels: list[tuple[float, float]], *, updated_at_ts: Optional[float] = None) -> None:
+    def apply_orderbook_delta(
+        self,
+        market_ticker: str,
+        side: str,
+        levels: list[tuple[float, float]],
+        *,
+        updated_at_ts: Optional[float] = None,
+        signed_delta: bool = False,
+    ) -> None:
         with self._lock:
             quote = self._quotes.get(market_ticker) or MarketQuote(market_ticker=market_ticker)
             book = quote.yes_bids if side == "YES" else quote.no_bids
             for price, size in levels:
                 p = round(float(price), 4)
-                s = float(size)
+                s = (book.get(p, 0.0) + float(size)) if signed_delta else float(size)
                 if s <= 0:
                     book.pop(p, None)
                 else:
@@ -427,6 +460,7 @@ class KalshiMarketStream:
             return
         ticker = _extract_ticker(message)
         channel = str(message.get("channel") or message.get("type") or "").lower()
+        payload = _message_payload(message)
 
         yes_bids, no_bids = _extract_book_sides(message)
         if ticker and (yes_bids or no_bids):
@@ -438,9 +472,10 @@ class KalshiMarketStream:
                 if no_bids:
                     self.apply_orderbook_delta(ticker, "NO", no_bids)
 
-        order = message.get("order")
-        data = message.get("data")
-        payload = order if isinstance(order, dict) else (data if isinstance(data, dict) else message)
+        delta_side, delta_levels = _extract_delta(message)
+        if ticker and delta_side and delta_levels:
+            self.apply_orderbook_delta(ticker, delta_side, delta_levels, signed_delta=True)
+
         order_id = payload.get("order_id") or payload.get("id")
         client_order_id = payload.get("client_order_id")
         if order_id or client_order_id:
@@ -498,6 +533,8 @@ class KalshiMarketStream:
                     close_timeout=2.0,
                 ) as ws:
                     self._connected = True
+                    self._active_ws = ws
+                    self._loop = asyncio.get_running_loop()
                     self._degraded = False
                     self._last_error = None
                     await self._resubscribe(ws)
@@ -514,11 +551,15 @@ class KalshiMarketStream:
                         self.ingest_message(message)
             except Exception as exc:
                 self._connected = False
+                self._active_ws = None
+                self._loop = None
                 self._degraded = True
                 self._last_error = str(exc)
                 logger.warning("KalshiMarketStream reconnecting after error: %s", exc)
                 await asyncio.sleep(config.MOMENTUM_LIVE_WS_RECONNECT_SECONDS)
         self._connected = False
+        self._active_ws = None
+        self._loop = None
 
     def _ws_url(self) -> str:
         if config.KALSHI_WS_URL:
@@ -537,12 +578,23 @@ class KalshiMarketStream:
     async def _resubscribe(self, ws) -> None:  # pragma: no cover - runtime wrapper
         with self._lock:
             tickers = sorted(self._subscribed_markets)
-        for ticker in tickers:
-            payloads = [
-                {"type": "subscribe", "channel": "orderbook", "ticker": ticker},
-                {"type": "subscribe", "channel": "market_status", "ticker": ticker},
-                {"type": "subscribe", "channel": "trades", "ticker": ticker},
-            ]
-            for payload in payloads:
-                await ws.send(json.dumps(payload))
-        await ws.send(json.dumps({"type": "subscribe", "channel": "user_orders"}))
+        if tickers:
+            await ws.send(json.dumps({
+                "id": _WS_SUBSCRIBE_ID,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_tickers": tickers,
+                },
+            }))
+
+    def _send_subscriptions(self) -> None:
+        ws = self._active_ws
+        loop = self._loop
+        if ws is None or loop is None or not loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._resubscribe(ws), loop)
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.debug("KalshiMarketStream subscribe send skipped: %s", exc)

@@ -147,3 +147,36 @@ class TestStreamCache:
         assert state.status == "filled"
         assert state.filled_count == pytest.approx(20.0)
         assert state.avg_fill_price == pytest.approx(0.29)
+
+    def test_ingest_message_parses_kalshi_v2_snapshot_and_delta(self):
+        stream = KalshiMarketStream()
+        stream.ingest_message(
+            {
+                "type": "orderbook_snapshot",
+                "sid": 1,
+                "seq": 1,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes": [[31, 10], [30, 5]],
+                    "no": [[66, 7]],
+                },
+            }
+        )
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.31)
+        assert stream.get_best_ask("KXBTC15M-TEST", "YES") == pytest.approx(0.34)
+
+        stream.ingest_message(
+            {
+                "type": "orderbook_delta",
+                "sid": 1,
+                "seq": 2,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "side": "yes",
+                    "price": 32,
+                    "delta": 4,
+                },
+            }
+        )
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.32)
+        assert stream.get_depth_at_or_better("KXBTC15M-TEST", "YES", 0.32) == pytest.approx(4)
