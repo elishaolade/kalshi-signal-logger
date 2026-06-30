@@ -13,6 +13,7 @@ from app.kalshi_ws import (
     build_connect_kwargs,
     compute_depth_at_or_better,
     compute_spread,
+    derive_ws_url,
     infer_no_ask,
     infer_yes_ask,
 )
@@ -33,6 +34,16 @@ class TestQuoteMath:
 
 
 class TestConnectKwargs:
+    def test_derives_production_ws_host_from_rest_base(self):
+        assert derive_ws_url("https://external-api.kalshi.com/trade-api/v2") == (
+            "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+        )
+
+    def test_derives_demo_ws_host_from_rest_base(self):
+        assert derive_ws_url("https://demo-api.kalshi.co/trade-api/v2") == (
+            "wss://demo-api-ws.kalshi.co/trade-api/ws/v2"
+        )
+
     def test_uses_additional_headers_when_supported(self, monkeypatch):
         class FakeWebsockets:
             def connect(self, uri, *, additional_headers=None, ping_interval=None):

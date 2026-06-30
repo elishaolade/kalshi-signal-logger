@@ -1023,13 +1023,18 @@ class MomentumLiveTrader:
     poll cycle, AFTER the shadow tracker, with the same arguments.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ws_stream: Optional[KalshiMarketStream] = None) -> None:
         import collections
         self._window: collections.deque[MarketRow] = collections.deque()
         self._current_market_id: Optional[str] = None
         self._cooldown_until: dict[int, float] = {}
         self._active: dict[int, _ActiveLive] = {}
-        self._ws = KalshiMarketStream() if config.MOMENTUM_LIVE_USE_WEBSOCKET else None
+        self._ws = (
+            ws_stream
+            if ws_stream is not None
+            else KalshiMarketStream() if config.MOMENTUM_LIVE_USE_WEBSOCKET else None
+        )
+        self._owns_ws = self._ws is not None and ws_stream is None
         self._ws_stale_guardrail_emitted = False
 
         # Recovery / safety latches.  While set, _try_open_live refuses new
@@ -1047,7 +1052,7 @@ class MomentumLiveTrader:
                 reason = str(exc)
 
         self._reconcile_on_startup()
-        if self._ws:
+        if self._ws and self._owns_ws:
             self._ws.start()
 
         if self._armed:

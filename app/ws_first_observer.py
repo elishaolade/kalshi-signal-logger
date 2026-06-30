@@ -1,0 +1,142 @@
+"""
+app/ws_first_observer.py — WebSocket-first quote observer for clean data runs.
+
+The logger may still use REST for market discovery, but this observer owns the
+quote source used by shadow/live diagnostics when enabled. If a fresh WebSocket
+book is not available, the tick is skipped instead of silently degrading to a
+poll snapshot.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+from app import config
+from app.kalshi_ws import KalshiMarketStream, MarketQuote
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WsObservedPrices:
+    prices: dict[str, dict]
+    quote_age_seconds: float
+    yes_depth_at_bid: float
+    no_depth_at_bid: float
+
+
+class WebSocketFirstObserver:
+    def __init__(self, stream: Optional[KalshiMarketStream] = None) -> None:
+        self.stream = stream or KalshiMarketStream(enabled=True)
+        self._last_missing_log_ts = 0.0
+        self._last_ready_market: Optional[str] = None
+
+    def start(self) -> None:
+        self.stream.start()
+        deadline = time.time() + config.MOMENTUM_WS_OBSERVER_BOOT_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if self.stream.connected:
+                break
+            time.sleep(0.1)
+        logger.info(
+            "WebSocketFirstObserver ready | url=%s require_fresh=%s max_age=%.1fs",
+            self.stream._ws_url(),
+            config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES,
+            config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS,
+        )
+        if not self.stream.connected and config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES:
+            raise RuntimeError(
+                "WebSocket observer could not connect "
+                f"within {config.MOMENTUM_WS_OBSERVER_BOOT_TIMEOUT_SECONDS:.1f}s "
+                f"(url={self.stream._ws_url()} last_error={self.stream.last_error()})"
+            )
+
+    def stop(self) -> None:
+        self.stream.stop()
+
+    def observe_market(self, market_ticker: str) -> Optional[WsObservedPrices]:
+        self.stream.subscribe_market(market_ticker)
+        quote = self.stream.get_quote(market_ticker)
+        age = self.stream.get_quote_age_seconds(market_ticker)
+
+        if not self._quote_is_usable(quote, age):
+            self._log_missing(market_ticker, age)
+            if config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES:
+                return None
+            return None
+
+        assert quote is not None
+        assert age is not None
+        if self._last_ready_market != market_ticker:
+            logger.info(
+                "ws observer quotes ready | %s | age=%.3fs YES %.3f/%.3f NO %.3f/%.3f",
+                market_ticker,
+                age,
+                quote.best_yes_bid or 0.0,
+                quote.best_yes_ask or 0.0,
+                quote.best_no_bid or 0.0,
+                quote.best_no_ask or 0.0,
+            )
+            self._last_ready_market = market_ticker
+
+        yes_depth = (
+            quote.get_depth_at_or_better("YES", quote.best_yes_bid)
+            if quote.best_yes_bid is not None else 0.0
+        )
+        no_depth = (
+            quote.get_depth_at_or_better("NO", quote.best_no_bid)
+            if quote.best_no_bid is not None else 0.0
+        )
+        return WsObservedPrices(
+            prices={
+                "YES": self._side_prices(quote, "YES"),
+                "NO": self._side_prices(quote, "NO"),
+            },
+            quote_age_seconds=age,
+            yes_depth_at_bid=yes_depth,
+            no_depth_at_bid=no_depth,
+        )
+
+    def _quote_is_usable(self, quote: Optional[MarketQuote], age: Optional[float]) -> bool:
+        if quote is None or age is None:
+            return False
+        if age > config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
+            return False
+        return all(
+            v is not None
+            for v in (
+                quote.best_yes_bid,
+                quote.best_yes_ask,
+                quote.best_no_bid,
+                quote.best_no_ask,
+            )
+        )
+
+    def _log_missing(self, market_ticker: str, age: Optional[float]) -> None:
+        now = time.time()
+        if now - self._last_missing_log_ts < 10.0:
+            return
+        self._last_missing_log_ts = now
+        logger.warning(
+            "ws observer waiting for fresh order book | market=%s connected=%s "
+            "degraded=%s age=%s last_error=%s",
+            market_ticker,
+            self.stream.connected,
+            self.stream.degraded,
+            f"{age:.3f}s" if age is not None else "n/a",
+            self.stream.last_error(),
+        )
+
+    @staticmethod
+    def _side_prices(quote: MarketQuote, side: str) -> dict:
+        bid = quote.get_best_bid(side)
+        ask = quote.get_best_ask(side)
+        spread = quote.get_spread(side)
+        return {
+            "bid_price": bid,
+            "ask_price": ask,
+            "spread": spread,
+            "source": "websocket",
+        }

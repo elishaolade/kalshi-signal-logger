@@ -57,6 +57,33 @@ def build_connect_kwargs(headers: dict[str, str]) -> dict[str, Any]:
     return {}
 
 
+def derive_ws_url(api_base: str) -> str:
+    """
+    Derive the prediction-market WebSocket endpoint from a REST API base.
+
+    Kalshi's production REST host is external-api.kalshi.com, while the
+    prediction-market WebSocket host is external-api-ws.kalshi.com. Keeping this
+    derivation in one helper prevents the observer from accidentally connecting
+    to a REST host path that returns HTTP 404.
+    """
+    split = urlsplit(api_base)
+    scheme = "wss" if split.scheme == "https" else "ws"
+    host = split.netloc
+    if host == "external-api.kalshi.com":
+        host = "external-api-ws.kalshi.com"
+    elif host == "demo-api.kalshi.co":
+        host = "demo-api-ws.kalshi.co"
+
+    path = split.path.rstrip("/")
+    if path.endswith("/trade-api/v2"):
+        path = path[:-len("/trade-api/v2")] + "/trade-api/ws/v2"
+    elif path.endswith("/v2"):
+        path = path[:-3] + "/ws/v2"
+    else:
+        path = "/trade-api/ws/v2"
+    return urlunsplit((scheme, host, path, "", ""))
+
+
 def infer_yes_ask(best_no_bid: Optional[float]) -> Optional[float]:
     if best_no_bid is None:
         return None
@@ -206,7 +233,7 @@ class MarketQuote:
 
 
 class KalshiMarketStream:
-    def __init__(self) -> None:
+    def __init__(self, enabled: Optional[bool] = None) -> None:
         self._lock = threading.RLock()
         self._quotes: dict[str, MarketQuote] = {}
         self._order_states: dict[str, WSOrderState] = {}
@@ -217,13 +244,14 @@ class KalshiMarketStream:
         self._connected = False
         self._last_message_ts = 0.0
         self._last_error: Optional[str] = None
+        self._enabled = config.MOMENTUM_LIVE_USE_WEBSOCKET if enabled is None else enabled
         self._supports_runtime = websockets is not None
         self._degraded = False
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if not config.MOMENTUM_LIVE_USE_WEBSOCKET:
+        if not self._enabled:
             return
         if not self._supports_runtime:
             self._degraded = True
@@ -495,14 +523,7 @@ class KalshiMarketStream:
     def _ws_url(self) -> str:
         if config.KALSHI_WS_URL:
             return config.KALSHI_WS_URL
-        split = urlsplit(config.KALSHI_API_BASE)
-        scheme = "wss" if split.scheme == "https" else "ws"
-        path = split.path.rstrip("/")
-        if path.endswith("/v2"):
-            path = path[:-3] + "/ws/v2"
-        else:
-            path = path + "/ws"
-        return urlunsplit((scheme, split.netloc, path, "", ""))
+        return derive_ws_url(config.KALSHI_API_BASE)
 
     def _ws_headers(self, url: str) -> dict[str, str]:
         path = urlsplit(url).path

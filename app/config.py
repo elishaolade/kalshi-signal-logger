@@ -184,6 +184,18 @@ MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS = float(
     os.getenv("MOMENTUM_LIVE_WS_PING_TIMEOUT_SECONDS", "20")
 )
 
+# ── WebSocket-first observer layer ───────────────────────────────────────────
+# This is the clean-data mode: Kalshi REST may still discover markets, but the
+# YES/NO quote inputs handed to shadow/live diagnostics must come from a fresh
+# WebSocket order book. When enabled, stale/missing WS quotes skip the tick.
+MOMENTUM_WS_OBSERVER_ENABLED = _env_bool("MOMENTUM_WS_OBSERVER_ENABLED", "false")
+MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES = _env_bool(
+    "MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES", "true"
+)
+MOMENTUM_WS_OBSERVER_BOOT_TIMEOUT_SECONDS = float(
+    os.getenv("MOMENTUM_WS_OBSERVER_BOOT_TIMEOUT_SECONDS", "10")
+)
+
 # ── WebSocket shadow-only exit audit (diagnostics only) ───────────────────────
 # These rules never place/cancel/modify real orders. They only record the first
 # time a hypothetical WS-aware exit would have triggered for a live trade.

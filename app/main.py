@@ -37,6 +37,7 @@ from app.config import (
     KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS,
     KALSHI_BTC_BINARY_SERIES_TICKER,
     LIVE_TRADING_ENABLED,
+    MOMENTUM_WS_OBSERVER_ENABLED,
     POLL_INTERVAL_SECONDS,
 )
 from app.data_feed import (
@@ -50,6 +51,7 @@ from app.features import Tick
 from app.models import MarketMetrics, MarketSnapshot
 from app.momentum_shadow_tracker import MomentumShadowTracker
 from app.momentum_live_trader import MomentumLiveTrader
+from app.ws_first_observer import WebSocketFirstObserver
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -95,6 +97,10 @@ _shadow_tracker: Optional[MomentumShadowTracker] = None
 # MOMENTUM_LIVE_* gate is set. Runs alongside — never replaces — the shadow
 # tracker. Initialized in run() after the DB pool is ready.
 _live_trader: Optional[MomentumLiveTrader] = None
+
+# WebSocket-first observer. When enabled, quote snapshots handed to shadow/live
+# diagnostics come from fresh WS order books; stale/missing WS books skip ticks.
+_ws_observer: Optional[WebSocketFirstObserver] = None
 
 
 # ── Kalshi market fetcher ──────────────────────────────────────────────────────
@@ -526,6 +532,13 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         logger.warning("Skipping tick #%d: contract prices unavailable — %s", n, exc)
         return
 
+    if _ws_observer is not None:
+        observed = _ws_observer.observe_market(market_id)
+        if observed is None:
+            logger.debug("Skipping tick #%d: waiting for WebSocket prices", n)
+            return
+        prices = observed.prices
+
     # 6. Insert market snapshot
     try:
         snapshot_id = _insert_market_snapshot(
@@ -601,7 +614,7 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
-    global _stop_event, _shadow_tracker, _live_trader
+    global _stop_event, _shadow_tracker, _live_trader, _ws_observer
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -623,6 +636,14 @@ def run() -> None:
     btc_ticks: collections.deque[Tick] = collections.deque(maxlen=BTC_TICK_BUFFER)
     _warm_up(btc_ticks)
 
+    if MOMENTUM_WS_OBSERVER_ENABLED:
+        try:
+            _ws_observer = WebSocketFirstObserver()
+            _ws_observer.start()
+        except Exception as exc:
+            logger.critical("WebSocketFirstObserver init failed: %s", exc)
+            raise SystemExit(1) from exc
+
     try:
         _shadow_tracker = MomentumShadowTracker()
     except Exception as exc:
@@ -632,7 +653,9 @@ def run() -> None:
         )
 
     try:
-        _live_trader = MomentumLiveTrader()
+        _live_trader = MomentumLiveTrader(
+            ws_stream=_ws_observer.stream if _ws_observer is not None else None
+        )
     except Exception as exc:
         logger.warning(
             "MomentumLiveTrader init failed (live trading disabled "
