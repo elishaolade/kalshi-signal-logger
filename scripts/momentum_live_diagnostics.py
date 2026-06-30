@@ -79,6 +79,82 @@ def _repo_units_to_cents(v: Optional[float]) -> Optional[float]:
     return round(float(v) * 100.0, 4)
 
 
+def _price_path_cents(row: dict, entry_key: str, exit_key: str) -> Optional[float]:
+    entry = _safe_float(row.get(entry_key))
+    exit_ = _safe_float(row.get(exit_key))
+    if entry is None or exit_ is None:
+        return None
+    return round((exit_ - entry) * 100.0, 4)
+
+
+def _entry_slippage_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("entry_slippage_cents"))
+    if stored is not None:
+        return stored
+    projected_entry = _safe_float(row.get("projected_entry_ask"))
+    actual_entry = _safe_float(row.get("actual_entry_price"))
+    if projected_entry is None or actual_entry is None:
+        return None
+    return round((actual_entry - projected_entry) * 100.0, 4)
+
+
+def _exit_slippage_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("exit_slippage_cents"))
+    if stored is not None:
+        return stored
+    projected_exit = _safe_float(row.get("projected_exit_bid"))
+    actual_exit = _safe_float(row.get("actual_exit_price"))
+    if projected_exit is None or actual_exit is None:
+        return None
+    return round((projected_exit - actual_exit) * 100.0, 4)
+
+
+def _total_execution_slippage_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("total_execution_slippage_cents"))
+    if stored is not None:
+        return stored
+    entry_slip = _entry_slippage_cents(row)
+    exit_slip = _exit_slippage_cents(row)
+    if entry_slip is None or exit_slip is None:
+        return None
+    return round(entry_slip + exit_slip, 4)
+
+
+def _projected_path_pnl_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("projected_path_pnl_cents"))
+    if stored is not None:
+        return stored
+    return _price_path_cents(row, "projected_entry_ask", "projected_exit_bid")
+
+
+def _actual_path_pnl_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("actual_pnl_cents"))
+    if stored is not None:
+        return stored
+    return _price_path_cents(row, "actual_entry_price", "actual_exit_price")
+
+
+def _live_decay_cents(row: dict) -> Optional[float]:
+    stored = _safe_float(row.get("live_decay_cents"))
+    if stored is not None:
+        return stored
+    projected = _projected_path_pnl_cents(row)
+    actual = _actual_path_pnl_cents(row)
+    if projected is None or actual is None:
+        return None
+    return round(projected - actual, 4)
+
+
+def _actual_trade_won(row: dict) -> bool:
+    if row.get("actual_trade_won") is not None:
+        return int(row.get("actual_trade_won") or 0) == 1
+    actual_profit = _safe_float(row.get("actual_profit_cents"))
+    if actual_profit is not None:
+        return actual_profit > 0
+    actual_path = _actual_path_pnl_cents(row)
+    return bool(actual_path is not None and actual_path > 0)
+
+
 def _build_time_filter(hours: Optional[int]) -> tuple[str, tuple]:
     if hours is None:
         return "", ()
@@ -663,21 +739,22 @@ def _print_live_vs_shadow_summary(rows: list[dict]) -> None:
         print("  scripts/migrate_add_momentum_live_telemetry.py to add telemetry fields.")
         return
 
-    def _vals(key: str) -> list[float]:
-        return [float(r[key]) for r in completed if r.get(key) is not None]
-
     def _avg(lst: list[float]) -> Optional[float]:
         return round(statistics.mean(lst), 4) if lst else None
 
     def _med(lst: list[float]) -> Optional[float]:
         return round(statistics.median(lst), 4) if lst else None
 
-    entry_slip = _vals("entry_slippage_cents")
-    exit_slip  = _vals("exit_slippage_cents")
-    total_slip = _vals("total_execution_slippage_cents")
-    proj_path  = _vals("projected_path_pnl_cents")
-    act_pnl    = _vals("actual_pnl_cents")
-    decay      = _vals("live_decay_cents")
+    def _derived_vals(fn) -> list[float]:
+        values = [fn(r) for r in completed]
+        return [float(v) for v in values if v is not None]
+
+    entry_slip = _derived_vals(_entry_slippage_cents)
+    exit_slip  = _derived_vals(_exit_slippage_cents)
+    total_slip = _derived_vals(_total_execution_slippage_cents)
+    proj_path  = _derived_vals(_projected_path_pnl_cents)
+    act_pnl    = _derived_vals(_actual_path_pnl_cents)
+    decay      = _derived_vals(_live_decay_cents)
 
     _row("Completed filled trades:", str(len(completed)))
     _row("Avg entry slippage (cents):", _fmt_num(_avg(entry_slip), signed=True))
@@ -693,6 +770,7 @@ def _print_live_vs_shadow_summary(rows: list[dict]) -> None:
     print("  Positive entry slippage = live paid more than shadow.")
     print("  Positive exit slippage  = live received less than shadow.")
     print("  Positive live decay     = live underperformed the shadow path.")
+    print("  Old rows with null telemetry columns are calculated from stored entry/exit prices.")
 
 
 def _print_bucket_performance(rows: list[dict]) -> None:
@@ -739,12 +817,12 @@ def _print_bucket_performance(rows: list[dict]) -> None:
         for grp in sorted(groups):
             chunk = groups[grp]
             n = len(chunk)
-            proj_vals = [float(r["projected_path_pnl_cents"]) for r in chunk if r.get("projected_path_pnl_cents") is not None]
-            act_vals  = [float(r["actual_pnl_cents"]) for r in chunk if r.get("actual_pnl_cents") is not None]
-            dec_vals  = [float(r["live_decay_cents"]) for r in chunk if r.get("live_decay_cents") is not None]
-            es_vals   = [float(r["entry_slippage_cents"]) for r in chunk if r.get("entry_slippage_cents") is not None]
-            xs_vals   = [float(r["exit_slippage_cents"]) for r in chunk if r.get("exit_slippage_cents") is not None]
-            wins = sum(1 for r in chunk if (_safe_float(r.get("actual_pnl_cents")) or 0.0) > 0)
+            proj_vals = [v for v in (_projected_path_pnl_cents(r) for r in chunk) if v is not None]
+            act_vals  = [v for v in (_actual_path_pnl_cents(r) for r in chunk) if v is not None]
+            dec_vals  = [v for v in (_live_decay_cents(r) for r in chunk) if v is not None]
+            es_vals   = [v for v in (_entry_slippage_cents(r) for r in chunk) if v is not None]
+            xs_vals   = [v for v in (_exit_slippage_cents(r) for r in chunk) if v is not None]
+            wins = sum(1 for r in chunk if _actual_trade_won(r))
             ft   = sum(1 for r in chunk if str(r.get("exit_reason") or "").lower() == "fixed_time")
             avg = lambda lst: round(statistics.mean(lst), 2) if lst else None
             print(
@@ -775,11 +853,11 @@ def _print_trade_lifecycle_samples(rows: list[dict], limit: int = 5) -> None:
         actual_e = _safe_float(r.get("actual_entry_price"))
         ideal_x = _safe_float(r.get("projected_exit_bid"))
         actual_x = _safe_float(r.get("actual_exit_price"))
-        e_slip = _safe_float(r.get("entry_slippage_cents"))
-        x_slip = _safe_float(r.get("exit_slippage_cents"))
+        e_slip = _entry_slippage_cents(r)
+        x_slip = _exit_slippage_cents(r)
         xreason = r.get("exit_reason", "?")
-        act_pnl = _safe_float(r.get("actual_pnl_cents"))
-        decay = _safe_float(r.get("live_decay_cents"))
+        act_pnl = _actual_path_pnl_cents(r)
+        decay = _live_decay_cents(r)
         phase = r.get("phase", "n/a")
         status = r.get("status", "?")
         print(
