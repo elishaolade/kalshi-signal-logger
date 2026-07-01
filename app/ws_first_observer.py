@@ -31,6 +31,7 @@ class WebSocketFirstObserver:
     def __init__(self, stream: Optional[KalshiMarketStream] = None) -> None:
         self.stream = stream or KalshiMarketStream(enabled=True)
         self._last_missing_log_ts = 0.0
+        self._last_invalid_log_ts = 0.0
         self._last_ready_market: Optional[str] = None
 
     def start(self) -> None:
@@ -61,8 +62,12 @@ class WebSocketFirstObserver:
         quote = self.stream.get_quote(market_ticker)
         age = self.stream.get_quote_age_seconds(market_ticker)
 
-        if not self._quote_is_usable(quote, age):
-            self._log_missing(market_ticker, age)
+        usable, reason = self._quote_status(quote, age)
+        if not usable:
+            if reason == "crossed_book":
+                self._log_invalid(market_ticker, quote, age)
+            else:
+                self._log_missing(market_ticker, age)
             if config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES:
                 return None
             return None
@@ -99,20 +104,26 @@ class WebSocketFirstObserver:
             no_depth_at_bid=no_depth,
         )
 
-    def _quote_is_usable(self, quote: Optional[MarketQuote], age: Optional[float]) -> bool:
+    def _quote_status(self, quote: Optional[MarketQuote], age: Optional[float]) -> tuple[bool, str]:
         if quote is None or age is None:
-            return False
+            return False, "missing"
         if age > config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
-            return False
-        return all(
-            v is not None
-            for v in (
-                quote.best_yes_bid,
-                quote.best_yes_ask,
-                quote.best_no_bid,
-                quote.best_no_ask,
-            )
+            return False, "stale"
+        values = (
+            quote.best_yes_bid,
+            quote.best_yes_ask,
+            quote.best_no_bid,
+            quote.best_no_ask,
         )
+        if not all(v is not None for v in values):
+            return False, "incomplete"
+        assert quote.best_yes_bid is not None
+        assert quote.best_yes_ask is not None
+        assert quote.best_no_bid is not None
+        assert quote.best_no_ask is not None
+        if quote.best_yes_ask < quote.best_yes_bid or quote.best_no_ask < quote.best_no_bid:
+            return False, "crossed_book"
+        return True, "ok"
 
     def _log_missing(self, market_ticker: str, age: Optional[float]) -> None:
         now = time.time()
@@ -127,6 +138,22 @@ class WebSocketFirstObserver:
             self.stream.degraded,
             f"{age:.3f}s" if age is not None else "n/a",
             self.stream.last_error(),
+        )
+
+    def _log_invalid(self, market_ticker: str, quote: Optional[MarketQuote], age: Optional[float]) -> None:
+        now = time.time()
+        if now - self._last_invalid_log_ts < 10.0:
+            return
+        self._last_invalid_log_ts = now
+        logger.warning(
+            "ws observer rejected crossed order book | market=%s age=%s "
+            "YES %.3f/%.3f NO %.3f/%.3f",
+            market_ticker,
+            f"{age:.3f}s" if age is not None else "n/a",
+            (quote.best_yes_bid if quote and quote.best_yes_bid is not None else 0.0),
+            (quote.best_yes_ask if quote and quote.best_yes_ask is not None else 0.0),
+            (quote.best_no_bid if quote and quote.best_no_bid is not None else 0.0),
+            (quote.best_no_ask if quote and quote.best_no_ask is not None else 0.0),
         )
 
     @staticmethod
