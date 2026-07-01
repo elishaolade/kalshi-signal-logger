@@ -348,7 +348,7 @@ class KalshiMarketStream:
             self._subscribed_markets.discard(market_ticker)
 
     def reset_market(self, market_ticker: str) -> None:
-        """Drop cached book state and request a fresh snapshot for this market."""
+        """Drop cached book state and reconnect to force a fresh snapshot."""
         if not market_ticker:
             return
         with self._lock:
@@ -361,7 +361,7 @@ class KalshiMarketStream:
                 self._sid_to_ticker.pop(sid, None)
             self._subscribed_markets.add(market_ticker)
         logger.info("KalshiMarketStream reset market book | %s", market_ticker)
-        self._send_subscriptions()
+        self._force_reconnect("book reset")
 
     def get_quote(self, market_ticker: str) -> Optional[MarketQuote]:
         with self._lock:
@@ -676,3 +676,18 @@ class KalshiMarketStream:
         except Exception as exc:
             self._last_error = str(exc)
             logger.debug("KalshiMarketStream subscribe send skipped: %s", exc)
+
+    def _force_reconnect(self, reason: str) -> None:
+        ws = self._active_ws
+        loop = self._loop
+        if ws is None or loop is None or not loop.is_running():
+            return
+        try:
+            logger.info("KalshiMarketStream reconnect requested | reason=%s", reason)
+            asyncio.run_coroutine_threadsafe(
+                ws.close(code=1012, reason=reason),
+                loop,
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.debug("KalshiMarketStream reconnect request skipped: %s", exc)
