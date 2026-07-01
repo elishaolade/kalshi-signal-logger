@@ -29,7 +29,6 @@ from app import config
 from app.data_feed import _kalshi_auth_headers
 
 logger = logging.getLogger(__name__)
-_WS_SUBSCRIBE_ID = 1
 
 try:
     import websockets
@@ -278,6 +277,7 @@ class KalshiMarketStream:
         self._sid_to_ticker: dict[str, str] = {}
         self._logged_message_types: set[str] = set()
         self._message_log_count = 0
+        self._next_command_id = 1
         self._ws_thread: Optional[threading.Thread] = None
         self._active_ws: Any = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -652,9 +652,11 @@ class KalshiMarketStream:
     async def _resubscribe(self, ws) -> None:  # pragma: no cover - runtime wrapper
         with self._lock:
             tickers = sorted(self._subscribed_markets)
+            command_id = self._next_command_id
+            self._next_command_id += 1
         if tickers:
             payload = {
-                "id": _WS_SUBSCRIBE_ID,
+                "id": command_id,
                 "cmd": "subscribe",
                 "params": {
                     "channels": ["orderbook_delta"],
