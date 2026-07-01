@@ -131,3 +131,34 @@ def test_observer_clears_crossed_resync_timer_after_good_quote(monkeypatch):
     assert observer.observe_market("KXBTC15M-TEST") is None
 
     assert calls == []
+
+
+def test_observer_rollover_unsubscribes_previous_market(monkeypatch):
+    monkeypatch.setattr("app.config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS", 5)
+
+    stream = KalshiMarketStream()
+    first = "KXBTC15M-FIRST"
+    second = "KXBTC15M-SECOND"
+    stream.apply_orderbook_snapshot(
+        first,
+        yes_bids=[(0.31, 10)],
+        no_bids=[(0.66, 7)],
+        updated_at_ts=100.0,
+    )
+    stream.apply_orderbook_snapshot(
+        second,
+        yes_bids=[(0.41, 10)],
+        no_bids=[(0.58, 7)],
+        updated_at_ts=101.0,
+    )
+    monkeypatch.setattr(stream, "get_quote_age_seconds", lambda ticker: 1.0)
+
+    observer = WebSocketFirstObserver(stream)
+    assert observer.observe_market(first) is not None
+    assert first in stream._subscribed_markets
+
+    assert observer.observe_market(second) is not None
+
+    assert first not in stream._subscribed_markets
+    assert second in stream._subscribed_markets
+    assert stream.get_quote(first) is None

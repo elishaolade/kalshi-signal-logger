@@ -346,6 +346,14 @@ class KalshiMarketStream:
     def unsubscribe_market(self, market_ticker: str) -> None:
         with self._lock:
             self._subscribed_markets.discard(market_ticker)
+            self._quotes.pop(market_ticker, None)
+            stale_sids = [
+                sid for sid, ticker in self._sid_to_ticker.items()
+                if ticker == market_ticker
+            ]
+            for sid in stale_sids:
+                self._sid_to_ticker.pop(sid, None)
+        logger.info("KalshiMarketStream unsubscribed local market cache | %s", market_ticker)
 
     def reset_market(self, market_ticker: str) -> None:
         """Drop cached book state and reconnect to force a fresh snapshot."""

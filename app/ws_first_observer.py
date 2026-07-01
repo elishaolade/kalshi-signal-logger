@@ -34,6 +34,7 @@ class WebSocketFirstObserver:
         self._last_invalid_log_ts = 0.0
         self._last_resync_ts: dict[str, float] = {}
         self._crossed_since_ts: dict[str, float] = {}
+        self._active_market: Optional[str] = None
         self._last_ready_market: Optional[str] = None
 
     def start(self) -> None:
@@ -60,6 +61,7 @@ class WebSocketFirstObserver:
         self.stream.stop()
 
     def observe_market(self, market_ticker: str) -> Optional[WsObservedPrices]:
+        self._set_active_market(market_ticker)
         self.stream.subscribe_market(market_ticker)
         quote = self.stream.get_quote(market_ticker)
         age = self.stream.get_quote_age_seconds(market_ticker)
@@ -107,6 +109,22 @@ class WebSocketFirstObserver:
             yes_depth_at_bid=yes_depth,
             no_depth_at_bid=no_depth,
         )
+
+    def _set_active_market(self, market_ticker: str) -> None:
+        if self._active_market == market_ticker:
+            return
+        previous_market = self._active_market
+        self._active_market = market_ticker
+        self._last_ready_market = None
+        self._crossed_since_ts.clear()
+        if previous_market:
+            self._last_resync_ts.pop(previous_market, None)
+            self.stream.unsubscribe_market(previous_market)
+            logger.info(
+                "ws observer active market rollover | %s -> %s",
+                previous_market,
+                market_ticker,
+            )
 
     def _quote_status(self, quote: Optional[MarketQuote], age: Optional[float]) -> tuple[bool, str]:
         if quote is None or age is None:

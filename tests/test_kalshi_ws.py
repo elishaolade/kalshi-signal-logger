@@ -97,6 +97,21 @@ class TestStreamCache:
         assert age is not None
         assert 1.0 <= age <= 3.5
 
+    def test_unsubscribe_market_clears_local_book_and_subscription(self):
+        stream = KalshiMarketStream()
+        stream.subscribe_market("KXBTC15M-TEST")
+        stream.apply_orderbook_snapshot(
+            "KXBTC15M-TEST",
+            yes_bids=[(0.31, 4)],
+            no_bids=[(0.66, 3)],
+            updated_at_ts=100.0,
+        )
+
+        stream.unsubscribe_market("KXBTC15M-TEST")
+
+        assert stream.get_quote("KXBTC15M-TEST") is None
+        assert "KXBTC15M-TEST" not in stream._subscribed_markets
+
     def test_order_state_tracks_by_client_order_id(self):
         stream = KalshiMarketStream()
         stream.apply_order_update(
