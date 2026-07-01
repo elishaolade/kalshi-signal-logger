@@ -227,3 +227,92 @@ class TestStreamCache:
             }
         )
         assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.32)
+
+    def test_crossed_delta_drops_book_and_resets_market(self, monkeypatch):
+        stream = KalshiMarketStream()
+        stream.apply_orderbook_snapshot(
+            "KXBTC15M-TEST",
+            yes_bids=[(0.41, 4)],
+            no_bids=[(0.58, 3)],
+            updated_at_ts=100.0,
+        )
+        calls = []
+        monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+
+        stream.apply_orderbook_delta(
+            "KXBTC15M-TEST",
+            "YES",
+            [(0.43, 5)],
+            updated_at_ts=101.0,
+        )
+
+        assert stream.get_quote("KXBTC15M-TEST") is None
+        assert calls == ["KXBTC15M-TEST"]
+
+    def test_sequence_gap_resets_market_and_ignores_delta(self, monkeypatch):
+        stream = KalshiMarketStream()
+        stream.ingest_message(
+            {
+                "type": "orderbook_snapshot",
+                "sid": 1,
+                "seq": 10,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes_dollars_fp": [["0.41", "10"]],
+                    "no_dollars_fp": [["0.58", "7"]],
+                },
+            }
+        )
+        calls = []
+        monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+
+        stream.ingest_message(
+            {
+                "type": "orderbook_delta",
+                "sid": 1,
+                "seq": 12,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "side": "yes",
+                    "price_dollars": "0.42",
+                    "delta_fp": "4",
+                },
+            }
+        )
+
+        assert calls == ["KXBTC15M-TEST"]
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.41)
+
+    def test_duplicate_sequence_ignores_delta_without_reset(self, monkeypatch):
+        stream = KalshiMarketStream()
+        stream.ingest_message(
+            {
+                "type": "orderbook_snapshot",
+                "sid": 1,
+                "seq": 10,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes_dollars_fp": [["0.41", "10"]],
+                    "no_dollars_fp": [["0.58", "7"]],
+                },
+            }
+        )
+        calls = []
+        monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+
+        stream.ingest_message(
+            {
+                "type": "orderbook_delta",
+                "sid": 1,
+                "seq": 10,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "side": "yes",
+                    "price_dollars": "0.42",
+                    "delta_fp": "4",
+                },
+            }
+        )
+
+        assert calls == []
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.41)

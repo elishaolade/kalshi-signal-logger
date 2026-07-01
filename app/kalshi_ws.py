@@ -129,6 +129,15 @@ def _price_to_unit(value: Any) -> Optional[float]:
     return round(raw, 4)
 
 
+def _to_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _message_payload(message: dict[str, Any]) -> dict[str, Any]:
     for key in ("msg", "data", "order"):
         payload = message.get(key)
@@ -253,6 +262,11 @@ class MarketQuote:
         self.best_yes_ask = infer_yes_ask(self.best_no_bid)
         self.best_no_ask = infer_no_ask(self.best_yes_bid)
 
+    def crossed_amount(self) -> float:
+        if self.best_yes_bid is None or self.best_no_bid is None:
+            return 0.0
+        return round(max(0.0, self.best_yes_bid + self.best_no_bid - 1.0), 4)
+
     def get_best_bid(self, side: str) -> Optional[float]:
         return self.best_yes_bid if side == "YES" else self.best_no_bid
 
@@ -275,6 +289,7 @@ class KalshiMarketStream:
         self._client_index: dict[str, str] = {}
         self._subscribed_markets: set[str] = set()
         self._sid_to_ticker: dict[str, str] = {}
+        self._seq_by_ticker: dict[str, int] = {}
         self._logged_message_types: set[str] = set()
         self._message_log_count = 0
         self._next_command_id = 1
@@ -353,6 +368,7 @@ class KalshiMarketStream:
             ]
             for sid in stale_sids:
                 self._sid_to_ticker.pop(sid, None)
+            self._seq_by_ticker.pop(market_ticker, None)
         logger.info("KalshiMarketStream unsubscribed local market cache | %s", market_ticker)
 
     def reset_market(self, market_ticker: str) -> None:
@@ -367,6 +383,7 @@ class KalshiMarketStream:
             ]
             for sid in stale_sids:
                 self._sid_to_ticker.pop(sid, None)
+            self._seq_by_ticker.pop(market_ticker, None)
             self._subscribed_markets.add(market_ticker)
         logger.info("KalshiMarketStream reset market book | %s", market_ticker)
         self._force_reconnect("book reset")
@@ -445,6 +462,7 @@ class KalshiMarketStream:
         updated_at_ts: Optional[float] = None,
         signed_delta: bool = False,
     ) -> None:
+        crossed_quote: Optional[MarketQuote] = None
         with self._lock:
             quote = self._quotes.get(market_ticker) or MarketQuote(market_ticker=market_ticker)
             book = quote.yes_bids if side == "YES" else quote.no_bids
@@ -457,8 +475,26 @@ class KalshiMarketStream:
                     book[p] = s
             quote.updated_at_ts = updated_at_ts or time.time()
             quote.refresh_derived()
-            self._quotes[market_ticker] = quote
+            if quote.crossed_amount() > 0:
+                crossed_quote = quote
+                self._quotes.pop(market_ticker, None)
+                self._seq_by_ticker.pop(market_ticker, None)
+            else:
+                self._quotes[market_ticker] = quote
             self._last_message_ts = quote.updated_at_ts
+        if crossed_quote is not None:
+            logger.warning(
+                "KalshiMarketStream dropping crossed book after delta | market=%s "
+                "side=%s crossed=%.4f YES %.3f/%s NO %.3f/%s",
+                market_ticker,
+                side,
+                crossed_quote.crossed_amount(),
+                crossed_quote.best_yes_bid or 0.0,
+                f"{crossed_quote.best_yes_ask:.3f}" if crossed_quote.best_yes_ask is not None else "n/a",
+                crossed_quote.best_no_bid or 0.0,
+                f"{crossed_quote.best_no_ask:.3f}" if crossed_quote.best_no_ask is not None else "n/a",
+            )
+            self.reset_market(market_ticker)
 
     def apply_order_update(
         self,
@@ -514,6 +550,7 @@ class KalshiMarketStream:
             with self._lock:
                 ticker = self._sid_to_ticker.get(sid_key)
         channel = str(message.get("channel") or message.get("type") or "").lower()
+        seq = _to_int(message.get("seq") or payload.get("seq"))
 
         self._log_protocol_message(message, payload, ticker, sid_key)
 
@@ -526,8 +563,15 @@ class KalshiMarketStream:
         yes_bids, no_bids = _extract_book_sides(message)
         if ticker and (yes_bids or no_bids):
             if "snapshot" in channel or message.get("snapshot") is True:
+                self._record_snapshot_sequence(ticker, seq)
                 self.apply_orderbook_snapshot(ticker, yes_bids, no_bids)
             else:
+                sequence_action = self._check_delta_sequence(ticker, seq)
+                if sequence_action == "reset":
+                    self.reset_market(ticker)
+                    return
+                if sequence_action == "ignore":
+                    return
                 if yes_bids:
                     self.apply_orderbook_delta(ticker, "YES", yes_bids)
                 if no_bids:
@@ -535,6 +579,12 @@ class KalshiMarketStream:
 
         delta_side, delta_levels = _extract_delta(message)
         if ticker and delta_side and delta_levels:
+            sequence_action = self._check_delta_sequence(ticker, seq)
+            if sequence_action == "reset":
+                self.reset_market(ticker)
+                return
+            if sequence_action == "ignore":
+                return
             self.apply_orderbook_delta(ticker, delta_side, delta_levels, signed_delta=True)
 
         order_id = payload.get("order_id") or payload.get("id")
@@ -568,6 +618,40 @@ class KalshiMarketStream:
                 fee_total=fee_total,
                 detected_by="websocket",
             )
+
+    def _record_snapshot_sequence(self, market_ticker: str, seq: Optional[int]) -> None:
+        if seq is None:
+            return
+        with self._lock:
+            self._seq_by_ticker[market_ticker] = seq
+
+    def _check_delta_sequence(self, market_ticker: str, seq: Optional[int]) -> str:
+        if seq is None:
+            return "accept"
+        with self._lock:
+            previous = self._seq_by_ticker.get(market_ticker)
+            if previous is None:
+                self._seq_by_ticker[market_ticker] = seq
+                return "accept"
+            if seq == previous + 1:
+                self._seq_by_ticker[market_ticker] = seq
+                return "accept"
+            if seq <= previous:
+                logger.info(
+                    "KalshiMarketStream ignoring duplicate/stale orderbook delta | "
+                    "market=%s seq=%s previous=%s",
+                    market_ticker,
+                    seq,
+                    previous,
+                )
+                return "ignore"
+        logger.warning(
+            "KalshiMarketStream detected orderbook sequence gap | market=%s seq=%s previous=%s",
+            market_ticker,
+            seq,
+            previous,
+        )
+        return "reset"
 
     def _log_protocol_message(
         self,
