@@ -33,6 +33,7 @@ class WebSocketFirstObserver:
         self._last_missing_log_ts = 0.0
         self._last_invalid_log_ts = 0.0
         self._last_resync_ts: dict[str, float] = {}
+        self._crossed_since_ts: dict[str, float] = {}
         self._last_ready_market: Optional[str] = None
 
     def start(self) -> None:
@@ -67,7 +68,7 @@ class WebSocketFirstObserver:
         if not usable:
             if reason == "crossed_book":
                 self._log_invalid(market_ticker, quote, age)
-                self._resync_market(market_ticker)
+                self._resync_crossed_market_if_persistent(market_ticker)
             else:
                 self._log_missing(market_ticker, age)
             if config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES:
@@ -76,6 +77,7 @@ class WebSocketFirstObserver:
 
         assert quote is not None
         assert age is not None
+        self._crossed_since_ts.pop(market_ticker, None)
         if self._last_ready_market != market_ticker:
             logger.info(
                 "ws observer quotes ready | %s | age=%.3fs YES %.3f/%.3f NO %.3f/%.3f",
@@ -149,14 +151,28 @@ class WebSocketFirstObserver:
         self._last_invalid_log_ts = now
         logger.warning(
             "ws observer rejected crossed order book | market=%s age=%s "
-            "YES %.3f/%.3f NO %.3f/%.3f",
+            "persisted=%.3fs threshold=%.3fs YES %.3f/%.3f NO %.3f/%.3f",
             market_ticker,
             f"{age:.3f}s" if age is not None else "n/a",
+            self._crossed_duration(market_ticker, now),
+            config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS,
             (quote.best_yes_bid if quote and quote.best_yes_bid is not None else 0.0),
             (quote.best_yes_ask if quote and quote.best_yes_ask is not None else 0.0),
             (quote.best_no_bid if quote and quote.best_no_bid is not None else 0.0),
             (quote.best_no_ask if quote and quote.best_no_ask is not None else 0.0),
         )
+
+    def _resync_crossed_market_if_persistent(self, market_ticker: str) -> None:
+        now = time.time()
+        first_crossed_at = self._crossed_since_ts.setdefault(market_ticker, now)
+        if now - first_crossed_at < config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS:
+            return
+        self._resync_market(market_ticker)
+        self._crossed_since_ts[market_ticker] = now
+
+    def _crossed_duration(self, market_ticker: str, now: float) -> float:
+        first_crossed_at = self._crossed_since_ts.get(market_ticker, now)
+        return max(0.0, now - first_crossed_at)
 
     def _resync_market(self, market_ticker: str) -> None:
         now = time.time()

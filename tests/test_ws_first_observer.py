@@ -66,6 +66,7 @@ def test_observer_rejects_crossed_book(monkeypatch):
 
 def test_observer_resets_crossed_book(monkeypatch):
     monkeypatch.setattr("app.config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS", 5)
+    monkeypatch.setattr("app.config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS", 3)
 
     stream = KalshiMarketStream()
     stream.apply_orderbook_snapshot(
@@ -78,7 +79,55 @@ def test_observer_resets_crossed_book(monkeypatch):
 
     calls = []
     monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+    now = [100.0]
+    monkeypatch.setattr("app.ws_first_observer.time.time", lambda: now[0])
 
-    WebSocketFirstObserver(stream).observe_market("KXBTC15M-TEST")
+    observer = WebSocketFirstObserver(stream)
+    assert observer.observe_market("KXBTC15M-TEST") is None
+    assert calls == []
 
+    now[0] = 104.0
+    assert observer.observe_market("KXBTC15M-TEST") is None
     assert calls == ["KXBTC15M-TEST"]
+
+
+def test_observer_clears_crossed_resync_timer_after_good_quote(monkeypatch):
+    monkeypatch.setattr("app.config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS", 5)
+    monkeypatch.setattr("app.config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS", 3)
+
+    stream = KalshiMarketStream()
+    stream.apply_orderbook_snapshot(
+        "KXBTC15M-TEST",
+        yes_bids=[(0.76, 10)],
+        no_bids=[(0.30, 7)],
+        updated_at_ts=100.0,
+    )
+    monkeypatch.setattr(stream, "get_quote_age_seconds", lambda ticker: 1.0)
+
+    calls = []
+    monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+    now = [100.0]
+    monkeypatch.setattr("app.ws_first_observer.time.time", lambda: now[0])
+
+    observer = WebSocketFirstObserver(stream)
+    assert observer.observe_market("KXBTC15M-TEST") is None
+
+    stream.apply_orderbook_snapshot(
+        "KXBTC15M-TEST",
+        yes_bids=[(0.31, 10)],
+        no_bids=[(0.66, 7)],
+        updated_at_ts=101.0,
+    )
+    now[0] = 101.0
+    assert observer.observe_market("KXBTC15M-TEST") is not None
+
+    stream.apply_orderbook_snapshot(
+        "KXBTC15M-TEST",
+        yes_bids=[(0.76, 10)],
+        no_bids=[(0.30, 7)],
+        updated_at_ts=102.0,
+    )
+    now[0] = 103.0
+    assert observer.observe_market("KXBTC15M-TEST") is None
+
+    assert calls == []
