@@ -347,6 +347,22 @@ class KalshiMarketStream:
         with self._lock:
             self._subscribed_markets.discard(market_ticker)
 
+    def reset_market(self, market_ticker: str) -> None:
+        """Drop cached book state and request a fresh snapshot for this market."""
+        if not market_ticker:
+            return
+        with self._lock:
+            self._quotes.pop(market_ticker, None)
+            stale_sids = [
+                sid for sid, ticker in self._sid_to_ticker.items()
+                if ticker == market_ticker
+            ]
+            for sid in stale_sids:
+                self._sid_to_ticker.pop(sid, None)
+            self._subscribed_markets.add(market_ticker)
+        logger.info("KalshiMarketStream reset market book | %s", market_ticker)
+        self._send_subscriptions()
+
     def get_quote(self, market_ticker: str) -> Optional[MarketQuote]:
         with self._lock:
             q = self._quotes.get(market_ticker)

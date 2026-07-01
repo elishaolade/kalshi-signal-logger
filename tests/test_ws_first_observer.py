@@ -62,3 +62,23 @@ def test_observer_rejects_crossed_book(monkeypatch):
     monkeypatch.setattr(stream, "get_quote_age_seconds", lambda ticker: 1.0)
 
     assert WebSocketFirstObserver(stream).observe_market("KXBTC15M-TEST") is None
+
+
+def test_observer_resets_crossed_book(monkeypatch):
+    monkeypatch.setattr("app.config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS", 5)
+
+    stream = KalshiMarketStream()
+    stream.apply_orderbook_snapshot(
+        "KXBTC15M-TEST",
+        yes_bids=[(0.76, 10)],
+        no_bids=[(0.30, 7)],
+        updated_at_ts=100.0,
+    )
+    monkeypatch.setattr(stream, "get_quote_age_seconds", lambda ticker: 1.0)
+
+    calls = []
+    monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+
+    WebSocketFirstObserver(stream).observe_market("KXBTC15M-TEST")
+
+    assert calls == ["KXBTC15M-TEST"]

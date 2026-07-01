@@ -32,6 +32,7 @@ class WebSocketFirstObserver:
         self.stream = stream or KalshiMarketStream(enabled=True)
         self._last_missing_log_ts = 0.0
         self._last_invalid_log_ts = 0.0
+        self._last_resync_ts: dict[str, float] = {}
         self._last_ready_market: Optional[str] = None
 
     def start(self) -> None:
@@ -66,6 +67,7 @@ class WebSocketFirstObserver:
         if not usable:
             if reason == "crossed_book":
                 self._log_invalid(market_ticker, quote, age)
+                self._resync_market(market_ticker)
             else:
                 self._log_missing(market_ticker, age)
             if config.MOMENTUM_WS_OBSERVER_REQUIRE_FRESH_QUOTES:
@@ -155,6 +157,14 @@ class WebSocketFirstObserver:
             (quote.best_no_bid if quote and quote.best_no_bid is not None else 0.0),
             (quote.best_no_ask if quote and quote.best_no_ask is not None else 0.0),
         )
+
+    def _resync_market(self, market_ticker: str) -> None:
+        now = time.time()
+        last = self._last_resync_ts.get(market_ticker, 0.0)
+        if now - last < 5.0:
+            return
+        self._last_resync_ts[market_ticker] = now
+        self.stream.reset_market(market_ticker)
 
     @staticmethod
     def _side_prices(quote: MarketQuote, side: str) -> dict:
