@@ -180,3 +180,35 @@ class TestStreamCache:
         )
         assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.32)
         assert stream.get_depth_at_or_better("KXBTC15M-TEST", "YES", 0.32) == pytest.approx(4)
+
+    def test_ingest_message_parses_kalshi_dollars_fp_fields(self):
+        stream = KalshiMarketStream()
+        stream.ingest_message(
+            {
+                "type": "orderbook_snapshot",
+                "sid": 1,
+                "seq": 1,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "yes_dollars_fp": [["0.31", "10"]],
+                    "no_dollars_fp": [["0.66", "7"]],
+                },
+            }
+        )
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.31)
+        assert stream.get_best_ask("KXBTC15M-TEST", "YES") == pytest.approx(0.34)
+
+        stream.ingest_message(
+            {
+                "type": "orderbook_delta",
+                "sid": 1,
+                "seq": 2,
+                "msg": {
+                    "market_ticker": "KXBTC15M-TEST",
+                    "side": "yes",
+                    "price_dollars": "0.32",
+                    "delta_fp": "4",
+                },
+            }
+        )
+        assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.32)

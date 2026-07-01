@@ -183,16 +183,33 @@ def _extract_book_sides(message: dict[str, Any]) -> tuple[list[tuple[float, floa
     Return (yes_bids, no_bids) from a permissive set of payload shapes.
     """
     payload = _message_payload(message)
-    yes_src = payload.get("yes_bids") or payload.get("yes") or payload.get("bids_yes")
-    no_src = payload.get("no_bids") or payload.get("no") or payload.get("bids_no")
+    yes_src = (
+        payload.get("yes_bids")
+        or payload.get("yes")
+        or payload.get("bids_yes")
+        or payload.get("yes_dollars")
+        or payload.get("yes_dollars_fp")
+    )
+    no_src = (
+        payload.get("no_bids")
+        or payload.get("no")
+        or payload.get("bids_no")
+        or payload.get("no_dollars")
+        or payload.get("no_dollars_fp")
+    )
     return _iter_levels(yes_src), _iter_levels(no_src)
 
 
 def _extract_delta(message: dict[str, Any]) -> tuple[Optional[str], list[tuple[float, float]]]:
     payload = _message_payload(message)
     side = payload.get("side")
-    price = _price_to_unit(payload.get("price") or payload.get("yes_price") or payload.get("no_price"))
-    delta = _to_float(payload.get("delta") or payload.get("size_delta"))
+    price = _price_to_unit(
+        payload.get("price")
+        or payload.get("price_dollars")
+        or payload.get("yes_price")
+        or payload.get("no_price")
+    )
+    delta = _to_float(payload.get("delta") or payload.get("delta_fp") or payload.get("size_delta"))
     if side is None or price is None or delta is None:
         return None, []
     side_s = str(side).upper()
