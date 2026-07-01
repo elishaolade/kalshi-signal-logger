@@ -1,5 +1,5 @@
 """
-app/momentum_shadow_tracker.py — Live shadow tracking for the frozen ht120s_tp5c
+app/momentum_shadow_tracker.py — Live shadow tracking for the frozen ht120s_tp3c
 momentum-repricing candidate.
 
 RESEARCH ONLY.  No orders are placed.  No trading endpoints are called.
@@ -11,10 +11,11 @@ the same ExperimentConfig loaded from experiments/momentum-lag.json.  The
 lookback-window logic (two-pointer walk, min 3 rows, 80% actual lookback) is
 replicated here exactly as in backtest/signals.iter_signals().
 
-Exit rules for the frozen ht120s_tp5c profile mirror backtest/executor.py:
-  1. Profit target: live bid >= entry_ask + 0.05 -> EXIT_PROFIT_TARGET
-  2. Fixed-time horizon: elapsed >= 120s -> exit at first available bid
-  3. Grace period: up to 10s past horizon with no bid -> EXIT_UNEXECUTABLE
+Exit rules for the frozen ht120s_tp3c profile mirror backtest/executor.py:
+  1. Profit target: live bid >= entry_ask + 0.03 -> EXIT_PROFIT_TARGET
+  2. Optional stop loss when MOMENTUM_LIVE_STOP_LOSS_ENABLED=true
+  3. Fixed-time horizon: elapsed >= 120s -> exit at first available bid
+  4. Grace period: up to 10s past horizon with no bid -> EXIT_UNEXECUTABLE
 
 PnL formula:
   gross = exit_bid - entry_ask
@@ -32,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from app import config
 from app.db import execute_query, insert_and_get_id
 from app.features import Tick
 from backtest.config import load_config, ExperimentConfig
@@ -45,9 +47,9 @@ logger = logging.getLogger(__name__)
 _CONFIG_PATH = Path(__file__).parent.parent / "experiments" / "momentum-lag.json"
 
 # Exit profile label for the frozen candidate.
-_PROFILE = "ht120s_tp5c"
+_PROFILE = "ht120s_tp3c"
 _HOLD_S  = 120
-_TP      = 0.05    # profit target (dollar fraction)
+_TP      = 0.03    # profit target (dollar fraction)
 
 # Grace window at horizon with no bid -> unexecutable (mirrors executor.py).
 _GRACE_S = 10.0
@@ -60,7 +62,7 @@ _TRIM_WINDOW_S = 60.0
 def _load_shadow_config() -> ExperimentConfig:
     """
     Load base config from experiments/momentum-lag.json and override to the
-    single frozen candidate profile (ht120s_tp5c).
+    single frozen candidate profile (ht120s_tp3c).
     Falls back to constructed defaults if the file is missing so the process
     can start even in stripped environments.
     """
@@ -84,6 +86,7 @@ _SHADOW_CONFIG: ExperimentConfig = _load_shadow_config()
 # ── Exit reason labels (mirror executor.py) ───────────────────────────────────
 
 EXIT_PROFIT_TARGET = "profit_target"
+EXIT_STOP_LOSS     = "stop_loss"
 EXIT_FIXED_TIME    = "fixed_time"
 EXIT_UNEXECUTABLE  = "unexecutable"
 
@@ -115,7 +118,7 @@ class _ActiveShadow:
 
 class MomentumShadowTracker:
     """
-    Manages live shadow trades for the frozen ht120s_tp5c momentum profile.
+    Manages live shadow trades for the frozen ht120s_tp3c momentum profile.
 
     Call on_tick() once per poll cycle after DB writes complete.
     """
@@ -400,10 +403,11 @@ class MomentumShadowTracker:
         """
         Advance all active shadow trades by one tick.
 
-        Exit rule order (mirrors executor.py ht120s_tp5c):
-          1. Profit target: bid >= entry_ask + 0.05
-          2. Fixed-time horizon: elapsed >= 120s + first available bid
-          3. Grace period: no bid for >10s past horizon -> unexecutable
+        Exit rule order:
+          1. Profit target: bid >= entry_ask + 0.03
+          2. Optional stop loss: bid <= entry_ask - configured stop
+          3. Fixed-time horizon: elapsed >= 120s + first available bid
+          4. Grace period: no bid for >10s past horizon -> unexecutable
         """
         for contract_id, shadow in list(self._active.items()):
             bid = get_bid(row, shadow.side)
@@ -423,7 +427,16 @@ class MomentumShadowTracker:
                 exit_reason = EXIT_PROFIT_TARGET
                 exit_bid    = bid
 
-            # 2. Fixed-time horizon.
+            # 2. Optional stop loss.
+            elif (
+                bid is not None
+                and config.MOMENTUM_LIVE_STOP_LOSS_ENABLED
+                and bid <= shadow.entry_ask - abs(config.MOMENTUM_LIVE_STOP_LOSS_CENTS)
+            ):
+                exit_reason = EXIT_STOP_LOSS
+                exit_bid    = bid
+
+            # 3. Fixed-time horizon.
             elif row.ts >= shadow.horizon_ts:
                 if bid is not None:
                     exit_reason = EXIT_FIXED_TIME

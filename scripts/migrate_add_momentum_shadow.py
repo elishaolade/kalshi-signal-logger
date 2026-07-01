@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS momentum_shadow_trades (
     time_remaining_at_entry         INT,
 
     -- Frozen exit profile
-    exit_profile                    VARCHAR(60)     NOT NULL DEFAULT 'ht120s_tp5c',
-    target_ask_price                DECIMAL(10,4),              -- entry_ask + 0.05
+    exit_profile                    VARCHAR(60)     NOT NULL DEFAULT 'ht120s_tp3c',
+    target_ask_price                DECIMAL(10,4),              -- entry_ask + 0.03
 
     -- Lifecycle status
     status                          VARCHAR(20)     NOT NULL DEFAULT 'ACTIVE',

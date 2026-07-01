@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 momentum_live_report.py — Live-vs-shadow performance report for the frozen
-ht120s_tp5c momentum strategy.
+ht120s_tp3c momentum strategy.
 
 Reads:
     momentum_live_trades            — real-money trades (projected + actual)

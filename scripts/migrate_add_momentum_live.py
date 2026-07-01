@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS momentum_live_trades (
     exit_at                         DATETIME(3),
 
     -- Frozen exit profile
-    exit_profile                    VARCHAR(60)     NOT NULL DEFAULT 'ht120s_tp5c',
+    exit_profile                    VARCHAR(60)     NOT NULL DEFAULT 'ht120s_tp3c',
     exit_reason                     VARCHAR(40),
     holding_seconds                 DECIMAL(10,2),
 
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS momentum_live_trades (
 
     -- ── Projected (shadow-of-this-trade) values ──────────────────────────────
     projected_entry_ask             DECIMAL(10,4),
-    projected_target_ask            DECIMAL(10,4),              -- entry_ask + 0.05
+    projected_target_ask            DECIMAL(10,4),              -- entry_ask + 0.03
     projected_exit_bid              DECIMAL(10,4),
     projected_profit_cents          DECIMAL(10,4),              -- shadow net pnl / contract
     -- Strategy-level projected stats captured at entry (rolling shadow window):

@@ -6,7 +6,7 @@ Reads from:
   momentum_shadow_trades — one row per live shadow trade (ACTIVE + COMPLETE)
 
 Purpose:
-  Provide a quick operating view of the frozen ht120s_tp5c shadow strategy:
+  Provide a quick operating view of the frozen ht120s_tp3c shadow strategy:
     - recent summary (last N hours)
     - ACTIVE vs COMPLETE counts
     - side split

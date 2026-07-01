@@ -1,6 +1,6 @@
 """
 app/momentum_live_trader.py — Real-money execution layer for the frozen
-ht120s_tp5c momentum candidate.
+ht120s_tp3c momentum candidate.
 
 THIS PLACES REAL ORDERS when (and only when) every MOMENTUM_LIVE_* gate is set.
 It is a SEPARATE component from the shadow tracker:
@@ -13,8 +13,9 @@ Signal alignment
 ----------------
 Entry detection and exit rules are imported directly from the shadow tracker /
 backtest modules (same ExperimentConfig, same detect_signal, same window math,
-same 120s hold / +5c target / 10s grace).  No strategy parameter is redefined
-here.
+same 120s hold / +3c target / 10s grace).  No strategy parameter is redefined
+here. Optional live-only exit experiments remain disabled unless their explicit
+MOMENTUM_LIVE_* flags are enabled.
 
 Safety model (fail closed)
 --------------------------
@@ -65,6 +66,7 @@ from app.momentum_shadow_tracker import (
     _build_market_row,
     _classify_pnl,
     EXIT_PROFIT_TARGET,
+    EXIT_STOP_LOSS,
     EXIT_FIXED_TIME,
     EXIT_UNEXECUTABLE,
 )
@@ -1019,7 +1021,7 @@ class _ActiveLive:
 
 class MomentumLiveTrader:
     """
-    Live execution for the frozen ht120s_tp5c profile.  Call on_tick() once per
+    Live execution for the frozen ht120s_tp3c profile.  Call on_tick() once per
     poll cycle, AFTER the shadow tracker, with the same arguments.
     """
 
@@ -1144,6 +1146,12 @@ class MomentumLiveTrader:
             return None, None
         entry_price = live.actual_entry_price if live.actual_entry_price is not None else live.entry_ask
         current_profit = round(bid - entry_price, 6)
+
+        if (
+            config.MOMENTUM_LIVE_STOP_LOSS_ENABLED
+            and current_profit <= -abs(config.MOMENTUM_LIVE_STOP_LOSS_CENTS)
+        ):
+            return EXIT_STOP_LOSS, bid
 
         if (
             config.MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED
@@ -2153,10 +2161,11 @@ class MomentumLiveTrader:
         self, live: _ActiveLive, row: MarketRow, bid: Optional[float]
     ) -> tuple[Optional[str], Optional[float]]:
         """
-        EXACT replica of the shadow tracker's exit rule order for ht120s_tp5c:
-          1. profit target: bid >= entry_ask + 0.05
-          2. fixed time:    elapsed >= 120s, first available bid
-          3. grace:         no bid > 10s past horizon -> unexecutable
+        Base replica of the shadow tracker's exit rule order for ht120s_tp3c:
+          1. profit target: bid >= entry_ask + 0.03
+          2. optional live-only exit experiments, if enabled
+          3. fixed time:    elapsed >= 120s, first available bid
+          4. grace:         no bid > 10s past horizon -> unexecutable
         """
         if bid is not None and bid >= live.entry_ask + _TP:
             return EXIT_PROFIT_TARGET, bid

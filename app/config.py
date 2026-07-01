@@ -252,7 +252,12 @@ MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS = float(
 
 # ── Optional exit experiments (disabled by default) ───────────────────────────
 MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
-MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.05"))
+MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.03"))
+MOMENTUM_LIVE_STOP_LOSS_ENABLED = _env_bool("MOMENTUM_LIVE_STOP_LOSS_ENABLED", "false")
+# Dollar fraction below entry. 0.04 = 4 cents.
+MOMENTUM_LIVE_STOP_LOSS_CENTS = float(
+    os.getenv("MOMENTUM_LIVE_STOP_LOSS_CENTS", "0.04")
+)
 MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED = _env_bool(
     "MOMENTUM_LIVE_PROFIT_PROTECTION_ENABLED", "false"
 )
