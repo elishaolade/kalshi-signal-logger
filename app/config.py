@@ -201,10 +201,10 @@ MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS = float(
     os.getenv("MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS", "8")
 )
 # Only drop/reconnect immediately when the reconstructed WS book is severely
-# crossed. Small one-cent crosses are common during fast deltas and are handled
-# by the observer debounce above.
+# crossed. Small/medium crosses are common during fast deltas and are handled by
+# the observer debounce above, which rejects those ticks without recording them.
 MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT = float(
-    os.getenv("MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT", "0.03")
+    os.getenv("MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT", "0.10")
 )
 
 # ── WebSocket shadow-only exit audit (diagnostics only) ───────────────────────
