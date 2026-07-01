@@ -165,8 +165,16 @@ class WebSocketFirstObserver:
     def _resync_crossed_market_if_persistent(self, market_ticker: str) -> None:
         now = time.time()
         first_crossed_at = self._crossed_since_ts.setdefault(market_ticker, now)
-        if now - first_crossed_at < config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS:
+        persisted = now - first_crossed_at
+        if persisted < config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS:
             return
+        logger.info(
+            "ws observer resyncing persistent crossed order book | market=%s "
+            "persisted=%.3fs threshold=%.3fs",
+            market_ticker,
+            persisted,
+            config.MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS,
+        )
         self._resync_market(market_ticker)
         self._crossed_since_ts[market_ticker] = now
 

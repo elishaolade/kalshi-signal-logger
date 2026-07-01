@@ -198,7 +198,7 @@ MOMENTUM_WS_OBSERVER_BOOT_TIMEOUT_SECONDS = float(
 # Crossed WS books can appear briefly while fast deltas are applying. Reject the
 # bad tick immediately, but only force a stream resync if the state persists.
 MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS = float(
-    os.getenv("MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS", "3")
+    os.getenv("MOMENTUM_WS_OBSERVER_CROSSED_RESYNC_SECONDS", "8")
 )
 
 # ── WebSocket shadow-only exit audit (diagnostics only) ───────────────────────
