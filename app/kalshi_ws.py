@@ -258,6 +258,9 @@ class KalshiMarketStream:
         self._order_states: dict[str, WSOrderState] = {}
         self._client_index: dict[str, str] = {}
         self._subscribed_markets: set[str] = set()
+        self._sid_to_ticker: dict[str, str] = {}
+        self._logged_message_types: set[str] = set()
+        self._message_log_count = 0
         self._ws_thread: Optional[threading.Thread] = None
         self._active_ws: Any = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -458,9 +461,26 @@ class KalshiMarketStream:
         """
         if not isinstance(message, dict):
             return
-        ticker = _extract_ticker(message)
-        channel = str(message.get("channel") or message.get("type") or "").lower()
         payload = _message_payload(message)
+        msg_type = str(message.get("type") or message.get("channel") or "").lower()
+        sid = message.get("sid") or payload.get("sid")
+        sid_key = str(sid) if sid is not None else None
+        ticker = _extract_ticker(message)
+        if ticker and sid_key:
+            with self._lock:
+                self._sid_to_ticker[sid_key] = ticker
+        elif sid_key:
+            with self._lock:
+                ticker = self._sid_to_ticker.get(sid_key)
+        channel = str(message.get("channel") or message.get("type") or "").lower()
+
+        self._log_protocol_message(message, payload, ticker, sid_key)
+
+        if msg_type in ("error", "subscribed", "ok"):
+            logger.info(
+                "KalshiMarketStream control message | type=%s sid=%s ticker=%s msg=%s",
+                msg_type, sid_key, ticker, payload,
+            )
 
         yes_bids, no_bids = _extract_book_sides(message)
         if ticker and (yes_bids or no_bids):
@@ -507,6 +527,27 @@ class KalshiMarketStream:
                 fee_total=fee_total,
                 detected_by="websocket",
             )
+
+    def _log_protocol_message(
+        self,
+        message: dict[str, Any],
+        payload: dict[str, Any],
+        ticker: Optional[str],
+        sid: Optional[str],
+    ) -> None:
+        msg_type = str(message.get("type") or message.get("channel") or "unknown")
+        if msg_type in self._logged_message_types and self._message_log_count >= 12:
+            return
+        self._logged_message_types.add(msg_type)
+        self._message_log_count += 1
+        logger.info(
+            "KalshiMarketStream recv | type=%s sid=%s ticker=%s keys=%s payload_keys=%s",
+            msg_type,
+            sid,
+            ticker,
+            sorted(message.keys()),
+            sorted(payload.keys()) if isinstance(payload, dict) else [],
+        )
 
     # ── Background runtime ───────────────────────────────────────────────────
 
@@ -579,14 +620,16 @@ class KalshiMarketStream:
         with self._lock:
             tickers = sorted(self._subscribed_markets)
         if tickers:
-            await ws.send(json.dumps({
+            payload = {
                 "id": _WS_SUBSCRIBE_ID,
                 "cmd": "subscribe",
                 "params": {
                     "channels": ["orderbook_delta"],
                     "market_tickers": tickers,
                 },
-            }))
+            }
+            logger.info("KalshiMarketStream subscribing | payload=%s", payload)
+            await ws.send(json.dumps(payload))
 
     def _send_subscriptions(self) -> None:
         ws = self._active_ws
