@@ -475,7 +475,8 @@ class KalshiMarketStream:
                     book[p] = s
             quote.updated_at_ts = updated_at_ts or time.time()
             quote.refresh_derived()
-            if quote.crossed_amount() > 0:
+            crossed_amount = quote.crossed_amount()
+            if crossed_amount > config.MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT:
                 crossed_quote = quote
                 self._quotes.pop(market_ticker, None)
                 self._seq_by_ticker.pop(market_ticker, None)

@@ -228,7 +228,9 @@ class TestStreamCache:
         )
         assert stream.get_best_bid("KXBTC15M-TEST", "YES") == pytest.approx(0.32)
 
-    def test_crossed_delta_drops_book_and_resets_market(self, monkeypatch):
+    def test_small_crossed_delta_keeps_book_for_observer_debounce(self, monkeypatch):
+        monkeypatch.setattr("app.config.MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT", 0.03)
+
         stream = KalshiMarketStream()
         stream.apply_orderbook_snapshot(
             "KXBTC15M-TEST",
@@ -243,6 +245,31 @@ class TestStreamCache:
             "KXBTC15M-TEST",
             "YES",
             [(0.43, 5)],
+            updated_at_ts=101.0,
+        )
+
+        quote = stream.get_quote("KXBTC15M-TEST")
+        assert quote is not None
+        assert quote.crossed_amount() == pytest.approx(0.01)
+        assert calls == []
+
+    def test_severe_crossed_delta_drops_book_and_resets_market(self, monkeypatch):
+        monkeypatch.setattr("app.config.MOMENTUM_WS_ORDERBOOK_MAX_CROSSED_AMOUNT", 0.03)
+
+        stream = KalshiMarketStream()
+        stream.apply_orderbook_snapshot(
+            "KXBTC15M-TEST",
+            yes_bids=[(0.41, 4)],
+            no_bids=[(0.58, 3)],
+            updated_at_ts=100.0,
+        )
+        calls = []
+        monkeypatch.setattr(stream, "reset_market", lambda ticker: calls.append(ticker))
+
+        stream.apply_orderbook_delta(
+            "KXBTC15M-TEST",
+            "YES",
+            [(0.63, 5)],
             updated_at_ts=101.0,
         )
 
