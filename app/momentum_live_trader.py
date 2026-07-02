@@ -63,6 +63,7 @@ from app.momentum_shadow_tracker import (
     _TP,
     _GRACE_S,
     _TRIM_WINDOW_S,
+    _entry_filter_reason,
     _build_market_row,
     _classify_pnl,
     EXIT_PROFIT_TARGET,
@@ -1514,6 +1515,10 @@ class MomentumLiveTrader:
                 False, "blocked_max_active",
                 f"max active live trades reached ({config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES})",
             )
+
+        entry_filter_reason = _entry_filter_reason(sig.side, sig.entry_ask)
+        if entry_filter_reason:
+            return False, "blocked_entry_filter", entry_filter_reason
 
         if self._ws and self._ws.degraded and self._active:
             return (

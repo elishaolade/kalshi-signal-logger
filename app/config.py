@@ -250,6 +250,14 @@ MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS = float(
     os.getenv("MOMENTUM_LIVE_WS_SHADOW_TIME_PROGRESS_MIN_PROFIT_CENTS", "0")
 )
 
+# ── Momentum entry filters ───────────────────────────────────────────────────
+# Block the bucket that has been the largest TP3C/stop-loss leak so far:
+# high-priced NO entries. 0.50 = 50 cents.
+MOMENTUM_BLOCK_HIGH_NO_ENABLED = _env_bool("MOMENTUM_BLOCK_HIGH_NO_ENABLED", "true")
+MOMENTUM_BLOCK_NO_ENTRY_ASK_MIN = float(
+    os.getenv("MOMENTUM_BLOCK_NO_ENTRY_ASK_MIN", "0.50")
+)
+
 # ── Optional exit experiments (disabled by default) ───────────────────────────
 MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
 MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.03"))

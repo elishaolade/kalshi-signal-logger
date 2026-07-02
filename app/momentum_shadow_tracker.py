@@ -96,6 +96,21 @@ RESULT_BREAKEVEN    = "breakeven"
 RESULT_UNEXECUTABLE = "unexecutable"
 
 
+def _entry_filter_reason(side: str, entry_ask: Optional[float]) -> Optional[str]:
+    """Return a no-trade reason for strategy-level entry filters."""
+    if (
+        config.MOMENTUM_BLOCK_HIGH_NO_ENABLED
+        and side == "NO"
+        and entry_ask is not None
+        and entry_ask >= config.MOMENTUM_BLOCK_NO_ENTRY_ASK_MIN
+    ):
+        return (
+            f"blocked high-price NO entry "
+            f"(entry_ask={entry_ask:.3f} >= {config.MOMENTUM_BLOCK_NO_ENTRY_ASK_MIN:.3f})"
+        )
+    return None
+
+
 # ── Active shadow trade state ─────────────────────────────────────────────────
 
 @dataclass
@@ -318,6 +333,12 @@ class MomentumShadowTracker:
             )
 
             if sig is not None:
+                if _entry_filter_reason(sig.side, sig.entry_ask):
+                    logger.info(
+                        "shadow SKIP entry-filter | %s %s entry_ask=%.3f",
+                        market_ticker, sig.side, sig.entry_ask,
+                    )
+                    continue
                 self._open_shadow(sig, market_ticker)
                 self._cooldown_until[contract_id] = (
                     row.ts + _SHADOW_CONFIG.cooldown_seconds
