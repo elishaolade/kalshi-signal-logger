@@ -1549,7 +1549,9 @@ class MomentumLiveTrader:
                 f"max active live trades reached ({config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES})",
             )
 
-        entry_filter_reason = _entry_filter_reason(sig.side, sig.entry_ask)
+        entry_filter_reason = _entry_filter_reason(
+            sig.side, sig.entry_ask, sig.time_remaining_s,
+        )
         if entry_filter_reason:
             return False, "blocked_entry_filter", entry_filter_reason
 

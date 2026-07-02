@@ -96,7 +96,11 @@ RESULT_BREAKEVEN    = "breakeven"
 RESULT_UNEXECUTABLE = "unexecutable"
 
 
-def _entry_filter_reason(side: str, entry_ask: Optional[float]) -> Optional[str]:
+def _entry_filter_reason(
+    side: str,
+    entry_ask: Optional[float],
+    time_remaining_s: Optional[float],
+) -> Optional[str]:
     """Return a no-trade reason for strategy-level entry filters."""
     if (
         config.MOMENTUM_BLOCK_HIGH_NO_ENABLED
@@ -107,6 +111,17 @@ def _entry_filter_reason(side: str, entry_ask: Optional[float]) -> Optional[str]
         return (
             f"blocked high-price NO entry "
             f"(entry_ask={entry_ask:.3f} >= {config.MOMENTUM_BLOCK_NO_ENTRY_ASK_MIN:.3f})"
+        )
+    if (
+        config.MOMENTUM_BLOCK_TTE_BUCKET_ENABLED
+        and time_remaining_s is not None
+        and config.MOMENTUM_BLOCK_TTE_MIN_SECONDS <= time_remaining_s
+        and time_remaining_s < config.MOMENTUM_BLOCK_TTE_MAX_SECONDS
+    ):
+        return (
+            f"blocked TTE bucket "
+            f"({time_remaining_s:.1f}s in [{config.MOMENTUM_BLOCK_TTE_MIN_SECONDS:.1f}, "
+            f"{config.MOMENTUM_BLOCK_TTE_MAX_SECONDS:.1f}))"
         )
     return None
 
@@ -333,10 +348,11 @@ class MomentumShadowTracker:
             )
 
             if sig is not None:
-                if _entry_filter_reason(sig.side, sig.entry_ask):
+                if _entry_filter_reason(sig.side, sig.entry_ask, sig.time_remaining_s):
                     logger.info(
-                        "shadow SKIP entry-filter | %s %s entry_ask=%.3f",
+                        "shadow SKIP entry-filter | %s %s entry_ask=%.3f tte=%s",
                         market_ticker, sig.side, sig.entry_ask,
+                        sig.time_remaining_s if sig.time_remaining_s is not None else "--",
                     )
                     continue
                 self._open_shadow(sig, market_ticker)
