@@ -150,6 +150,32 @@ def compute_position_size(
     return contracts, dollars_budgeted
 
 
+def compute_fixed_position_size(
+    *,
+    fixed_contracts: int,
+    max_dollars_per_trade: float,
+    max_contracts_per_trade: int,
+    price_per_contract: float,
+) -> tuple[int, float]:
+    """
+    Fixed-contract sizing with the same hard caps as Kelly sizing.
+
+    Returns (0, 0.0) when the fixed count is invalid or one capped fixed lot
+    would exceed the per-trade dollar cap.
+    """
+    if fixed_contracts <= 0 or max_dollars_per_trade <= 0 or price_per_contract <= 0:
+        return 0, 0.0
+    contracts = fixed_contracts
+    if max_contracts_per_trade and max_contracts_per_trade > 0:
+        contracts = min(contracts, max_contracts_per_trade)
+    if contracts < 1:
+        return 0, 0.0
+    dollars_budgeted = round(contracts * price_per_contract, 4)
+    if dollars_budgeted > max_dollars_per_trade:
+        return 0, 0.0
+    return contracts, dollars_budgeted
+
+
 def compute_live_entry_limit_price(
     projected_entry_ask: float,
     price_offset_cents: float,
@@ -609,8 +635,12 @@ def is_live_armed() -> tuple[bool, str]:
         return False, "Kalshi RSA auth not configured (KALSHI_KEY_ID/KALSHI_KEY_FILE)"
     if config.MOMENTUM_LIVE_BANKROLL_DOLLARS <= 0:
         return False, "MOMENTUM_LIVE_BANKROLL_DOLLARS must be > 0"
-    if config.MOMENTUM_LIVE_KELLY_FRACTION <= 0:
+    if config.MOMENTUM_LIVE_SIZE_MODE not in ("kelly", "fixed"):
+        return False, "MOMENTUM_LIVE_SIZE_MODE must be 'kelly' or 'fixed'"
+    if config.MOMENTUM_LIVE_SIZE_MODE == "kelly" and config.MOMENTUM_LIVE_KELLY_FRACTION <= 0:
         return False, "MOMENTUM_LIVE_KELLY_FRACTION must be > 0"
+    if config.MOMENTUM_LIVE_SIZE_MODE == "fixed" and config.MOMENTUM_LIVE_FIXED_CONTRACTS <= 0:
+        return False, "MOMENTUM_LIVE_FIXED_CONTRACTS must be > 0 in fixed mode"
     if config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE <= 0:
         return False, "MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE must be > 0"
     return True, ""
@@ -1061,9 +1091,12 @@ class MomentumLiveTrader:
         if self._armed:
             logger.warning(
                 "MomentumLiveTrader ARMED — REAL ORDERS ENABLED | profile=%s "
-                "bankroll=$%.2f kelly=%.3f max$/trade=%.2f max_contracts=%d "
+                "size_mode=%s fixed_contracts=%d bankroll=$%.2f kelly=%.3f "
+                "max$/trade=%.2f max_contracts=%d "
                 "max_active=%d max_spread=%.3f ws=%s",
                 _PROFILE,
+                config.MOMENTUM_LIVE_SIZE_MODE,
+                config.MOMENTUM_LIVE_FIXED_CONTRACTS,
                 config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
                 config.MOMENTUM_LIVE_KELLY_FRACTION,
                 config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
@@ -1590,19 +1623,28 @@ class MomentumLiveTrader:
         full_kelly = compute_full_kelly_fraction(
             proj["win_rate"], proj["profit_loss_ratio"]
         )
-        contracts, dollars_budgeted = compute_position_size(
-            bankroll_dollars=config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
-            kelly_fraction=config.MOMENTUM_LIVE_KELLY_FRACTION,
-            full_kelly_fraction=full_kelly,
-            max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
-            max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
-            price_per_contract=entry_limit_price,
-        )
+        if config.MOMENTUM_LIVE_SIZE_MODE == "fixed":
+            contracts, dollars_budgeted = compute_fixed_position_size(
+                fixed_contracts=config.MOMENTUM_LIVE_FIXED_CONTRACTS,
+                max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
+                max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
+                price_per_contract=entry_limit_price,
+            )
+        else:
+            contracts, dollars_budgeted = compute_position_size(
+                bankroll_dollars=config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
+                kelly_fraction=config.MOMENTUM_LIVE_KELLY_FRACTION,
+                full_kelly_fraction=full_kelly,
+                max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
+                max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
+                price_per_contract=entry_limit_price,
+            )
         if contracts < 1:
             self._record_guardrail(
                 "blocked_sizing", market_ticker, sig.side,
                 f"sizing rounded down to 0 contracts "
-                f"(full_kelly={full_kelly:.3f}, budget=${dollars_budgeted:.2f}, "
+                f"(mode={config.MOMENTUM_LIVE_SIZE_MODE}, full_kelly={full_kelly:.3f}, "
+                f"budget=${dollars_budgeted:.2f}, "
                 f"price={entry_limit_price:.3f})",
             )
             return False

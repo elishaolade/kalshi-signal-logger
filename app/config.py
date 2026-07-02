@@ -107,7 +107,12 @@ MOMENTUM_LIVE_KILL_SWITCH_FILE = os.getenv(
     "MOMENTUM_LIVE_KILL_SWITCH_FILE", ""
 ).strip()
 
-# ── Bankroll + Kelly sizing ───────────────────────────────────────────────────
+# ── Bankroll + sizing ─────────────────────────────────────────────────────────
+# Default mode is Kelly sizing.  Set MOMENTUM_LIVE_SIZE_MODE=fixed and
+# MOMENTUM_LIVE_FIXED_CONTRACTS=1 to collect fixed-size live data while keeping
+# the same risk gates and max-dollar / max-contract caps.
+MOMENTUM_LIVE_SIZE_MODE              = os.getenv("MOMENTUM_LIVE_SIZE_MODE", "kelly").strip().lower()
+MOMENTUM_LIVE_FIXED_CONTRACTS        = int(os.getenv("MOMENTUM_LIVE_FIXED_CONTRACTS", "0"))
 # Bankroll in whole dollars.  Kelly fraction is a multiplier on the computed
 # full-Kelly stake (e.g. 0.25 = quarter Kelly).  Per-trade dollar and contract
 # caps bound the stake regardless of what Kelly suggests.
