@@ -550,10 +550,7 @@ def _chatgpt_json_response(description: str) -> dict[str, Any]:
         "description": description,
         "content": {
             "application/json": {
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": True,
-                }
+                "schema": {"$ref": "#/components/schemas/LoggerActionResponse"}
             }
         },
     }
@@ -580,7 +577,92 @@ def chatgpt_openapi() -> dict[str, Any]:
                     "in": "header",
                     "name": "x-api-key",
                 }
-            }
+            },
+            "schemas": {
+                "LoggerActionResponse": {
+                    "type": "object",
+                    "description": "Generic JSON response from the read-only logger API.",
+                    "properties": {
+                        "hours": {
+                            "type": ["integer", "null"],
+                            "description": "Optional lookback window in hours.",
+                        },
+                        "row_count": {
+                            "type": "integer",
+                            "description": "Number of rows returned when the endpoint returns rows.",
+                        },
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": True,
+                            },
+                        },
+                        "status_breakdown": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": True,
+                            },
+                        },
+                        "completed_summary": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                        "exit_reason_breakdown": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": True,
+                            },
+                        },
+                        "pause_state": {
+                            "type": ["object", "null"],
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                        "baseline": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                        "pre_entry": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": True,
+                            },
+                        },
+                        "early_exit": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": True,
+                            },
+                        },
+                        "missing_telemetry": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                        "params": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                        "unit_note": {
+                            "type": "string",
+                        },
+                    },
+                    "additionalProperties": True,
+                }
+            },
         },
         "security": [{"ApiKeyAuth": []}],
         "paths": {
