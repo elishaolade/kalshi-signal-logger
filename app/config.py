@@ -68,6 +68,9 @@ RANGE_MARKET_POLL_INTERVAL_SECONDS = float(os.getenv("RANGE_MARKET_POLL_INTERVAL
 # ── Research API ─────────────────────────────────────────────────────────────
 RESEARCH_API_TOKEN = os.getenv("RESEARCH_API_TOKEN", "")
 RESEARCH_API_MAX_ROWS = int(os.getenv("RESEARCH_API_MAX_ROWS", "200"))
+# Public HTTPS base URL used in the ChatGPT Actions OpenAPI document.
+# Example: https://logger.yourdomain.com
+RESEARCH_API_PUBLIC_BASE_URL = os.getenv("RESEARCH_API_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
