@@ -34,6 +34,7 @@ outcomes continue to be recorded by the (separate) shadow tracker.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import statistics
 import uuid
@@ -79,6 +80,8 @@ logger = logging.getLogger(__name__)
 # tracker exactly.  Actual pnl uses real fill prices + real fees instead.
 _PROJ_FEE      = _SHADOW_CONFIG.estimated_fee_per_contract
 _PROJ_SLIPPAGE = _SHADOW_CONFIG.estimated_slippage_cents
+_BTC_LEAD_MARKS = (5, 10, 15, 20, 30, 60)
+_BTC_LEAD_PROFILE_FALLBACK = "btc_lead_lag_v1"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,6 +219,27 @@ def price_delta_to_cents(
     if current_exit_bid is None or actual_entry_price is None:
         return None
     return round((float(current_exit_bid) - float(actual_entry_price)) * 100.0, 4)
+
+
+@dataclass(frozen=True)
+class _BtcLeadSignal:
+    """Synthetic signal object for the BTC lead-lag experiment."""
+
+    market_id: int
+    contract_id: int
+    side: str
+    signal_at: datetime
+    signal_ts: float
+    entry_ask: float
+    entry_spread: Optional[float]
+    time_remaining_s: Optional[float]
+    exit_profile: str
+    strategy_name: str
+    expected_edge_cents: float
+    target_cents: float
+    hold_seconds: float
+    force_one_contract: bool
+    btc_lead_signal: dict
 
 
 def determine_ws_shadow_exit_reasons(
@@ -1072,6 +1096,14 @@ class _ActiveLive:
     time_to_negative_2c_seconds: Optional[float] = None
     time_to_stop_threshold_seconds: Optional[float] = None
 
+    # ── BTC lead-lag experiment telemetry ────────────────────────────────────
+    strategy_name: Optional[str] = None
+    btc_lead_triggered: bool = False
+    btc_lead_expected_edge_cents: Optional[float] = None
+    btc_lead_signal: Optional[dict] = None
+    btc_lead_path: dict = field(default_factory=dict)
+    btc_lead_path_marks_recorded: set[str] = field(default_factory=set)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MomentumLiveTrader
@@ -1095,6 +1127,7 @@ class MomentumLiveTrader:
         self._current_market_id: Optional[str] = None
         self._cooldown_until: dict[int, float] = {}
         self._active: dict[int, _ActiveLive] = {}
+        self._btc_lead_followups: dict[int, _ActiveLive] = {}
         self._ws = (
             ws_stream
             if ws_stream is not None
@@ -1261,6 +1294,12 @@ class MomentumLiveTrader:
             return None, None
         entry_price = live.actual_entry_price if live.actual_entry_price is not None else live.entry_ask
         current_profit = round(bid - entry_price, 6)
+
+        if (
+            live.strategy_name == config.MOMENTUM_BTC_LEAD_PROFILE
+            and current_profit <= -abs(config.MOMENTUM_BTC_LEAD_STOP_LOSS_CENTS)
+        ):
+            return EXIT_STOP_LOSS, bid
 
         if (
             config.MOMENTUM_LIVE_STOP_LOSS_ENABLED
@@ -1614,6 +1653,310 @@ class MomentumLiveTrader:
         except Exception as exc:  # never let diagnostics logging affect a trade
             logger.debug("filter shadow eval logging failed: %s", exc)
 
+    # ── BTC lead-lag experiment helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _is_btc_lead_signal(sig) -> bool:
+        return getattr(sig, "strategy_name", None) == config.MOMENTUM_BTC_LEAD_PROFILE
+
+    @staticmethod
+    def _ask_from_row(row: MarketRow, side: str) -> Optional[float]:
+        return row.yes_ask if side == "YES" else row.no_ask
+
+    @staticmethod
+    def _bid_from_row(row: MarketRow, side: str) -> Optional[float]:
+        return row.yes_bid if side == "YES" else row.no_bid
+
+    @staticmethod
+    def _spread_from_row(row: MarketRow, side: str) -> Optional[float]:
+        return row.yes_spread if side == "YES" else row.no_spread
+
+    @staticmethod
+    def _side_btc_move(side: str, now_price: float, prior_price: float) -> float:
+        return round(now_price - prior_price, 4) if side == "YES" else round(prior_price - now_price, 4)
+
+    @staticmethod
+    def _side_distance(side: str, btc_price: float, target_price: float) -> float:
+        return round(btc_price - target_price, 4) if side == "YES" else round(target_price - btc_price, 4)
+
+    @staticmethod
+    def _row_at_or_before(rows: list[MarketRow], cutoff_ts: float) -> Optional[MarketRow]:
+        prior = None
+        for row in rows:
+            if row.ts <= cutoff_ts:
+                prior = row
+            else:
+                break
+        return prior
+
+    def _btc_lead_completed_count(self) -> int:
+        row = fetch_one(
+            "SELECT COUNT(*) AS n FROM momentum_live_trades "
+            "WHERE exit_profile=%s AND status='COMPLETE' AND filled_contracts > 0",
+            (config.MOMENTUM_BTC_LEAD_PROFILE,),
+        )
+        return int(row["n"] or 0) if row else 0
+
+    def _btc_lead_cumulative_pnl(self) -> float:
+        row = fetch_one(
+            "SELECT COALESCE(SUM(actual_profit_dollars), 0) AS pnl "
+            "FROM momentum_live_trades "
+            "WHERE exit_profile=%s AND status='COMPLETE' AND filled_contracts > 0 "
+            "AND actual_profit_dollars IS NOT NULL",
+            (config.MOMENTUM_BTC_LEAD_PROFILE,),
+        )
+        return float(row["pnl"] or 0.0) if row else 0.0
+
+    def _btc_lead_consecutive_losses(self) -> int:
+        rows = fetch_all(
+            "SELECT actual_profit_dollars FROM momentum_live_trades "
+            "WHERE exit_profile=%s AND status='COMPLETE' AND filled_contracts > 0 "
+            "AND actual_profit_dollars IS NOT NULL "
+            "ORDER BY signal_at DESC LIMIT %s",
+            (config.MOMENTUM_BTC_LEAD_PROFILE, max(1, config.MOMENTUM_BTC_LEAD_MAX_CONSECUTIVE_LOSSES)),
+        )
+        losses = 0
+        for row in rows:
+            if float(row["actual_profit_dollars"]) < 0:
+                losses += 1
+            else:
+                break
+        return losses
+
+    def _check_btc_lead_experiment_gates(self, market_ticker: str, side: str) -> tuple[bool, str]:
+        max_trades = config.MOMENTUM_BTC_LEAD_MAX_COMPLETED_TRADES
+        if max_trades > 0 and self._btc_lead_completed_count() >= max_trades:
+            return False, f"BTC lead-lag test complete: reached {max_trades} completed trades"
+
+        max_loss = abs(config.MOMENTUM_BTC_LEAD_MAX_CUM_LOSS_DOLLARS)
+        if max_loss > 0 and self._btc_lead_cumulative_pnl() <= -max_loss:
+            return False, f"BTC lead-lag loss stop reached: cumulative <= -${max_loss:.2f}"
+
+        max_consec = config.MOMENTUM_BTC_LEAD_MAX_CONSECUTIVE_LOSSES
+        if max_consec > 0 and self._btc_lead_consecutive_losses() >= max_consec:
+            return False, f"BTC lead-lag loss streak stop reached: {max_consec} consecutive losses"
+
+        if config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES <= 0:
+            return False, "max active trade config is invalid"
+        return True, ""
+
+    def _detect_btc_lead_signal(
+        self,
+        *,
+        market_db_id: int,
+        market_ticker: str,
+        contract_ids: dict[str, int],
+        target_price: float,
+        row: MarketRow,
+        window: list[MarketRow],
+        captured_at: datetime,
+    ) -> Optional[_BtcLeadSignal]:
+        if not config.MOMENTUM_BTC_LEAD_ENABLED:
+            return None
+        if row.time_remaining_s is None:
+            return None
+        if not (config.MOMENTUM_BTC_LEAD_MIN_TTE_SECONDS <= row.time_remaining_s <= config.MOMENTUM_BTC_LEAD_MAX_TTE_SECONDS):
+            return None
+
+        priors = {
+            mark: self._row_at_or_before(window, row.ts - mark)
+            for mark in (5, 10, 30, 60)
+        }
+        if any(priors[mark] is None for mark in (5, 10, 30, 60)):
+            return None
+
+        for side in ("YES", "NO"):
+            contract_id = contract_ids.get(side)
+            if contract_id is None or contract_id in self._active:
+                continue
+            if row.ts < self._cooldown_until.get(contract_id, float("-inf")):
+                continue
+
+            ask = self._ask_from_row(row, side)
+            bid = self._bid_from_row(row, side)
+            spread = self._spread_from_row(row, side)
+            if ask is None or bid is None:
+                continue
+            if not (config.MOMENTUM_BTC_LEAD_MIN_ASK <= ask <= config.MOMENTUM_BTC_LEAD_MAX_ASK):
+                continue
+            if spread is None or spread > config.MOMENTUM_LIVE_MAX_SPREAD:
+                continue
+
+            quote_age = self._quote_age_seconds(market_ticker, captured_at)
+            if quote_age > config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
+                continue
+
+            btc_moves = {
+                mark: self._side_btc_move(side, row.btc_price, priors[mark].btc_price)  # type: ignore[index]
+                for mark in (5, 10, 30, 60)
+            }
+            if (
+                btc_moves[5] < config.MOMENTUM_BTC_LEAD_MIN_MOVE_5S
+                or btc_moves[10] < config.MOMENTUM_BTC_LEAD_MIN_MOVE_10S
+                or btc_moves[30] < config.MOMENTUM_BTC_LEAD_MIN_MOVE_30S
+                or btc_moves[60] < config.MOMENTUM_BTC_LEAD_MIN_MOVE_60S
+            ):
+                continue
+
+            side_distance = self._side_distance(side, row.btc_price, target_price)
+            if side_distance < -abs(config.MOMENTUM_BTC_LEAD_MAX_WRONG_SIDE_DISTANCE):
+                continue
+
+            contract_moves: dict[int, Optional[float]] = {}
+            for mark, prior in priors.items():
+                prior_ask = self._ask_from_row(prior, side) if prior else None
+                contract_moves[mark] = (
+                    round((ask - prior_ask) * 100.0, 4)
+                    if prior_ask is not None else None
+                )
+            contract_move_30 = contract_moves[30]
+            if contract_move_30 is None:
+                continue
+
+            expected_contract_move_cents = (
+                btc_moves[30] / config.MOMENTUM_BTC_LEAD_DOLLARS_PER_EXPECTED_CENT
+                if config.MOMENTUM_BTC_LEAD_DOLLARS_PER_EXPECTED_CENT > 0 else 0.0
+            )
+            expected_edge_cents = round(expected_contract_move_cents - contract_move_30, 4)
+            if expected_edge_cents < config.MOMENTUM_BTC_LEAD_MIN_EXPECTED_EDGE_CENTS:
+                continue
+
+            ok, reason = self._check_btc_lead_experiment_gates(market_ticker, side)
+            if not ok:
+                self._record_guardrail("blocked_btc_lead_experiment", market_ticker, side, reason)
+                return None
+
+            signal_json = {
+                "reason": "external_btc_leads_kalshi_repricing",
+                "side": side,
+                "btc_price": row.btc_price,
+                "target_price": target_price,
+                "side_distance": side_distance,
+                "time_remaining_s": row.time_remaining_s,
+                "entry_bid": bid,
+                "entry_ask": ask,
+                "entry_spread": spread,
+                "quote_age_seconds": quote_age,
+                "btc_moves": {str(k): v for k, v in btc_moves.items()},
+                "contract_ask_moves_cents": {str(k): v for k, v in contract_moves.items()},
+                "expected_contract_move_cents": round(expected_contract_move_cents, 4),
+                "expected_edge_cents": expected_edge_cents,
+                "snapshots": {
+                    "signal": self._btc_lead_snapshot(row),
+                    **{f"minus_{mark}s": self._btc_lead_snapshot(priors[mark]) for mark in (5, 10, 30, 60)},
+                },
+            }
+            return _BtcLeadSignal(
+                market_id=market_db_id,
+                contract_id=contract_id,
+                side=side,
+                signal_at=captured_at,
+                signal_ts=captured_at.timestamp(),
+                entry_ask=ask,
+                entry_spread=spread,
+                time_remaining_s=float(row.time_remaining_s),
+                exit_profile=config.MOMENTUM_BTC_LEAD_PROFILE or _BTC_LEAD_PROFILE_FALLBACK,
+                strategy_name=config.MOMENTUM_BTC_LEAD_PROFILE or _BTC_LEAD_PROFILE_FALLBACK,
+                expected_edge_cents=expected_edge_cents,
+                target_cents=config.MOMENTUM_LIVE_TP_CENTS or _TP,
+                hold_seconds=_HOLD_S,
+                force_one_contract=True,
+                btc_lead_signal=signal_json,
+            )
+        return None
+
+    @staticmethod
+    def _btc_lead_snapshot(row: Optional[MarketRow]) -> Optional[dict]:
+        if row is None:
+            return None
+        return {
+            "captured_at": row.captured_at.isoformat(),
+            "btc_price": row.btc_price,
+            "time_remaining_s": row.time_remaining_s,
+            "yes_bid": row.yes_bid,
+            "yes_ask": row.yes_ask,
+            "no_bid": row.no_bid,
+            "no_ask": row.no_ask,
+        }
+
+    def _update_btc_lead_path(self, live: _ActiveLive, row: MarketRow, captured_at: datetime) -> None:
+        if not live.btc_lead_triggered:
+            return
+        if not live.btc_lead_path:
+            live.btc_lead_path = {}
+        if "entry" not in live.btc_lead_path:
+            live.btc_lead_path["entry"] = self._btc_lead_snapshot(row)
+        if live.entry_fill_ts is None:
+            return
+        elapsed = max(0.0, captured_at.timestamp() - live.entry_fill_ts)
+        for mark in _BTC_LEAD_MARKS:
+            key = f"plus_{mark}s"
+            if elapsed >= mark and key not in live.btc_lead_path_marks_recorded:
+                live.btc_lead_path[key] = self._btc_lead_snapshot(row)
+                live.btc_lead_path_marks_recorded.add(key)
+
+    def _btc_lead_path_complete(self, live: _ActiveLive) -> bool:
+        return all(f"plus_{mark}s" in live.btc_lead_path for mark in _BTC_LEAD_MARKS)
+
+    def _queue_btc_lead_followup(self, live: _ActiveLive) -> None:
+        if not live.btc_lead_triggered or self._btc_lead_path_complete(live):
+            return
+        followups = getattr(self, "_btc_lead_followups", None)
+        if followups is None:
+            self._btc_lead_followups = {}
+            followups = self._btc_lead_followups
+        followups[live.live_trade_id] = live
+
+    def _advance_btc_lead_followups(self, market_ticker: str, row: MarketRow, captured_at: datetime) -> None:
+        followups = getattr(self, "_btc_lead_followups", None)
+        if not followups:
+            return
+        for live_trade_id, live in list(followups.items()):
+            if live.market_ticker != market_ticker:
+                continue
+            self._update_btc_lead_path(live, row, captured_at)
+            self._persist_btc_lead_fields(live)
+            elapsed = (
+                captured_at.timestamp() - live.entry_fill_ts
+                if live.entry_fill_ts is not None else 0.0
+            )
+            if self._btc_lead_path_complete(live) or elapsed > max(_BTC_LEAD_MARKS) + 5:
+                followups.pop(live_trade_id, None)
+
+    def _persist_btc_lead_fields(self, live: _ActiveLive) -> None:
+        if not live.strategy_name and not live.btc_lead_triggered:
+            return
+        signal = live.btc_lead_signal or {}
+        btc_moves = signal.get("btc_moves", {}) if isinstance(signal, dict) else {}
+        contract_moves = signal.get("contract_ask_moves_cents", {}) if isinstance(signal, dict) else {}
+        try:
+            execute_query(
+                "UPDATE momentum_live_trades SET "
+                "strategy_name=%s, btc_lead_triggered=%s, btc_lead_expected_edge_cents=%s, "
+                "btc_lead_btc_move_5s=%s, btc_lead_btc_move_10s=%s, "
+                "btc_lead_btc_move_30s=%s, btc_lead_btc_move_60s=%s, "
+                "btc_lead_contract_move_5s_cents=%s, btc_lead_contract_move_10s_cents=%s, "
+                "btc_lead_contract_move_30s_cents=%s, btc_lead_contract_move_60s_cents=%s, "
+                "btc_lead_signal_json=%s, btc_lead_path_json=%s "
+                "WHERE id=%s",
+                (
+                    live.strategy_name,
+                    1 if live.btc_lead_triggered else 0,
+                    live.btc_lead_expected_edge_cents,
+                    btc_moves.get("5"), btc_moves.get("10"), btc_moves.get("30"), btc_moves.get("60"),
+                    contract_moves.get("5"), contract_moves.get("10"),
+                    contract_moves.get("30"), contract_moves.get("60"),
+                    json.dumps(live.btc_lead_signal, default=str) if live.btc_lead_signal else None,
+                    json.dumps(live.btc_lead_path, default=str) if live.btc_lead_path else None,
+                    live.live_trade_id,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "BTC lead-lag telemetry write failed - run "
+                "migrate_add_btc_lead_lag_experiment.py: %s", exc,
+            )
+
     def on_tick(
         self,
         market_db_id:  int,
@@ -1671,6 +2014,8 @@ class MomentumLiveTrader:
             btc_ticks=btc_ticks,
         )
 
+        self._advance_btc_lead_followups(market_ticker, row, captured_at)
+
         if self._active:
             try:
                 self._advance_active(row, captured_at)
@@ -1722,6 +2067,25 @@ class MomentumLiveTrader:
             opens_at=None, closes_at=None, settles_at=None,
             status="open", contract_ids=contract_ids,
         )
+
+        btc_lead_sig = self._detect_btc_lead_signal(
+            market_db_id=market_db_id,
+            market_ticker=market_ticker,
+            contract_ids=contract_ids,
+            target_price=target_price,
+            row=row,
+            window=window,
+            captured_at=captured_at,
+        )
+        if btc_lead_sig is not None:
+            if self._shadow_only:
+                self._open_shadow_entry(btc_lead_sig, market_ticker, captured_at)
+            else:
+                self._try_open_live(btc_lead_sig, market_ticker, captured_at)
+            return
+
+        if config.MOMENTUM_BTC_LEAD_ENABLED and config.MOMENTUM_BTC_LEAD_EXCLUSIVE:
+            return
 
         for side in ("YES", "NO"):
             contract_id = contract_ids.get(side)
@@ -1777,11 +2141,17 @@ class MomentumLiveTrader:
                 f"max active live trades reached ({config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES})",
             )
 
-        entry_filter_reason = _entry_filter_reason(
-            sig.side, sig.entry_ask, sig.time_remaining_s,
-        )
-        if entry_filter_reason:
-            return False, "blocked_entry_filter", entry_filter_reason
+        is_btc_lead = self._is_btc_lead_signal(sig)
+        if is_btc_lead:
+            ok, reason = self._check_btc_lead_experiment_gates(market_ticker, sig.side)
+            if not ok:
+                return False, "blocked_btc_lead_experiment", reason
+        else:
+            entry_filter_reason = _entry_filter_reason(
+                sig.side, sig.entry_ask, sig.time_remaining_s,
+            )
+            if entry_filter_reason:
+                return False, "blocked_entry_filter", entry_filter_reason
 
         if self._ws and self._ws.degraded and self._active:
             return (
@@ -1836,7 +2206,8 @@ class MomentumLiveTrader:
             market_ticker, sig.side, getattr(sig, "entry_spread", None)
         )
         ws_quote_age = self._quote_age_seconds(market_ticker, captured_at)
-        target_ask = round(sig.entry_ask + _TP, 4)
+        target_cents = getattr(sig, "target_cents", _TP)
+        target_ask = round(sig.entry_ask + target_cents, 4)
 
         live_trade_id = insert_and_get_id(
             """
@@ -1862,7 +2233,7 @@ class MomentumLiveTrader:
             """,
             (
                 sig.market_id, sig.contract_id, market_ticker, sig.side,
-                sig.signal_at, captured_at, _PROFILE,
+                sig.signal_at, captured_at, getattr(sig, "exit_profile", _PROFILE),
                 sig.entry_ask, target_ask,
                 sig.entry_ask,
                 1 if ws else 0, _safe(ws_quote_age), _safe(ws_spread),
@@ -1880,7 +2251,7 @@ class MomentumLiveTrader:
             signal_at=sig.signal_at,
             signal_ts=sig.signal_ts,
             entry_ask=sig.entry_ask,
-            horizon_ts=sig.signal_ts + _HOLD_S,
+            horizon_ts=sig.signal_ts + getattr(sig, "hold_seconds", _HOLD_S),
             requested_contracts=1,
             status="ACTIVE",
             filled_contracts=1,
@@ -1893,9 +2264,14 @@ class MomentumLiveTrader:
             ws_entry_best_bid=ws_best_bid,
             ws_entry_best_ask=ws_best_ask,
             entry_order_price=sig.entry_ask,
+            strategy_name=getattr(sig, "strategy_name", None),
+            btc_lead_triggered=self._is_btc_lead_signal(sig),
+            btc_lead_expected_edge_cents=getattr(sig, "expected_edge_cents", None),
+            btc_lead_signal=getattr(sig, "btc_lead_signal", None),
         )
         self._capture_signal_time_fields(live, sig, ws_best_ask, ws_spread, ws_quote_age)
         self._persist_signal_time_fields(live)
+        self._persist_btc_lead_fields(live)
         self._maybe_log_filter_shadow_eval(live)
 
         # One-active-per-contract + cooldown, mirroring a real fill.
@@ -1926,6 +2302,7 @@ class MomentumLiveTrader:
         self._update_trade_metrics(
             live, bid=bid, quote_age=quote_age, spread=spread, captured_at=captured_at,
         )
+        self._update_btc_lead_path(live, row, captured_at)
 
         exit_reason, exit_bid = self._frozen_exit_decision(live, row, bid)
         if exit_reason is None:
@@ -1955,26 +2332,49 @@ class MomentumLiveTrader:
             logger.warning("live BLOCKED | %s %s | %s", market_ticker, sig.side, reason)
             return False
 
-        # Projected strategy stats (rolling shadow window) → Kelly inputs.
-        proj = self._load_projected_stats()
-        if proj is None or proj["n"] < config.MOMENTUM_LIVE_MIN_SHADOW_TRADES:
-            self._record_guardrail(
-                "blocked_sizing", market_ticker, sig.side,
-                f"insufficient shadow history for sizing "
-                f"(have {None if proj is None else proj['n']}, "
-                f"need {config.MOMENTUM_LIVE_MIN_SHADOW_TRADES})",
-            )
-            return False
+        is_btc_lead = self._is_btc_lead_signal(sig)
+
+        # Projected strategy stats (rolling shadow window) -> Kelly inputs.
+        # BTC lead-lag is an explicit 1-contract experiment, so it bypasses
+        # Kelly/shadow-history sizing but still respects spread, quote freshness,
+        # max active, kill switch, daily loss, and max-dollar caps.
+        if is_btc_lead:
+            proj = {
+                "n": 0,
+                "expectancy": None,
+                "win_rate": None,
+                "profit_factor": None,
+                "profit_loss_ratio": None,
+            }
+            full_kelly = 0.0
+        else:
+            proj = self._load_projected_stats()
+            if proj is None or proj["n"] < config.MOMENTUM_LIVE_MIN_SHADOW_TRADES:
+                self._record_guardrail(
+                    "blocked_sizing", market_ticker, sig.side,
+                    f"insufficient shadow history for sizing "
+                    f"(have {None if proj is None else proj['n']}, "
+                    f"need {config.MOMENTUM_LIVE_MIN_SHADOW_TRADES})",
+                )
+                return False
 
         entry_limit_price = compute_live_entry_limit_price(
             sig.entry_ask,
             config.MOMENTUM_LIVE_ENTRY_PRICE_OFFSET_CENTS,
         )
 
-        full_kelly = compute_full_kelly_fraction(
-            proj["win_rate"], proj["profit_loss_ratio"]
-        )
-        if self._diagnostic:
+        if not is_btc_lead:
+            full_kelly = compute_full_kelly_fraction(
+                proj["win_rate"], proj["profit_loss_ratio"]
+            )
+        if is_btc_lead:
+            contracts, dollars_budgeted = compute_fixed_position_size(
+                fixed_contracts=1,
+                max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
+                max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
+                price_per_contract=entry_limit_price,
+            )
+        elif self._diagnostic:
             # Forced 1-contract diagnostic run: pin size to exactly 1 and bypass
             # Kelly.  Every other gate/safeguard above still applied.
             contracts, dollars_budgeted = compute_fixed_position_size(
@@ -2009,7 +2409,8 @@ class MomentumLiveTrader:
             )
             return False
 
-        target_ask = round(sig.entry_ask + _TP, 4)
+        target_cents = getattr(sig, "target_cents", _TP)
+        target_ask = round(sig.entry_ask + target_cents, 4)
         now = datetime.now(timezone.utc)
         ws = getattr(self, "_ws", None)
         ws_best_bid = ws.get_best_bid(market_ticker, sig.side) if ws else None
@@ -2056,7 +2457,7 @@ class MomentumLiveTrader:
             """,
             (
                 sig.market_id, sig.contract_id, market_ticker, sig.side,
-                sig.signal_at, _PROFILE,
+                sig.signal_at, getattr(sig, "exit_profile", _PROFILE),
                 config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
                 config.MOMENTUM_LIVE_KELLY_FRACTION, round(full_kelly, 4),
                 dollars_budgeted, contracts,
@@ -2082,7 +2483,7 @@ class MomentumLiveTrader:
             signal_at=sig.signal_at,
             signal_ts=sig.signal_ts,
             entry_ask=sig.entry_ask,
-            horizon_ts=sig.signal_ts + _HOLD_S,
+            horizon_ts=sig.signal_ts + getattr(sig, "hold_seconds", _HOLD_S),
             requested_contracts=contracts,
             status="PENDING_ENTRY",
             entry_client_order_id=coid,
@@ -2094,10 +2495,15 @@ class MomentumLiveTrader:
             entry_signal_to_order_ms=int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
             entry_order_price=entry_limit_price,
             diagnostic_mode=self._diagnostic,
+            strategy_name=getattr(sig, "strategy_name", None),
+            btc_lead_triggered=is_btc_lead,
+            btc_lead_expected_edge_cents=getattr(sig, "expected_edge_cents", None),
+            btc_lead_signal=getattr(sig, "btc_lead_signal", None),
         )
         # Filter-diagnostics: capture signal-time inputs + persist (telemetry-only).
         self._capture_signal_time_fields(live, sig, ws_best_ask, ws_spread, ws_quote_age)
         self._persist_signal_time_fields(live)
+        self._persist_btc_lead_fields(live)
         self._maybe_log_filter_shadow_eval(live)
 
         # Place the real entry order (limit buy at the observed ask).
@@ -2396,6 +2802,7 @@ class MomentumLiveTrader:
             spread=spread,
             captured_at=captured_at,
         )
+        self._update_btc_lead_path(live, row, captured_at)
         exit_reason, exit_bid = self._frozen_exit_decision(live, row, bid)
         if exit_reason is None:
             return
@@ -2501,6 +2908,7 @@ class MomentumLiveTrader:
             spread=spread,
             captured_at=captured_at,
         )
+        self._update_btc_lead_path(live, row, captured_at)
         if not live.exit_order_ids:
             # We owe an exit but never placed one (no bid earlier) — try now.
             remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
@@ -2593,7 +3001,7 @@ class MomentumLiveTrader:
           3. fixed time:    elapsed >= 120s, first available bid
           4. grace:         no bid > 10s past horizon -> unexecutable
         """
-        if bid is not None and bid >= live.entry_ask + _TP:
+        if bid is not None and bid >= live.entry_ask + self._target_cents():
             return EXIT_PROFIT_TARGET, bid
         experimental_reason, experimental_bid = self._experimental_exit_decision(live, row, bid)
         if experimental_reason is not None:
@@ -2879,6 +3287,8 @@ class MomentumLiveTrader:
         )
         self._write_phase(live.live_trade_id, "FINALIZED")
         self._persist_first30s_fields(live)
+        self._persist_btc_lead_fields(live)
+        self._queue_btc_lead_followup(live)
         if not live.exit_accounting_verified:
             self._record_guardrail(
                 "accounting_unverified", live.market_ticker, live.side,

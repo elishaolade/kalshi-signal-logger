@@ -292,6 +292,37 @@ MOMENTUM_WS_SHADOW_ONLY = _env_bool("MOMENTUM_WS_SHADOW_ONLY", "false")
 #    regardless of this flag.
 MOMENTUM_FILTER_SHADOW_EVAL = _env_bool("MOMENTUM_FILTER_SHADOW_EVAL", "false")
 
+# ── BTC lead-lag live experiment (disabled by default) ────────────────────────
+# Tests whether external BTC spot movement leads Kalshi BTC15M quote repricing.
+# This is a separate signal path from the frozen momentum profile.  It is
+# limited to one contract per trade and has its own experiment stop gates.
+MOMENTUM_BTC_LEAD_ENABLED = _env_bool("MOMENTUM_BTC_LEAD_ENABLED", "false")
+# When true, skip the legacy frozen momentum entry path and only evaluate this
+# BTC lead-lag experiment.  Use this during the limited real-money test.
+MOMENTUM_BTC_LEAD_EXCLUSIVE = _env_bool("MOMENTUM_BTC_LEAD_EXCLUSIVE", "false")
+MOMENTUM_BTC_LEAD_PROFILE = os.getenv("MOMENTUM_BTC_LEAD_PROFILE", "btc_lead_lag_v1")
+MOMENTUM_BTC_LEAD_MAX_COMPLETED_TRADES = int(os.getenv("MOMENTUM_BTC_LEAD_MAX_COMPLETED_TRADES", "30"))
+MOMENTUM_BTC_LEAD_MAX_CUM_LOSS_DOLLARS = float(os.getenv("MOMENTUM_BTC_LEAD_MAX_CUM_LOSS_DOLLARS", "5"))
+MOMENTUM_BTC_LEAD_MAX_CONSECUTIVE_LOSSES = int(os.getenv("MOMENTUM_BTC_LEAD_MAX_CONSECUTIVE_LOSSES", "5"))
+MOMENTUM_BTC_LEAD_MIN_TTE_SECONDS = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_TTE_SECONDS", "120"))
+MOMENTUM_BTC_LEAD_MAX_TTE_SECONDS = float(os.getenv("MOMENTUM_BTC_LEAD_MAX_TTE_SECONDS", "420"))
+MOMENTUM_BTC_LEAD_MIN_ASK = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_ASK", "0.05"))
+MOMENTUM_BTC_LEAD_MAX_ASK = float(os.getenv("MOMENTUM_BTC_LEAD_MAX_ASK", "0.95"))
+MOMENTUM_BTC_LEAD_MIN_MOVE_5S = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_MOVE_5S", "10"))
+MOMENTUM_BTC_LEAD_MIN_MOVE_10S = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_MOVE_10S", "15"))
+MOMENTUM_BTC_LEAD_MIN_MOVE_30S = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_MOVE_30S", "25"))
+MOMENTUM_BTC_LEAD_MIN_MOVE_60S = float(os.getenv("MOMENTUM_BTC_LEAD_MIN_MOVE_60S", "35"))
+MOMENTUM_BTC_LEAD_DOLLARS_PER_EXPECTED_CENT = float(
+    os.getenv("MOMENTUM_BTC_LEAD_DOLLARS_PER_EXPECTED_CENT", "10")
+)
+MOMENTUM_BTC_LEAD_MIN_EXPECTED_EDGE_CENTS = float(
+    os.getenv("MOMENTUM_BTC_LEAD_MIN_EXPECTED_EDGE_CENTS", "3")
+)
+MOMENTUM_BTC_LEAD_MAX_WRONG_SIDE_DISTANCE = float(
+    os.getenv("MOMENTUM_BTC_LEAD_MAX_WRONG_SIDE_DISTANCE", "100")
+)
+MOMENTUM_BTC_LEAD_STOP_LOSS_CENTS = float(os.getenv("MOMENTUM_BTC_LEAD_STOP_LOSS_CENTS", "0.04"))
+
 # ── Optional exit experiments (disabled by default) ───────────────────────────
 MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
 MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.03"))
