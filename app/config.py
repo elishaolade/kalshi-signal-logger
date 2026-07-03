@@ -266,6 +266,29 @@ MOMENTUM_BLOCK_TTE_BUCKET_ENABLED = _env_bool("MOMENTUM_BLOCK_TTE_BUCKET_ENABLED
 MOMENTUM_BLOCK_TTE_MIN_SECONDS = float(os.getenv("MOMENTUM_BLOCK_TTE_MIN_SECONDS", "450"))
 MOMENTUM_BLOCK_TTE_MAX_SECONDS = float(os.getenv("MOMENTUM_BLOCK_TTE_MAX_SECONDS", "600"))
 
+# ── Filter-diagnostics research modes (telemetry / shadow only) ───────────────
+# These three flags back the pre-entry / first-30-second FILTER DIAGNOSTICS
+# milestone.  All default OFF and NONE of them changes strategy entry/exit
+# behaviour for real exits.  See app/momentum_filter_shadow.py and
+# scripts/momentum_filter_diagnostics.py.
+#
+# 1) Force a fixed 1-contract LIVE diagnostic run.  When true, live sizing is
+#    pinned to exactly 1 contract and Kelly is bypassed for this run — every
+#    other gate/safeguard is unchanged.  Rows are tagged diagnostic_mode=1.
+MOMENTUM_LIVE_DIAGNOSTIC_1_CONTRACT = _env_bool("MOMENTUM_LIVE_DIAGNOSTIC_1_CONTRACT", "false")
+#
+# 2) WebSocket SHADOW-ONLY mode.  Runs the frozen signal detection + full
+#    telemetry and records hypothetical entries/exits (shadow_only=1), but NEVER
+#    submits, cancels, amends, or exits a real order.  Requires no Kalshi auth or
+#    bankroll.  This is the "pause live, observe only" switch.
+MOMENTUM_WS_SHADOW_ONLY = _env_bool("MOMENTUM_WS_SHADOW_ONLY", "false")
+#
+# 3) Evaluate candidate pre-entry filters in shadow alongside each recorded
+#    trade (telemetry/logging only).  Never gates real entries/exits.  Default
+#    false; the diagnostics report recomputes filter impact from stored columns
+#    regardless of this flag.
+MOMENTUM_FILTER_SHADOW_EVAL = _env_bool("MOMENTUM_FILTER_SHADOW_EVAL", "false")
+
 # ── Optional exit experiments (disabled by default) ───────────────────────────
 MOMENTUM_LIVE_PLACE_RESTING_TP = _env_bool("MOMENTUM_LIVE_PLACE_RESTING_TP", "false")
 MOMENTUM_LIVE_TP_CENTS = float(os.getenv("MOMENTUM_LIVE_TP_CENTS", "0.03"))

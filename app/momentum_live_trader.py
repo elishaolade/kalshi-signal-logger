@@ -71,6 +71,7 @@ from app.momentum_shadow_tracker import (
     EXIT_FIXED_TIME,
     EXIT_UNEXECUTABLE,
 )
+from app import momentum_filter_shadow as _filter_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -635,12 +636,15 @@ def is_live_armed() -> tuple[bool, str]:
         return False, "Kalshi RSA auth not configured (KALSHI_KEY_ID/KALSHI_KEY_FILE)"
     if config.MOMENTUM_LIVE_BANKROLL_DOLLARS <= 0:
         return False, "MOMENTUM_LIVE_BANKROLL_DOLLARS must be > 0"
-    if config.MOMENTUM_LIVE_SIZE_MODE not in ("kelly", "fixed"):
-        return False, "MOMENTUM_LIVE_SIZE_MODE must be 'kelly' or 'fixed'"
-    if config.MOMENTUM_LIVE_SIZE_MODE == "kelly" and config.MOMENTUM_LIVE_KELLY_FRACTION <= 0:
-        return False, "MOMENTUM_LIVE_KELLY_FRACTION must be > 0"
-    if config.MOMENTUM_LIVE_SIZE_MODE == "fixed" and config.MOMENTUM_LIVE_FIXED_CONTRACTS <= 0:
-        return False, "MOMENTUM_LIVE_FIXED_CONTRACTS must be > 0 in fixed mode"
+    # Diagnostic 1-contract mode pins sizing to fixed/1 and bypasses Kelly, so
+    # the size-mode-specific validation below does not apply to it.
+    if not config.MOMENTUM_LIVE_DIAGNOSTIC_1_CONTRACT:
+        if config.MOMENTUM_LIVE_SIZE_MODE not in ("kelly", "fixed"):
+            return False, "MOMENTUM_LIVE_SIZE_MODE must be 'kelly' or 'fixed'"
+        if config.MOMENTUM_LIVE_SIZE_MODE == "kelly" and config.MOMENTUM_LIVE_KELLY_FRACTION <= 0:
+            return False, "MOMENTUM_LIVE_KELLY_FRACTION must be > 0"
+        if config.MOMENTUM_LIVE_SIZE_MODE == "fixed" and config.MOMENTUM_LIVE_FIXED_CONTRACTS <= 0:
+            return False, "MOMENTUM_LIVE_FIXED_CONTRACTS must be > 0 in fixed mode"
     if config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE <= 0:
         return False, "MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE must be > 0"
     return True, ""
@@ -1045,6 +1049,29 @@ class _ActiveLive:
     last_metrics_ts: Optional[float] = None
     ws_shadow_triggered_reasons: set[str] = field(default_factory=set)
 
+    # ── Filter-diagnostics telemetry (telemetry-only; never gates behaviour) ──
+    shadow_only: bool = False            # True => hypothetical trade, no real order
+    diagnostic_mode: bool = False        # True => forced 1-contract live diagnostic
+    # Pre-entry (signal-time) filter inputs.
+    ws_entry_ask_at_signal: Optional[float] = None
+    rest_ideal_entry_ask: Optional[float] = None
+    entry_ask_gap_cents: Optional[float] = None
+    ws_spread_at_signal: Optional[float] = None
+    ws_quote_age_ms_at_signal: Optional[float] = None
+    time_to_expiry_seconds_at_signal: Optional[float] = None
+    # First-30-second early-exit filter inputs (TRUE cents / seconds).
+    pnl_at_5s_cents: Optional[float] = None
+    pnl_at_10s_cents: Optional[float] = None
+    pnl_at_15s_cents: Optional[float] = None
+    pnl_at_20s_cents: Optional[float] = None
+    pnl_at_30s_cents: Optional[float] = None
+    max_profit_first_30s_cents: Optional[float] = None
+    min_profit_first_30s_cents: Optional[float] = None
+    time_to_first_green_seconds: Optional[float] = None
+    time_to_negative_1c_seconds: Optional[float] = None
+    time_to_negative_2c_seconds: Optional[float] = None
+    time_to_stop_threshold_seconds: Optional[float] = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MomentumLiveTrader
@@ -1055,6 +1082,12 @@ class MomentumLiveTrader:
     Live execution for the frozen ht120s_tp3c profile.  Call on_tick() once per
     poll cycle, AFTER the shadow tracker, with the same arguments.
     """
+
+    # Class-level defaults so helpers stay safe even for objects built without
+    # __init__ (e.g. unit tests via object.__new__).  __init__ overrides these.
+    _shadow_only: bool = False
+    _diagnostic: bool = False
+    _armed: bool = False
 
     def __init__(self, ws_stream: Optional[KalshiMarketStream] = None) -> None:
         import collections
@@ -1075,27 +1108,48 @@ class MomentumLiveTrader:
         self._flatten_only = False
         self._unresolved_recovery = False
 
-        self._armed, reason = is_live_armed()
-        self._client: Optional[KalshiTradingClient] = None
-        if self._armed:
-            try:
-                self._client = KalshiTradingClient(require_auth=True)
-            except KalshiTradingError as exc:
-                self._armed = False
-                reason = str(exc)
+        # ── Filter-diagnostics research modes ─────────────────────────────────
+        # Shadow-only is a HARD no-order switch: it always wins over live arming
+        # so a mis-set env can never place a real order in shadow mode.
+        self._shadow_only = config.MOMENTUM_WS_SHADOW_ONLY
+        self._diagnostic = config.MOMENTUM_LIVE_DIAGNOSTIC_1_CONTRACT
 
-        self._reconcile_on_startup()
+        self._client: Optional[KalshiTradingClient] = None
+        if self._shadow_only:
+            # No auth, no bankroll, no client, no startup reconciliation — there
+            # is nothing real to reconcile because no order is ever placed.
+            self._armed = False
+            reason = "MOMENTUM_WS_SHADOW_ONLY — hypothetical trades only"
+        else:
+            self._armed, reason = is_live_armed()
+            if self._armed:
+                try:
+                    self._client = KalshiTradingClient(require_auth=True)
+                except KalshiTradingError as exc:
+                    self._armed = False
+                    reason = str(exc)
+            self._reconcile_on_startup()
+
         if self._ws and self._owns_ws:
             self._ws.start()
 
-        if self._armed:
+        if self._shadow_only:
+            logger.warning(
+                "MomentumLiveTrader SHADOW-ONLY — NO REAL ORDERS | profile=%s "
+                "records hypothetical entries/exits (shadow_only=1) using frozen "
+                "rules; filter_shadow_eval=%s ws=%s",
+                _PROFILE,
+                "on" if config.MOMENTUM_FILTER_SHADOW_EVAL else "off",
+                "on" if self._ws else "off",
+            )
+        elif self._armed:
             logger.warning(
                 "MomentumLiveTrader ARMED — REAL ORDERS ENABLED | profile=%s "
                 "size_mode=%s fixed_contracts=%d bankroll=$%.2f kelly=%.3f "
                 "max$/trade=%.2f max_contracts=%d "
-                "max_active=%d max_spread=%.3f ws=%s",
+                "max_active=%d max_spread=%.3f ws=%s%s",
                 _PROFILE,
-                config.MOMENTUM_LIVE_SIZE_MODE,
+                "diagnostic_1_contract" if self._diagnostic else config.MOMENTUM_LIVE_SIZE_MODE,
                 config.MOMENTUM_LIVE_FIXED_CONTRACTS,
                 config.MOMENTUM_LIVE_BANKROLL_DOLLARS,
                 config.MOMENTUM_LIVE_KELLY_FRACTION,
@@ -1104,6 +1158,8 @@ class MomentumLiveTrader:
                 config.MOMENTUM_LIVE_MAX_ACTIVE_TRADES,
                 config.MOMENTUM_LIVE_MAX_SPREAD,
                 "on" if self._ws else "off",
+                (" | DIAGNOSTIC 1-CONTRACT MODE (Kelly bypassed, size pinned to 1)"
+                 if self._diagnostic else ""),
             )
         else:
             logger.info(
@@ -1115,6 +1171,31 @@ class MomentumLiveTrader:
     @property
     def armed(self) -> bool:
         return self._armed
+
+    @property
+    def shadow_only(self) -> bool:
+        return self._shadow_only
+
+    @property
+    def _orders_enabled(self) -> bool:
+        """True only when the trader may place/cancel/amend/exit REAL orders."""
+        return self._armed and not self._shadow_only
+
+    def _guard_orders_enabled(self, context: str) -> None:
+        """
+        Hard guard at every real-order call site.  Shadow-only mode must NEVER
+        place, cancel, amend, or exit a real order, so we raise instead of
+        silently proceeding.  This makes the no-order guarantee testable.
+
+        (Non-armed inert mode is already handled upstream — on_tick returns
+        before any entry, and active trades only exist when armed — so the guard
+        keys specifically on the shadow-only latch.)
+        """
+        if getattr(self, "_shadow_only", False):
+            raise RuntimeError(
+                f"order placement blocked ({context}): shadow-only mode never "
+                f"places real orders"
+            )
 
     @property
     def active_count(self) -> int:
@@ -1348,6 +1429,9 @@ class MomentumLiveTrader:
                 if elapsed >= mark and getattr(live, attr) is None:
                     setattr(live, attr, bid)
 
+            # ── First-30-second filter telemetry (TRUE cents / seconds) ───────
+            self._update_first30s_metrics(live, profit_cents=profit_cents, elapsed=elapsed)
+
             target_bid = round(live.entry_ask + self._target_cents(), 4)
             if bid >= target_bid:
                 if not live.target_touched:
@@ -1393,6 +1477,143 @@ class MomentumLiveTrader:
                 exc,
             )
 
+    # ── Filter-diagnostics telemetry helpers (telemetry-only) ─────────────────
+
+    def _update_first30s_metrics(
+        self, live: _ActiveLive, *, profit_cents: float, elapsed: float,
+    ) -> None:
+        """
+        Record the first-30-second P/L path used to evaluate candidate early
+        exits.  ``profit_cents`` is already TRUE cents (bid-entry delta).  Only
+        the first sample at/after each mark is captured; time-to-event fields
+        latch the first crossing.
+        """
+        for mark, attr in (
+            (5, "pnl_at_5s_cents"), (10, "pnl_at_10s_cents"),
+            (15, "pnl_at_15s_cents"), (20, "pnl_at_20s_cents"),
+            (30, "pnl_at_30s_cents"),
+        ):
+            if elapsed >= mark and getattr(live, attr) is None:
+                setattr(live, attr, round(profit_cents, 4))
+
+        if elapsed <= 30.5:
+            if live.max_profit_first_30s_cents is None or profit_cents > live.max_profit_first_30s_cents:
+                live.max_profit_first_30s_cents = round(profit_cents, 4)
+            if live.min_profit_first_30s_cents is None or profit_cents < live.min_profit_first_30s_cents:
+                live.min_profit_first_30s_cents = round(profit_cents, 4)
+
+        if profit_cents > 0 and live.time_to_first_green_seconds is None:
+            live.time_to_first_green_seconds = round(elapsed, 2)
+        if profit_cents <= -1.0 and live.time_to_negative_1c_seconds is None:
+            live.time_to_negative_1c_seconds = round(elapsed, 2)
+        if profit_cents <= -2.0 and live.time_to_negative_2c_seconds is None:
+            live.time_to_negative_2c_seconds = round(elapsed, 2)
+        stop_cents = abs(config.MOMENTUM_LIVE_STOP_LOSS_CENTS) * 100.0
+        if stop_cents > 0 and profit_cents <= -stop_cents and live.time_to_stop_threshold_seconds is None:
+            live.time_to_stop_threshold_seconds = round(elapsed, 2)
+
+    def _capture_signal_time_fields(
+        self, live: _ActiveLive, sig, ws_best_ask, ws_spread, ws_quote_age,
+    ) -> None:
+        """Populate the pre-entry (signal-time) filter inputs on ``live``."""
+        live.rest_ideal_entry_ask = sig.entry_ask
+        live.ws_entry_ask_at_signal = ws_best_ask
+        live.entry_ask_gap_cents = _filter_shadow.entry_ask_gap_cents(
+            ws_best_ask, sig.entry_ask
+        )
+        live.ws_spread_at_signal = ws_spread
+        live.ws_quote_age_ms_at_signal = (
+            round(ws_quote_age * 1000.0, 2) if ws_quote_age is not None else None
+        )
+        live.time_to_expiry_seconds_at_signal = (
+            float(sig.time_remaining_s) if getattr(sig, "time_remaining_s", None) is not None else None
+        )
+
+    def _persist_signal_time_fields(self, live: _ActiveLive) -> None:
+        """
+        Defensive write of mode + signal-time filter columns.  Wrapped like
+        _write_phase so a missing filter-diagnostics migration never breaks a
+        live/shadow trade — only the extra telemetry is skipped.
+        """
+        try:
+            execute_query(
+                "UPDATE momentum_live_trades SET "
+                "diagnostic_mode=%s, shadow_only=%s, "
+                "ws_entry_ask_at_signal=%s, rest_ideal_entry_ask=%s, "
+                "entry_ask_gap_cents=%s, ws_spread_at_signal=%s, "
+                "ws_quote_age_ms_at_signal=%s, time_to_expiry_seconds_at_signal=%s "
+                "WHERE id=%s",
+                (
+                    1 if live.diagnostic_mode else 0,
+                    1 if live.shadow_only else 0,
+                    live.ws_entry_ask_at_signal, live.rest_ideal_entry_ask,
+                    live.entry_ask_gap_cents, live.ws_spread_at_signal,
+                    live.ws_quote_age_ms_at_signal, live.time_to_expiry_seconds_at_signal,
+                    live.live_trade_id,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "signal-time filter columns write failed — run "
+                "migrate_add_momentum_filter_diagnostics.py: %s", exc,
+            )
+
+    def _persist_first30s_fields(self, live: _ActiveLive) -> None:
+        """Defensive write of the first-30-second early-exit telemetry columns."""
+        try:
+            execute_query(
+                "UPDATE momentum_live_trades SET "
+                "pnl_at_5s_cents=%s, pnl_at_10s_cents=%s, pnl_at_15s_cents=%s, "
+                "pnl_at_20s_cents=%s, pnl_at_30s_cents=%s, "
+                "max_profit_first_30s_cents=%s, min_profit_first_30s_cents=%s, "
+                "time_to_first_green_seconds=%s, time_to_negative_1c_seconds=%s, "
+                "time_to_negative_2c_seconds=%s, time_to_stop_threshold_seconds=%s "
+                "WHERE id=%s",
+                (
+                    live.pnl_at_5s_cents, live.pnl_at_10s_cents, live.pnl_at_15s_cents,
+                    live.pnl_at_20s_cents, live.pnl_at_30s_cents,
+                    live.max_profit_first_30s_cents, live.min_profit_first_30s_cents,
+                    live.time_to_first_green_seconds, live.time_to_negative_1c_seconds,
+                    live.time_to_negative_2c_seconds, live.time_to_stop_threshold_seconds,
+                    live.live_trade_id,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "first-30s telemetry write failed — run "
+                "migrate_add_momentum_filter_diagnostics.py: %s", exc,
+            )
+
+    def _maybe_log_filter_shadow_eval(self, live: _ActiveLive) -> None:
+        """
+        MOMENTUM_FILTER_SHADOW_EVAL: log which candidate PRE-ENTRY filters would
+        have blocked this signal.  Logging/telemetry only — it NEVER changes the
+        entry decision.  The report recomputes impact from stored columns.
+        """
+        if not config.MOMENTUM_FILTER_SHADOW_EVAL:
+            return
+        try:
+            norm = _filter_shadow.normalize_trade({
+                "side": live.side,
+                "projected_entry_ask": live.entry_ask,
+                "entry_ask_gap_cents": live.entry_ask_gap_cents,
+                "ws_spread_at_signal": live.ws_spread_at_signal,
+                "ws_quote_age_ms_at_signal": live.ws_quote_age_ms_at_signal,
+                "time_to_expiry_seconds_at_signal": live.time_to_expiry_seconds_at_signal,
+            })
+            blocks = [
+                f"{c.name}{c.threshold_label}"
+                for c in _filter_shadow.default_pre_entry_candidates()
+                if c.decide(norm).acts is True
+            ]
+            logger.info(
+                "[FILTER_SHADOW_EVAL] trade_id=%s %s %s would-block=%s",
+                live.live_trade_id, live.market_ticker, live.side,
+                ",".join(blocks) if blocks else "none",
+            )
+        except Exception as exc:  # never let diagnostics logging affect a trade
+            logger.debug("filter shadow eval logging failed: %s", exc)
+
     def on_tick(
         self,
         market_db_id:  int,
@@ -1417,7 +1638,7 @@ class MomentumLiveTrader:
           4. append to window / trim
           5. detect new signals (only opens real trades when armed + gates pass)
         """
-        if not self._armed:
+        if not (self._armed or self._shadow_only):
             return
         if target_price is None:
             return
@@ -1519,8 +1740,15 @@ class MomentumLiveTrader:
             if sig is None:
                 continue
 
-            # Frozen signal fired — attempt a live entry behind the risk gates.
-            self._try_open_live(sig, market_ticker, captured_at)
+            # Frozen signal fired.  In shadow-only mode record a hypothetical
+            # trade (no order, no risk gating — capture the full population so
+            # the report can score every candidate filter, including the
+            # existing live blocks).  Otherwise attempt a real entry behind the
+            # risk gates.
+            if self._shadow_only:
+                self._open_shadow_entry(sig, market_ticker, captured_at)
+            else:
+                self._try_open_live(sig, market_ticker, captured_at)
 
     # ── Risk gates ────────────────────────────────────────────────────────────
 
@@ -1588,6 +1816,127 @@ class MomentumLiveTrader:
                 )
         return True, "", ""
 
+    # ── Shadow-only lifecycle (NO real orders — MOMENTUM_WS_SHADOW_ONLY) ──────
+
+    def _open_shadow_entry(self, sig, market_ticker: str, captured_at: datetime) -> None:
+        """
+        Record a HYPOTHETICAL entry (shadow_only=1) and manage it purely off the
+        quote stream with the frozen exit rules.  No order is ever placed.
+
+        The entry "fills" instantly at the observed shadow ask (sig.entry_ask),
+        so projected == actual for the entry leg; the exit is simulated at the
+        bid the frozen rule fires on.  Every signal is recorded (no risk gating)
+        so the diagnostics report has the full population, including trades the
+        existing live blocks would have skipped.
+        """
+        ws = getattr(self, "_ws", None)
+        ws_best_bid = ws.get_best_bid(market_ticker, sig.side) if ws else None
+        ws_best_ask = self._best_ask_for_side(market_ticker, sig.side)
+        ws_spread = self._spread_for_side(
+            market_ticker, sig.side, getattr(sig, "entry_spread", None)
+        )
+        ws_quote_age = self._quote_age_seconds(market_ticker, captured_at)
+        target_ask = round(sig.entry_ask + _TP, 4)
+
+        live_trade_id = insert_and_get_id(
+            """
+            INSERT INTO momentum_live_trades (
+                market_id, contract_id, market_ticker, side,
+                signal_at, entry_at, exit_profile,
+                requested_contracts, filled_contracts,
+                projected_entry_ask, projected_target_ask,
+                actual_entry_price,
+                ws_enabled, ws_quote_age_at_entry, ws_spread_at_entry,
+                ws_entry_best_bid, ws_entry_best_ask,
+                phase, status, created_at
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                1, 1,
+                %s, %s,
+                %s,
+                %s, %s, %s,
+                %s, %s,
+                'ENTRY_FILLED', 'ACTIVE', %s
+            )
+            """,
+            (
+                sig.market_id, sig.contract_id, market_ticker, sig.side,
+                sig.signal_at, captured_at, _PROFILE,
+                sig.entry_ask, target_ask,
+                sig.entry_ask,
+                1 if ws else 0, _safe(ws_quote_age), _safe(ws_spread),
+                _safe(ws_best_bid), _safe(ws_best_ask),
+                captured_at,
+            ),
+        )
+
+        live = _ActiveLive(
+            live_trade_id=live_trade_id,
+            market_id=sig.market_id,
+            contract_id=sig.contract_id,
+            market_ticker=market_ticker,
+            side=sig.side,
+            signal_at=sig.signal_at,
+            signal_ts=sig.signal_ts,
+            entry_ask=sig.entry_ask,
+            horizon_ts=sig.signal_ts + _HOLD_S,
+            requested_contracts=1,
+            status="ACTIVE",
+            filled_contracts=1,
+            actual_entry_price=sig.entry_ask,
+            entry_fill_ts=captured_at.timestamp(),
+            shadow_only=True,
+            ws_enabled=bool(ws),
+            ws_quote_age_at_entry=ws_quote_age,
+            ws_spread_at_entry=ws_spread,
+            ws_entry_best_bid=ws_best_bid,
+            ws_entry_best_ask=ws_best_ask,
+            entry_order_price=sig.entry_ask,
+        )
+        self._capture_signal_time_fields(live, sig, ws_best_ask, ws_spread, ws_quote_age)
+        self._persist_signal_time_fields(live)
+        self._maybe_log_filter_shadow_eval(live)
+
+        # One-active-per-contract + cooldown, mirroring a real fill.
+        self._cooldown_until[live.contract_id] = max(
+            self._cooldown_until.get(live.contract_id, float("-inf")),
+            live.signal_ts + _SHADOW_CONFIG.cooldown_seconds,
+        )
+        self._active[sig.contract_id] = live
+        logger.info(
+            "[SHADOW_ONLY] entry #%d | %s %s | entry_ask=%.3f (hypothetical, no order)",
+            live_trade_id, market_ticker, sig.side, sig.entry_ask,
+        )
+
+    def _advance_shadow(self, live: _ActiveLive, row: MarketRow, captured_at: datetime) -> None:
+        """
+        Advance a shadow-only trade one tick: update telemetry, apply the frozen
+        exit rules, and finalize on a SIMULATED fill.  Never calls the order API.
+        """
+        bid = self._best_bid_for_side(live.market_ticker, live.side, row)
+        if bid is not None:
+            live.last_bid = bid
+        if row.ts <= live.horizon_ts and bid is not None:
+            live.peak_bid = max(live.peak_bid, bid)
+            live.trough_bid = min(live.trough_bid, bid)
+
+        quote_age = self._ws.get_quote_age_seconds(live.market_ticker) if self._ws else None
+        spread = self._ws.get_spread(live.market_ticker, live.side) if self._ws else None
+        self._update_trade_metrics(
+            live, bid=bid, quote_age=quote_age, spread=spread, captured_at=captured_at,
+        )
+
+        exit_reason, exit_bid = self._frozen_exit_decision(live, row, bid)
+        if exit_reason is None:
+            return
+        live.exit_reason = exit_reason
+        live.projected_exit_bid = exit_bid
+        if live.exit_signal_ts is None:
+            live.exit_signal_ts = captured_at.timestamp()
+        # Simulated instant fill at the firing bid (None => unexecutable at grace).
+        self._finalize_complete(live, exit_bid, None, 1, captured_at)
+
     # ── Trade lifecycle ───────────────────────────────────────────────────────
 
     def _try_open_live(self, sig, market_ticker: str, captured_at: datetime) -> bool:
@@ -1625,7 +1974,16 @@ class MomentumLiveTrader:
         full_kelly = compute_full_kelly_fraction(
             proj["win_rate"], proj["profit_loss_ratio"]
         )
-        if config.MOMENTUM_LIVE_SIZE_MODE == "fixed":
+        if self._diagnostic:
+            # Forced 1-contract diagnostic run: pin size to exactly 1 and bypass
+            # Kelly.  Every other gate/safeguard above still applied.
+            contracts, dollars_budgeted = compute_fixed_position_size(
+                fixed_contracts=1,
+                max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
+                max_contracts_per_trade=config.MOMENTUM_LIVE_MAX_CONTRACTS_PER_TRADE,
+                price_per_contract=entry_limit_price,
+            )
+        elif config.MOMENTUM_LIVE_SIZE_MODE == "fixed":
             contracts, dollars_budgeted = compute_fixed_position_size(
                 fixed_contracts=config.MOMENTUM_LIVE_FIXED_CONTRACTS,
                 max_dollars_per_trade=config.MOMENTUM_LIVE_MAX_DOLLARS_PER_TRADE,
@@ -1735,9 +2093,16 @@ class MomentumLiveTrader:
             ws_entry_best_ask=ws_best_ask,
             entry_signal_to_order_ms=int(max(0.0, (now.timestamp() - sig.signal_ts) * 1000.0)),
             entry_order_price=entry_limit_price,
+            diagnostic_mode=self._diagnostic,
         )
+        # Filter-diagnostics: capture signal-time inputs + persist (telemetry-only).
+        self._capture_signal_time_fields(live, sig, ws_best_ask, ws_spread, ws_quote_age)
+        self._persist_signal_time_fields(live)
+        self._maybe_log_filter_shadow_eval(live)
 
         # Place the real entry order (limit buy at the observed ask).
+        # Hard guard: never reachable in shadow-only mode, but assert anyway.
+        self._guard_orders_enabled("entry")
         live.entry_submit_ts = datetime.now(timezone.utc).timestamp()
         try:
             order = self._client.place_order(
@@ -1806,6 +2171,18 @@ class MomentumLiveTrader:
     def _advance_active(self, row: MarketRow, captured_at: datetime) -> None:
         """Advance every active live trade by one tick."""
         for contract_id, live in list(self._active.items()):
+            # Shadow-only trades never touch the order API — they are simulated
+            # off the quote stream using the frozen exit rules.
+            if live.shadow_only:
+                try:
+                    self._advance_shadow(live, row, captured_at)
+                except Exception as exc:
+                    logger.error(
+                        "shadow advance failed (#%d): %s", live.live_trade_id, exc,
+                        exc_info=True,
+                    )
+                continue
+
             # Flattening trades belong to a market the main loop no longer feeds
             # (rolled over / recovered on restart); manage them off the quote
             # stream using last_bid, never the current row.
@@ -2242,6 +2619,9 @@ class MomentumLiveTrader:
         """
         if qty < 1:
             return
+        # Hard guard: shadow-only trades never reach _submit_exit (they finalize
+        # off simulated fills), but assert so a real sell can never slip through.
+        self._guard_orders_enabled("exit")
         coid = str(uuid.uuid4())
         live.exit_submit_ts = datetime.now(timezone.utc).timestamp()
         exit_submitted_at_dt = datetime.fromtimestamp(live.exit_submit_ts, tz=timezone.utc)
@@ -2498,6 +2878,7 @@ class MomentumLiveTrader:
             ),
         )
         self._write_phase(live.live_trade_id, "FINALIZED")
+        self._persist_first30s_fields(live)
         if not live.exit_accounting_verified:
             self._record_guardrail(
                 "accounting_unverified", live.market_ticker, live.side,
@@ -2545,6 +2926,16 @@ class MomentumLiveTrader:
           driven to flat by _advance_flattening on subsequent ticks, and block
           new entries until the exposure is resolved.
         """
+        # Shadow-only trades hold no real position — finalize the hypothetical
+        # trade at the last observed bid (fixed-time) instead of touching orders.
+        if live.shadow_only:
+            live.exit_reason = live.exit_reason or EXIT_FIXED_TIME
+            if live.exit_signal_ts is None:
+                live.exit_signal_ts = captured_at.timestamp()
+            live.projected_exit_bid = live.last_bid
+            self._finalize_complete(live, live.last_bid, None, 1, captured_at)
+            return
+
         remaining = order_remaining(live.filled_contracts, live.exit_filled_contracts)
 
         if live.status == "PENDING_ENTRY" and live.filled_contracts == 0:
