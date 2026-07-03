@@ -2,28 +2,63 @@
 data_feed.py
 
 Real data:
-  - Kraken public REST API for BTC/USD spot price (no auth needed)
+  - BTC/USD spot price from Kraken REST by default, Kraken WebSocket when
+    BTC_PRICE_SOURCE=kraken_ws, or a configured CF Benchmarks websocket
+    endpoint when BTC_PRICE_SOURCE=cf_benchmark_ws
   - Kalshi production REST API for market and contract data
     Authenticated via RSA key pair when KALSHI_KEY_ID + KALSHI_KEY_FILE are set.
     Falls back to unauthenticated (public endpoints only) when keys are absent.
 
-Mock data (fallback when Kalshi API is unavailable):
+Development-only mock support:
   - BTC price random walk, seeded from Kraken when available
-  - 15-minute BTC up/down market aligned to the current clock window
-  - Binary contract bid/ask priced from a probability model (not Kalshi)
+
+The logger itself now fails closed on market/contract data. Unused mock
+market/contract generators are intentionally removed so the ingestion path stays
+easy to reason about and clearly separated from synthetic data.
 """
 
+import asyncio
 import base64
+import inspect
+import json
 import logging
-import math
 import os
 import random
-from datetime import datetime, timedelta, timezone
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
+try:
+    import websockets
+except Exception:  # pragma: no cover - optional runtime dependency
+    websockets = None
 
 from app.config import (
+    BTC_PRICE_SOURCE,
+    CF_BENCHMARK_WS_BOOT_TIMEOUT_SECONDS,
+    CF_BENCHMARK_WS_FALLBACK_TO_KRAKEN,
+    CF_BENCHMARK_WS_HEADERS_JSON,
+    CF_BENCHMARK_WS_PING_INTERVAL_SECONDS,
+    CF_BENCHMARK_WS_PING_TIMEOUT_SECONDS,
+    CF_BENCHMARK_WS_PRICE_JSON_PATH,
+    CF_BENCHMARK_WS_RECONNECT_SECONDS,
+    CF_BENCHMARK_WS_STALE_AFTER_SECONDS,
+    CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE,
+    CF_BENCHMARK_WS_SYMBOL,
+    CF_BENCHMARK_WS_SYMBOL_JSON_PATH,
+    CF_BENCHMARK_WS_URL,
+    KRAKEN_WS_BOOT_TIMEOUT_SECONDS,
+    KRAKEN_WS_EVENT_TRIGGER,
+    KRAKEN_WS_FALLBACK_TO_REST,
+    KRAKEN_WS_PING_INTERVAL_SECONDS,
+    KRAKEN_WS_PING_TIMEOUT_SECONDS,
+    KRAKEN_WS_PRICE_MODE,
+    KRAKEN_WS_RECONNECT_SECONDS,
+    KRAKEN_WS_STALE_AFTER_SECONDS,
+    KRAKEN_WS_SYMBOL,
+    KRAKEN_WS_URL,
     KALSHI_API_BASE,
     KALSHI_API_TIMEOUT_SECONDS,
     KALSHI_BTC_RANGE_EVENT_TICKER,
@@ -39,6 +74,16 @@ logger = logging.getLogger(__name__)
 _KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 _KRAKEN_PAIR = "XBTUSD"
 _KRAKEN_RESULT_KEY = "XXBTZUSD"     # Kraken's canonical pair name in the response
+_KRAKEN_WS_SOURCE_NAME = "kraken_ws"
+_kraken_stream: Optional["_KrakenTickerStream"] = None
+_kraken_stream_lock = threading.Lock()
+
+# ── CF Benchmarks websocket config ───────────────────────────────────────────
+
+_CF_BENCHMARK_SOURCE_NAME = "cf_benchmark_ws"
+_last_btc_price_source = "unknown"
+_cf_stream: Optional["_CFBenchmarkPriceStream"] = None
+_cf_stream_lock = threading.Lock()
 
 # ── Module-level mock state ───────────────────────────────────────────────────
 
@@ -63,61 +108,404 @@ def _advance_mock_price(anchor: Optional[float] = None) -> float:
     return round(_mock_btc_price, 2)
 
 
-def _normal_cdf(z: float) -> float:
-    """Standard normal CDF via the complementary error function."""
-    return 0.5 * math.erfc(-z / math.sqrt(2))
+def _set_btc_source(name: str) -> None:
+    global _last_btc_price_source
+    _last_btc_price_source = name
 
 
-def _yes_probability(
-    btc_price: float,
-    target_price: float,
-    time_remaining_seconds: float,
-) -> float:
-    """
-    Estimate P(BTC closes above target) using a simplified log-normal model.
-
-    Approach: treat the remaining window as a diffusion process with constant
-    hourly vol.  The z-score of the gap relative to expected movement gives the
-    probability via the normal CDF.
-
-    Hourly vol ≈ $500 (rough BTC average; tune via config if needed).
-    """
-    gap = btc_price - target_price
-    hourly_vol = 500.0
-    t_hours = max(time_remaining_seconds, 1.0) / 3600.0
-    sigma = hourly_vol * math.sqrt(t_hours)
-    sigma = max(sigma, 1.0)          # floor avoids division issues near expiry
-    z = gap / sigma
-    raw_prob = _normal_cdf(z)
-
-    # Small Gaussian noise keeps prices from being perfectly deterministic
-    noise = random.gauss(0, 0.005)
-    return max(0.01, min(0.99, raw_prob + noise))
+def get_btc_price_source() -> str:
+    """Return the source used by the most recent successful ``get_btc_price``."""
+    return _last_btc_price_source
 
 
-def _make_side(mid: float, spread: float) -> dict[str, float]:
-    """Build a bid/ask quote around a mid-price with the given spread."""
-    half = spread / 2.0
-    bid  = round(max(0.01, mid - half), 4)
-    ask  = round(min(0.99, mid + half), 4)
-    # last price: random fill somewhere inside the spread
-    last = round(bid + random.uniform(0, ask - bid), 4)
-    return {
-        "bid_price":  bid,
-        "ask_price":  ask,
-        "mid_price":  round((bid + ask) / 2.0, 4),
-        "last_price": last,
-        "spread":     round(ask - bid, 4),
-    }
+def _parse_ws_headers() -> dict[str, str]:
+    if not CF_BENCHMARK_WS_HEADERS_JSON:
+        return {}
+    try:
+        parsed = json.loads(CF_BENCHMARK_WS_HEADERS_JSON)
+    except Exception as exc:
+        raise RuntimeError(f"CF_BENCHMARK_WS_HEADERS_JSON is invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("CF_BENCHMARK_WS_HEADERS_JSON must be a JSON object")
+    return {str(k): str(v) for k, v in parsed.items()}
 
 
-def _current_15min_window() -> tuple[datetime, datetime]:
-    """Return (open_time, close_time) for the active 15-minute clock window."""
-    now = datetime.now(timezone.utc)
-    boundary_minute = (now.minute // 15) * 15
-    open_time  = now.replace(minute=boundary_minute, second=0, microsecond=0)
-    close_time = open_time + timedelta(minutes=15)
-    return open_time, close_time
+def _ws_connect_kwargs(headers: dict[str, str]) -> dict[str, Any]:
+    if not headers or websockets is None:
+        return {}
+    params = inspect.signature(websockets.connect).parameters
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    if "extra_headers" in params:
+        return {"extra_headers": headers}
+    return {}
+
+
+def _get_path(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if part == "":
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return cur
+
+
+def _parse_numeric(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_price_from_message(message: Any) -> Optional[float]:
+    if CF_BENCHMARK_WS_SYMBOL and CF_BENCHMARK_WS_SYMBOL_JSON_PATH:
+        symbol = _get_path(message, CF_BENCHMARK_WS_SYMBOL_JSON_PATH)
+        if symbol is not None and str(symbol) != CF_BENCHMARK_WS_SYMBOL:
+            return None
+
+    if CF_BENCHMARK_WS_PRICE_JSON_PATH:
+        return _parse_numeric(_get_path(message, CF_BENCHMARK_WS_PRICE_JSON_PATH))
+
+    if isinstance(message, (int, float, str)):
+        return _parse_numeric(message)
+    if isinstance(message, list):
+        for item in message:
+            price = _extract_price_from_message(item)
+            if price is not None:
+                return price
+        return None
+
+    for path in (
+        "price",
+        "value",
+        "index",
+        "rate",
+        "last",
+        "last_price",
+        "data.price",
+        "data.value",
+        "data.index",
+        "payload.price",
+        "payload.value",
+        "result.price",
+        "result.value",
+    ):
+        price = _parse_numeric(_get_path(message, path))
+        if price is not None:
+            return price
+    return None
+
+
+class _CFBenchmarkPriceStream:
+    """Small websocket cache for the configured CF Benchmarks BTC price feed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._price: Optional[float] = None
+        self._last_ts: Optional[float] = None
+        self._last_error: Optional[str] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="cf-benchmark-btc-ws",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def latest(self) -> tuple[Optional[float], Optional[float], Optional[str]]:
+        with self._lock:
+            return self._price, self._last_ts, self._last_error
+
+    def _set_price(self, price: float) -> None:
+        with self._lock:
+            self._price = round(price, 2)
+            self._last_ts = time.time()
+            self._last_error = None
+
+    def _set_error(self, exc: Exception | str) -> None:
+        with self._lock:
+            self._last_error = str(exc)
+
+    def _thread_main(self) -> None:  # pragma: no cover - runtime wrapper
+        try:
+            asyncio.run(self._run_forever())
+        except Exception as exc:
+            self._set_error(exc)
+            logger.error("CF Benchmarks BTC websocket fatal error: %s", exc, exc_info=True)
+
+    async def _run_forever(self) -> None:  # pragma: no cover - runtime wrapper
+        if websockets is None:
+            raise RuntimeError("websockets package not available")
+        if not CF_BENCHMARK_WS_URL:
+            raise RuntimeError("CF_BENCHMARK_WS_URL is required when BTC_PRICE_SOURCE=cf_benchmark_ws")
+
+        headers = _parse_ws_headers()
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    CF_BENCHMARK_WS_URL,
+                    **_ws_connect_kwargs(headers),
+                    ping_interval=CF_BENCHMARK_WS_PING_INTERVAL_SECONDS,
+                    ping_timeout=CF_BENCHMARK_WS_PING_TIMEOUT_SECONDS,
+                    open_timeout=5.0,
+                    close_timeout=2.0,
+                ) as ws:
+                    logger.info("CF Benchmarks BTC websocket connected")
+                    if CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE:
+                        try:
+                            subscribe = json.loads(CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE)
+                        except Exception:
+                            subscribe = CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE
+                        await ws.send(json.dumps(subscribe) if not isinstance(subscribe, str) else subscribe)
+                    while not self._stop.is_set():
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=max(CF_BENCHMARK_WS_PING_INTERVAL_SECONDS, 5.0),
+                        )
+                        try:
+                            message = json.loads(raw)
+                        except Exception:
+                            message = raw
+                        price = _extract_price_from_message(message)
+                        if price is not None:
+                            self._set_price(price)
+            except Exception as exc:
+                self._set_error(exc)
+                logger.warning("CF Benchmarks BTC websocket reconnecting after error: %s", exc)
+                await asyncio.sleep(CF_BENCHMARK_WS_RECONNECT_SECONDS)
+
+
+def _get_cf_stream() -> _CFBenchmarkPriceStream:
+    global _cf_stream
+    with _cf_stream_lock:
+        if _cf_stream is None:
+            _cf_stream = _CFBenchmarkPriceStream()
+            _cf_stream.start()
+        return _cf_stream
+
+
+def _get_cf_benchmark_ws_price() -> float:
+    stream = _get_cf_stream()
+    deadline = time.time() + max(0.0, CF_BENCHMARK_WS_BOOT_TIMEOUT_SECONDS)
+    while True:
+        price, ts, last_error = stream.latest()
+        if price is not None and ts is not None:
+            age = time.time() - ts
+            if age <= CF_BENCHMARK_WS_STALE_AFTER_SECONDS:
+                logger.debug("CF Benchmarks BTC/USD: %.2f age=%.3fs", price, age)
+                return price
+            raise RuntimeError(
+                f"CF Benchmarks BTC websocket price stale "
+                f"(age={age:.2f}s > {CF_BENCHMARK_WS_STALE_AFTER_SECONDS:.2f}s)"
+            )
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "CF Benchmarks BTC websocket has no price yet"
+                + (f" (last_error={last_error})" if last_error else "")
+            )
+        time.sleep(0.05)
+
+
+class _KrakenTickerStream:
+    """Small websocket cache for Kraken public BTC/USD ticker updates."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._price: Optional[float] = None
+        self._last_ts: Optional[float] = None
+        self._last_error: Optional[str] = None
+        self._bid: Optional[float] = None
+        self._ask: Optional[float] = None
+        self._last: Optional[float] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="kraken-btc-ws",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def latest(self) -> tuple[Optional[float], Optional[float], Optional[str]]:
+        with self._lock:
+            return self._price, self._last_ts, self._last_error
+
+    def _set_ticker(
+        self,
+        *,
+        bid: Optional[float],
+        ask: Optional[float],
+        last: Optional[float],
+    ) -> None:
+        with self._lock:
+            if bid is not None:
+                self._bid = bid
+            if ask is not None:
+                self._ask = ask
+            if last is not None:
+                self._last = last
+
+            price = self._select_price()
+            if price is not None:
+                self._price = round(price, 2)
+                self._last_ts = time.time()
+                self._last_error = None
+
+    def _select_price(self) -> Optional[float]:
+        mode = KRAKEN_WS_PRICE_MODE
+        if mode == "bid":
+            return self._bid
+        if mode == "ask":
+            return self._ask
+        if mode == "last":
+            return self._last
+        if self._bid is not None and self._ask is not None:
+            return (self._bid + self._ask) / 2.0
+        return self._last or self._bid or self._ask
+
+    def _set_error(self, exc: Exception | str) -> None:
+        with self._lock:
+            self._last_error = str(exc)
+
+    def _thread_main(self) -> None:  # pragma: no cover - runtime wrapper
+        try:
+            asyncio.run(self._run_forever())
+        except Exception as exc:
+            self._set_error(exc)
+            logger.error("Kraken BTC websocket fatal error: %s", exc, exc_info=True)
+
+    async def _run_forever(self) -> None:  # pragma: no cover - runtime wrapper
+        if websockets is None:
+            raise RuntimeError("websockets package not available")
+
+        subscribe = {
+            "method": "subscribe",
+            "params": {
+                "channel": "ticker",
+                "symbol": [KRAKEN_WS_SYMBOL],
+                "event_trigger": KRAKEN_WS_EVENT_TRIGGER,
+                "snapshot": True,
+            },
+        }
+
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    KRAKEN_WS_URL,
+                    ping_interval=KRAKEN_WS_PING_INTERVAL_SECONDS,
+                    ping_timeout=KRAKEN_WS_PING_TIMEOUT_SECONDS,
+                    open_timeout=5.0,
+                    close_timeout=2.0,
+                ) as ws:
+                    logger.info(
+                        "Kraken BTC websocket connected | symbol=%s mode=%s trigger=%s",
+                        KRAKEN_WS_SYMBOL,
+                        KRAKEN_WS_PRICE_MODE,
+                        KRAKEN_WS_EVENT_TRIGGER,
+                    )
+                    await ws.send(json.dumps(subscribe))
+                    while not self._stop.is_set():
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=max(KRAKEN_WS_PING_INTERVAL_SECONDS, 5.0),
+                        )
+                        try:
+                            message = json.loads(raw)
+                        except Exception:
+                            continue
+                        self._ingest_message(message)
+            except Exception as exc:
+                self._set_error(exc)
+                logger.warning("Kraken BTC websocket reconnecting after error: %s", exc)
+                await asyncio.sleep(KRAKEN_WS_RECONNECT_SECONDS)
+
+    def _ingest_message(self, message: Any) -> None:
+        rows = None
+        if isinstance(message, dict):
+            channel = message.get("channel")
+            if channel and channel != "ticker":
+                return
+            rows = message.get("data")
+        elif isinstance(message, list):
+            rows = message
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = row.get("symbol")
+            if symbol and str(symbol) != KRAKEN_WS_SYMBOL:
+                continue
+            self._set_ticker(
+                bid=_parse_numeric(row.get("bid")),
+                ask=_parse_numeric(row.get("ask")),
+                last=_parse_numeric(row.get("last")),
+            )
+
+
+def _get_kraken_stream() -> _KrakenTickerStream:
+    global _kraken_stream
+    with _kraken_stream_lock:
+        if _kraken_stream is None:
+            _kraken_stream = _KrakenTickerStream()
+            _kraken_stream.start()
+        return _kraken_stream
+
+
+def _get_kraken_ws_price() -> float:
+    stream = _get_kraken_stream()
+    deadline = time.time() + max(0.0, KRAKEN_WS_BOOT_TIMEOUT_SECONDS)
+    while True:
+        price, ts, last_error = stream.latest()
+        if price is not None and ts is not None:
+            age = time.time() - ts
+            if age <= KRAKEN_WS_STALE_AFTER_SECONDS:
+                logger.debug("Kraken WS BTC/USD: %.2f age=%.3fs", price, age)
+                return price
+            raise RuntimeError(
+                f"Kraken BTC websocket price stale "
+                f"(age={age:.2f}s > {KRAKEN_WS_STALE_AFTER_SECONDS:.2f}s)"
+            )
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "Kraken BTC websocket has no price yet"
+                + (f" (last_error={last_error})" if last_error else "")
+            )
+        time.sleep(0.05)
+
+
+def _get_kraken_btc_price() -> float:
+    with httpx.Client(timeout=5.0) as client:
+        response = client.get(_KRAKEN_URL, params={"pair": _KRAKEN_PAIR})
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            raise ValueError(f"Kraken API error: {data['error']}")
+        # 'c' field is [last_trade_price, lot_volume]
+        price_str = data["result"][_KRAKEN_RESULT_KEY]["c"][0]
+        return float(price_str)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -126,95 +514,53 @@ def get_btc_price(*, allow_mock: bool = True) -> float:
     """
     Return current BTC/USD price.
 
-    Tries the Kraken public ticker API first (no credentials required).
+    Uses the configured BTC source.  Kraken public REST remains the default.
+    When BTC_PRICE_SOURCE=kraken_ws, a local websocket ticker cache is used and
+    no REST BTC price is read unless KRAKEN_WS_FALLBACK_TO_REST=true.
+    When BTC_PRICE_SOURCE=cf_benchmark_ws, a local websocket cache is used and
+    no REST BTC price is read unless CF_BENCHMARK_WS_FALLBACK_TO_KRAKEN=true.
+
     When ``allow_mock`` is true, any failure falls back to the module-level
     mock random walk so development tooling can keep running.  When false,
     the exception is raised so callers can fail closed instead of inventing
     data.
     """
     try:
-        with httpx.Client(timeout=5.0) as client:
-            response = client.get(_KRAKEN_URL, params={"pair": _KRAKEN_PAIR})
-            response.raise_for_status()
-            data = response.json()
-            if data.get("error"):
-                raise ValueError(f"Kraken API error: {data['error']}")
-            # 'c' field is [last_trade_price, lot_volume]
-            price_str = data["result"][_KRAKEN_RESULT_KEY]["c"][0]
-            price = float(price_str)
-            logger.debug("Kraken BTC/USD: %.2f", price)
-            return _advance_mock_price(anchor=price)   # keep mock in sync
+        if BTC_PRICE_SOURCE in ("kraken_ws", "kraken_websocket"):
+            try:
+                price = _get_kraken_ws_price()
+                _set_btc_source(_KRAKEN_WS_SOURCE_NAME)
+                return _advance_mock_price(anchor=price)  # keep mock in sync
+            except Exception:
+                if not KRAKEN_WS_FALLBACK_TO_REST:
+                    raise
+                logger.warning("Kraken BTC websocket unavailable; falling back to Kraken REST")
+
+        if BTC_PRICE_SOURCE in ("cf_benchmark_ws", "cfbenchmarks_ws", "cf_ws"):
+            try:
+                price = _get_cf_benchmark_ws_price()
+                _set_btc_source(_CF_BENCHMARK_SOURCE_NAME)
+                return _advance_mock_price(anchor=price)  # keep mock in sync
+            except Exception:
+                if not CF_BENCHMARK_WS_FALLBACK_TO_KRAKEN:
+                    raise
+                logger.warning("CF Benchmarks BTC websocket unavailable; falling back to Kraken")
+
+        price = _get_kraken_btc_price()
+        logger.debug("Kraken BTC/USD: %.2f", price)
+        _set_btc_source("kraken")
+        return _advance_mock_price(anchor=price)   # keep mock in sync
 
     except Exception as exc:
         if not allow_mock:
-            raise RuntimeError(f"Kraken BTC/USD fetch failed: {exc}") from exc
+            raise RuntimeError(f"BTC/USD fetch failed from {BTC_PRICE_SOURCE}: {exc}") from exc
         fallback = _advance_mock_price()
+        _set_btc_source("mock")
         logger.warning(
-            "Kraken fetch failed (%s) — using mock BTC price %.2f",
-            exc, fallback,
+            "BTC fetch failed from %s (%s) — using mock BTC price %.2f",
+            BTC_PRICE_SOURCE, exc, fallback,
         )
         return fallback
-
-
-def get_active_mock_market(btc_price: Optional[float] = None) -> dict:
-    """
-    Return a fake 15-minute BTC up/down market aligned to the current clock.
-
-    ``target_price`` is the contract strike/threshold — BTC must close above
-    (or below) this level for YES/NO to settle at $1.  It is NOT the live spot
-    price.  It is snapped to the nearest $500 to mimic typical Kalshi strike
-    granularity (e.g. BTC=63,368 → strike=63,500).
-
-    Args:
-        btc_price: live BTC spot price fetched by the caller.  When provided,
-                   the strike is derived from *this same reading* so that
-                   ``btc_price`` and ``target_price`` are always consistent
-                   within one tick.  Falls back to a fresh Kraken fetch only
-                   when called stand-alone (e.g. tests, CLI).
-
-    Returns:
-        {
-            "market_ticker":          str,
-            "target_price":           float,   # contract strike, not spot price
-            "open_time":              datetime (UTC, tz-aware),
-            "close_time":             datetime (UTC, tz-aware),
-            "time_remaining_seconds": float,
-            "contract_age_seconds":   float,
-        }
-    """
-    open_time, close_time = _current_15min_window()
-    now = datetime.now(timezone.utc)
-
-    # Use the caller-supplied spot price so strike and snapshot btc_price share
-    # the same reading.  Only call get_btc_price() when no price is passed in.
-    btc_now = btc_price if btc_price is not None else get_btc_price()
-
-    # Snap to nearest $500 — this is the contract strike, not the live price.
-    # e.g. BTC=63,368.16  →  strike=63,500.00
-    target_price = round(btc_now / 500) * 500
-
-    time_remaining  = max(0.0, (close_time - now).total_seconds())
-    contract_age    = (now - open_time).total_seconds()
-
-    # Ticker format: KXBTC-YYMMDD-HHMM-T<strike>
-    # e.g.  KXBTC-260612-0500-T63500
-    date_part   = open_time.strftime("%y%m%d")
-    time_part   = open_time.strftime("%H%M")
-    market_ticker = f"KXBTC-{date_part}-{time_part}-T{int(target_price)}"
-
-    logger.debug(
-        "Mock market: %s  spot=%.2f  strike=%.2f  remaining=%.0fs",
-        market_ticker, btc_now, target_price, time_remaining,
-    )
-
-    return {
-        "market_ticker":          market_ticker,
-        "target_price":           float(target_price),
-        "open_time":              open_time,
-        "close_time":             close_time,
-        "time_remaining_seconds": time_remaining,
-        "contract_age_seconds":   contract_age,
-    }
 
 
 # ── Kalshi public REST helpers ────────────────────────────────────────────────
@@ -454,53 +800,3 @@ def get_kalshi_btc_hourly_range_markets(
         m["floor_strike"],
     ))
     return normalized
-
-
-# ── Mock / 15-min helpers ─────────────────────────────────────────────────────
-
-def get_mock_contract_prices(
-    btc_price: float,
-    target_price: float,
-    time_remaining_seconds: float,
-) -> dict[str, dict[str, float]]:
-    """
-    Return simulated YES and NO bid/ask quotes for a BTC up/down contract.
-
-    Pricing logic:
-      - P(YES) is estimated from the gap between BTC and target using the
-        normal CDF, scaled by time-weighted volatility (fewer seconds left →
-        less uncertainty → price converges toward 0 or 1).
-      - P(NO) = 1 - P(YES).
-      - Each side gets an independent random spread of 1–3 cents.
-      - Small Gaussian noise is added so prices are never perfectly static.
-
-    Args:
-        btc_price:              Current BTC/USD spot price.
-        target_price:           Contract strike (the "will BTC close above X?" level).
-        time_remaining_seconds: Seconds until contract expiry.
-
-    Returns:
-        {
-            "YES": {"bid_price", "ask_price", "mid_price", "last_price", "spread"},
-            "NO":  {"bid_price", "ask_price", "mid_price", "last_price", "spread"},
-        }
-        All prices are in [0.01, 0.99] as dollar fractions (multiply by 100 for cents).
-    """
-    yes_prob = _yes_probability(btc_price, target_price, time_remaining_seconds)
-    no_prob  = 1.0 - yes_prob
-
-    # Independent spreads per side: 1–3 cents (0.01–0.03 in dollar fraction)
-    yes_spread = random.uniform(0.01, 0.03)
-    no_spread  = random.uniform(0.01, 0.03)
-
-    yes_side = _make_side(yes_prob, yes_spread)
-    no_side  = _make_side(no_prob,  no_spread)
-
-    logger.debug(
-        "Contract prices — BTC=%.2f target=%.2f t=%.0fs | "
-        "YES mid=%.4f  NO mid=%.4f",
-        btc_price, target_price, time_remaining_seconds,
-        yes_side["mid_price"], no_side["mid_price"],
-    )
-
-    return {"YES": yes_side, "NO": no_side}

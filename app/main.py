@@ -7,7 +7,7 @@ Capture what happened, when it happened, and what the market knew
 at that moment. No signals. No strategies. No predictions.
 
 Poll cycle (every POLL_INTERVAL_SECONDS):
-  1.  Fetch BTC price             (Kraken only)
+  1.  Fetch BTC price             (configured source; Kraken REST by default)
   2.  Fetch active Kalshi market  (production Kalshi API only)
   3.  Upsert market row           → markets
   4.  Upsert contract rows        → contracts  (YES + NO, once per market)
@@ -42,6 +42,7 @@ from app.config import (
 )
 from app.data_feed import (
     get_btc_price,
+    get_btc_price_source,
     get_kalshi_markets,
     _parse_float,
     _parse_dt,
@@ -314,6 +315,7 @@ def _insert_market_snapshot(
     captured_at:  datetime,
     btc_price:    float,
     tte:          Optional[int],
+    source:       str,
     raw_payload:  Optional[dict],
 ) -> int:
     """Insert one market_snapshot row. Returns market_snapshots.id."""
@@ -328,7 +330,7 @@ def _insert_market_snapshot(
              btc_price, time_remaining_seconds, source, raw_payload)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         """,
-        (market_db_id, seq, captured_at, btc_price, tte, "kraken", raw_json),
+        (market_db_id, seq, captured_at, btc_price, tte, source, raw_json),
     )
 
 
@@ -495,6 +497,7 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
     # 1. BTC price
     try:
         btc_price = get_btc_price(allow_mock=False)
+        btc_source = get_btc_price_source()
     except Exception as exc:
         logger.warning("Skipping tick #%d: BTC price unavailable — %s", n, exc)
         return
@@ -547,7 +550,12 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
             captured_at=now,
             btc_price=btc_price,
             tte=tte,
-            raw_payload={"btc_price": btc_price, "market_raw": market.get("_raw")},
+            source=btc_source,
+            raw_payload={
+                "btc_price": btc_price,
+                "btc_price_source": btc_source,
+                "market_raw": market.get("_raw"),
+            },
         )
     except Exception as exc:
         logger.warning("Failed to insert market snapshot: %s", exc)

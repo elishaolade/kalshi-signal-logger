@@ -35,6 +35,47 @@ SIGNAL_TIMEZONE = os.getenv("SIGNAL_TIMEZONE", "America/New_York")
 KALSHI_API_BASE            = os.getenv("KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2")
 KALSHI_API_TIMEOUT_SECONDS = float(os.getenv("KALSHI_API_TIMEOUT_SECONDS", "8"))
 
+# ── BTC price source ─────────────────────────────────────────────────────────
+# Default remains Kraken REST. Set BTC_PRICE_SOURCE=kraken_ws for Kraken's
+# public WebSocket ticker, or cf_benchmark_ws for a licensed CF Benchmarks feed.
+BTC_PRICE_SOURCE = os.getenv("BTC_PRICE_SOURCE", "kraken_rest").strip().lower()
+KRAKEN_WS_URL = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com/v2").strip()
+KRAKEN_WS_SYMBOL = os.getenv("KRAKEN_WS_SYMBOL", "BTC/USD").strip()
+KRAKEN_WS_PRICE_MODE = os.getenv("KRAKEN_WS_PRICE_MODE", "mid").strip().lower()
+KRAKEN_WS_EVENT_TRIGGER = os.getenv("KRAKEN_WS_EVENT_TRIGGER", "bbo").strip().lower()
+KRAKEN_WS_BOOT_TIMEOUT_SECONDS = float(os.getenv("KRAKEN_WS_BOOT_TIMEOUT_SECONDS", "5"))
+KRAKEN_WS_STALE_AFTER_SECONDS = float(os.getenv("KRAKEN_WS_STALE_AFTER_SECONDS", "5"))
+KRAKEN_WS_RECONNECT_SECONDS = float(os.getenv("KRAKEN_WS_RECONNECT_SECONDS", "3"))
+KRAKEN_WS_PING_INTERVAL_SECONDS = float(os.getenv("KRAKEN_WS_PING_INTERVAL_SECONDS", "20"))
+KRAKEN_WS_PING_TIMEOUT_SECONDS = float(os.getenv("KRAKEN_WS_PING_TIMEOUT_SECONDS", "20"))
+KRAKEN_WS_FALLBACK_TO_REST = (
+    os.getenv("KRAKEN_WS_FALLBACK_TO_REST", "false").strip().lower() == "true"
+)
+CF_BENCHMARK_WS_URL = os.getenv("CF_BENCHMARK_WS_URL", "").strip()
+CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE = os.getenv("CF_BENCHMARK_WS_SUBSCRIBE_MESSAGE", "").strip()
+CF_BENCHMARK_WS_HEADERS_JSON = os.getenv("CF_BENCHMARK_WS_HEADERS_JSON", "").strip()
+CF_BENCHMARK_WS_PRICE_JSON_PATH = os.getenv("CF_BENCHMARK_WS_PRICE_JSON_PATH", "").strip()
+CF_BENCHMARK_WS_SYMBOL_JSON_PATH = os.getenv("CF_BENCHMARK_WS_SYMBOL_JSON_PATH", "").strip()
+CF_BENCHMARK_WS_SYMBOL = os.getenv("CF_BENCHMARK_WS_SYMBOL", "").strip()
+CF_BENCHMARK_WS_BOOT_TIMEOUT_SECONDS = float(
+    os.getenv("CF_BENCHMARK_WS_BOOT_TIMEOUT_SECONDS", "5")
+)
+CF_BENCHMARK_WS_STALE_AFTER_SECONDS = float(
+    os.getenv("CF_BENCHMARK_WS_STALE_AFTER_SECONDS", "5")
+)
+CF_BENCHMARK_WS_RECONNECT_SECONDS = float(
+    os.getenv("CF_BENCHMARK_WS_RECONNECT_SECONDS", "3")
+)
+CF_BENCHMARK_WS_PING_INTERVAL_SECONDS = float(
+    os.getenv("CF_BENCHMARK_WS_PING_INTERVAL_SECONDS", "20")
+)
+CF_BENCHMARK_WS_PING_TIMEOUT_SECONDS = float(
+    os.getenv("CF_BENCHMARK_WS_PING_TIMEOUT_SECONDS", "20")
+)
+CF_BENCHMARK_WS_FALLBACK_TO_KRAKEN = (
+    os.getenv("CF_BENCHMARK_WS_FALLBACK_TO_KRAKEN", "false").strip().lower() == "true"
+)
+
 # ── Active 15-minute BTC binary market selection ─────────────────────────────
 # Series used by the core BTC up/down logger. Keep this separate from the
 # hourly range tracker configuration so the logger never piggybacks on range
