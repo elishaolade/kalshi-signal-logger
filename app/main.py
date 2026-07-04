@@ -37,6 +37,7 @@ from app.config import (
     KALSHI_BTC_BINARY_MAX_TIME_TO_CLOSE_SECONDS,
     KALSHI_BTC_BINARY_SERIES_TICKER,
     LIVE_TRADING_ENABLED,
+    MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS,
     MOMENTUM_WS_OBSERVER_ENABLED,
     POLL_INTERVAL_SECONDS,
 )
@@ -671,11 +672,12 @@ def run() -> None:
         )
 
     logger.info(
-        "Running — interval=%.1fs  tick_buffer=%d",
-        POLL_INTERVAL_SECONDS, BTC_TICK_BUFFER,
+        "Running — interval=%.1fs  active_pulse=%.3fs  tick_buffer=%d",
+        POLL_INTERVAL_SECONDS, MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS, BTC_TICK_BUFFER,
     )
 
     n = 0
+    next_active_pulse_at = time.monotonic()
     while not _stop_event:
         n += 1
         tick_start = time.monotonic()
@@ -695,7 +697,18 @@ def run() -> None:
 
         deadline = time.monotonic() + sleep_for
         while not _stop_event and time.monotonic() < deadline:
-            time.sleep(min(0.1, deadline - time.monotonic()))
+            now_mono = time.monotonic()
+            if (
+                _live_trader is not None
+                and MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS > 0
+                and now_mono >= next_active_pulse_at
+            ):
+                try:
+                    _live_trader.pulse_active_positions()
+                except Exception as exc:
+                    logger.error("Live active pulse failed: %s", exc, exc_info=True)
+                next_active_pulse_at = now_mono + MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     logger.info("Market logger stopped cleanly after %d tick(s)", n)
 

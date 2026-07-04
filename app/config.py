@@ -198,6 +198,12 @@ MOMENTUM_LIVE_RETRY_AFTER_CANCEL_SECONDS = float(
 MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS = float(
     os.getenv("MOMENTUM_LIVE_ENTRY_FILL_TIMEOUT_SECONDS", "10")
 )
+# Active filled positions are exit-sensitive: +3c targets / stops can appear
+# between the main logger ticks.  This pulse evaluates ACTIVE positions from
+# the latest WebSocket book without running entry detection.
+MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS = float(
+    os.getenv("MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS", "0.5")
+)
 
 # ── Automatic pause (live actual drifting below shadow projected) ──────────────
 # Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.

@@ -1128,6 +1128,7 @@ class MomentumLiveTrader:
         self._cooldown_until: dict[int, float] = {}
         self._active: dict[int, _ActiveLive] = {}
         self._btc_lead_followups: dict[int, _ActiveLive] = {}
+        self._latest_rows_by_market: dict[str, MarketRow] = {}
         self._ws = (
             ws_stream
             if ws_stream is not None
@@ -2013,6 +2014,7 @@ class MomentumLiveTrader:
             prices=prices,
             btc_ticks=btc_ticks,
         )
+        self._latest_rows_by_market[market_ticker] = row
 
         self._advance_btc_lead_followups(market_ticker, row, captured_at)
 
@@ -2039,6 +2041,88 @@ class MomentumLiveTrader:
             )
         except Exception as exc:
             logger.error("live detect failed: %s", exc, exc_info=True)
+
+    def pulse_active_positions(self) -> None:
+        """
+        Fast path for filled live positions.
+
+        The main logger tick still owns entries and normal bookkeeping.  This
+        method only evaluates already ACTIVE positions against the latest
+        WebSocket order book so target/stop exits are not limited by the logger
+        poll interval.
+        """
+        if not (self._armed or self._shadow_only):
+            return
+        if not self._ws or not self._active:
+            return
+        captured_at = datetime.now(timezone.utc)
+        self._maybe_record_ws_guardrail()
+        for live in list(self._active.values()):
+            if live.status != "ACTIVE" or live.flattening:
+                continue
+            row = self._ws_market_row_for_live(live, captured_at)
+            if row is None:
+                continue
+            try:
+                self._advance_single_live(live, row, captured_at)
+            except KalshiTradingError as exc:
+                logger.warning(
+                    "live fast active pulse failed (#%d, retry next pulse): %s",
+                    live.live_trade_id, exc,
+                )
+            except Exception as exc:
+                logger.error(
+                    "live fast active pulse error (#%d): %s",
+                    live.live_trade_id, exc, exc_info=True,
+                )
+
+    def _ws_market_row_for_live(
+        self, live: _ActiveLive, captured_at: datetime
+    ) -> Optional[MarketRow]:
+        ws = getattr(self, "_ws", None)
+        if not ws:
+            return None
+        quote = ws.get_quote(live.market_ticker)
+        age = ws.get_quote_age_seconds(live.market_ticker)
+        if quote is None or age is None:
+            return None
+        if age > config.MOMENTUM_LIVE_QUOTE_MAX_AGE_SECONDS:
+            return None
+
+        base = self._latest_rows_by_market.get(live.market_ticker)
+        ts = captured_at.timestamp()
+        if base is None:
+            # Do not fabricate BTC/market metrics before the main loop has
+            # established a baseline row for this market.
+            return None
+
+        elapsed = max(0.0, ts - base.ts)
+        tte = (
+            max(0, int(round(base.time_remaining_s - elapsed)))
+            if base.time_remaining_s is not None else None
+        )
+        return MarketRow(
+            snapshot_id=base.snapshot_id,
+            snapshot_seq=base.snapshot_seq,
+            captured_at=captured_at,
+            ts=ts,
+            btc_price=base.btc_price,
+            time_remaining_s=tte,
+            yes_bid=quote.best_yes_bid,
+            yes_ask=quote.best_yes_ask,
+            yes_spread=quote.get_spread("YES"),
+            no_bid=quote.best_no_bid,
+            no_ask=quote.best_no_ask,
+            no_spread=quote.get_spread("NO"),
+            distance_from_target=base.distance_from_target,
+            distance_from_target_pct=base.distance_from_target_pct,
+            is_above_target=base.is_above_target,
+            btc_return_30s=base.btc_return_30s,
+            btc_return_1m=base.btc_return_1m,
+            btc_return_5m=base.btc_return_5m,
+            btc_return_stddev_1m=base.btc_return_stddev_1m,
+            btc_return_stddev_5m=base.btc_return_stddev_5m,
+        )
 
     # ── Signal detection (identical window math to the shadow tracker) ─────────
 
@@ -2577,54 +2661,53 @@ class MomentumLiveTrader:
     def _advance_active(self, row: MarketRow, captured_at: datetime) -> None:
         """Advance every active live trade by one tick."""
         for contract_id, live in list(self._active.items()):
-            # Shadow-only trades never touch the order API — they are simulated
-            # off the quote stream using the frozen exit rules.
-            if live.shadow_only:
-                try:
-                    self._advance_shadow(live, row, captured_at)
-                except Exception as exc:
-                    logger.error(
-                        "shadow advance failed (#%d): %s", live.live_trade_id, exc,
-                        exc_info=True,
-                    )
-                continue
-
-            # Flattening trades belong to a market the main loop no longer feeds
-            # (rolled over / recovered on restart); manage them off the quote
-            # stream using last_bid, never the current row.
-            if live.flattening:
-                try:
-                    self._advance_flattening(live, captured_at)
-                except KalshiTradingError as exc:
-                    logger.warning(
-                        "live flatten poll failed (#%d, retry next tick): %s",
-                        live.live_trade_id, exc,
-                    )
-                continue
-
-            bid = self._best_bid_for_side(live.market_ticker, live.side, row)
-            if bid is not None:
-                live.last_bid = bid
-            live.last_ask = self._best_ask_for_side(live.market_ticker, live.side)
-
-            # Projected excursion tracking (identical to shadow tracker).
-            if row.ts <= live.horizon_ts and bid is not None:
-                live.peak_bid = max(live.peak_bid, bid)
-                live.trough_bid = min(live.trough_bid, bid)
-
             try:
-                if live.status == "PENDING_ENTRY":
-                    self._advance_pending_entry(live, row, captured_at)
-                elif live.status == "ACTIVE":
-                    self._advance_active_position(live, row, bid, captured_at)
-                elif live.status == "PENDING_EXIT":
-                    self._advance_pending_exit(live, row, bid, captured_at)
+                self._advance_single_live(live, row, captured_at)
             except KalshiTradingError as exc:
                 # Network/API hiccup — log and retry on the next tick.
                 logger.warning(
                     "live order poll failed (#%d, retry next tick): %s",
                     live.live_trade_id, exc,
                 )
+
+    def _advance_single_live(
+        self, live: _ActiveLive, row: MarketRow, captured_at: datetime
+    ) -> None:
+        # Shadow-only trades never touch the order API — they are simulated off
+        # the quote stream using the frozen exit rules.
+        if live.shadow_only:
+            try:
+                self._advance_shadow(live, row, captured_at)
+            except Exception as exc:
+                logger.error(
+                    "shadow advance failed (#%d): %s", live.live_trade_id, exc,
+                    exc_info=True,
+                )
+            return
+
+        # Flattening trades belong to a market the main loop no longer feeds
+        # (rolled over / recovered on restart); manage them off the quote stream
+        # using last_bid, never the current row.
+        if live.flattening:
+            self._advance_flattening(live, captured_at)
+            return
+
+        bid = self._best_bid_for_side(live.market_ticker, live.side, row)
+        if bid is not None:
+            live.last_bid = bid
+        live.last_ask = self._best_ask_for_side(live.market_ticker, live.side)
+
+        # Projected excursion tracking (identical to shadow tracker).
+        if row.ts <= live.horizon_ts and bid is not None:
+            live.peak_bid = max(live.peak_bid, bid)
+            live.trough_bid = min(live.trough_bid, bid)
+
+        if live.status == "PENDING_ENTRY":
+            self._advance_pending_entry(live, row, captured_at)
+        elif live.status == "ACTIVE":
+            self._advance_active_position(live, row, bid, captured_at)
+        elif live.status == "PENDING_EXIT":
+            self._advance_pending_exit(live, row, bid, captured_at)
 
     def _advance_pending_entry(self, live: _ActiveLive, row: MarketRow, captured_at: datetime) -> None:
         """
