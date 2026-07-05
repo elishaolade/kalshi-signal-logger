@@ -82,6 +82,7 @@ JOIN markets m ON m.id = ms.market_id
 JOIN contract_snapshots cs ON cs.market_snapshot_id = ms.id
 JOIN contracts c ON c.id = cs.contract_id
 WHERE m.market_id LIKE 'KXBTC15M-%'
+  AND ms.time_remaining_seconds BETWEEN 420 AND 480
 GROUP BY
   ms.id, ms.captured_at, CONVERT_TZ(ms.captured_at, '+00:00', '-04:00'),
   m.id, m.market_id, m.target_price, m.closes_at, m.status, m.raw_payload,
@@ -92,15 +93,17 @@ GROUP BY
 CREATE_FINAL_BTC_SQL = """
 CREATE TEMPORARY TABLE lws_final_btc AS
 SELECT
-  m.id AS market_pk,
+  c.market_pk,
   CAST(SUBSTRING_INDEX(GROUP_CONCAT(ms.btc_price ORDER BY ms.captured_at DESC), ',', 1) AS DECIMAL(18,4)) AS final_btc_price,
   MAX(ms.captured_at) AS final_btc_snapshot_at
-FROM markets m
+FROM (
+  SELECT DISTINCT market_pk, expiry_ts
+  FROM lws_candidates
+) c
 JOIN market_snapshots ms
-  ON ms.market_id = m.id
- AND ms.captured_at <= m.closes_at + INTERVAL 30 SECOND
-WHERE m.market_id LIKE 'KXBTC15M-%'
-GROUP BY m.id
+  ON ms.market_id = c.market_pk
+ AND ms.captured_at <= c.expiry_ts + INTERVAL 30 SECOND
+GROUP BY c.market_pk
 """
 
 
@@ -882,9 +885,9 @@ def build_report(output_dir: Path) -> OutputPaths:
             cur.execute(sql)
         for sql in (
             CREATE_QUOTE_PIVOT_SQL,
-            CREATE_FINAL_BTC_SQL,
             CREATE_RAW_CANDIDATES_SQL,
             CREATE_CANDIDATES_SQL,
+            CREATE_FINAL_BTC_SQL,
             CREATE_OUTCOMES_SQL,
             CREATE_DATA_QUALITY_SQL,
         ):
