@@ -47,6 +47,9 @@ DROP_SQL = [
     "DROP TEMPORARY TABLE IF EXISTS lws_final_btc",
     "DROP TEMPORARY TABLE IF EXISTS lws_raw_candidates",
     "DROP TEMPORARY TABLE IF EXISTS lws_candidates",
+    "DROP TEMPORARY TABLE IF EXISTS lws_future_quotes",
+    "DROP TEMPORARY TABLE IF EXISTS lws_aggregated",
+    "DROP TEMPORARY TABLE IF EXISTS lws_settlement",
     "DROP TEMPORARY TABLE IF EXISTS lws_outcomes",
     "DROP TEMPORARY TABLE IF EXISTS lws_data_quality",
 ]
@@ -210,59 +213,67 @@ WHERE rn_for_market_side = 1
 """
 
 
+CREATE_FUTURE_QUOTES_SQL = """
+CREATE TEMPORARY TABLE lws_future_quotes AS
+SELECT
+  c.signal_id,
+  fms.captured_at,
+  CASE
+    WHEN c.side = 'YES' THEN fms.btc_price - c.strike
+    WHEN c.side = 'NO' THEN c.strike - fms.btc_price
+  END AS future_entry_side_distance,
+  fms.btc_price AS future_btc_price,
+  fcs.bid_price AS future_bid
+FROM lws_candidates c
+JOIN market_snapshots fms
+  ON fms.market_id = c.market_pk
+ AND fms.captured_at > c.observation_ts
+ AND fms.captured_at <= c.expiry_ts
+JOIN contract_snapshots fcs
+  ON fcs.market_snapshot_id = fms.id
+ AND fcs.contract_id = c.contract_pk
+"""
+
+
+CREATE_AGGREGATED_SQL = """
+CREATE TEMPORARY TABLE lws_aggregated AS
+SELECT
+  signal_id,
+  MIN(future_entry_side_distance) AS min_btc_distance_after_entry,
+  MIN(CASE WHEN future_entry_side_distance <= 0 THEN captured_at END) AS btc_cross_target_at,
+  MIN(CASE WHEN future_entry_side_distance <= 50 THEN captured_at END) AS btc_distance_below_50_at,
+  MIN(CASE WHEN future_entry_side_distance <= 25 THEN captured_at END) AS btc_distance_below_25_at,
+  CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN future_entry_side_distance <= 0 THEN future_bid END ORDER BY captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_cross_target,
+  CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN future_entry_side_distance <= 50 THEN future_bid END ORDER BY captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_distance_below_50,
+  CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN future_entry_side_distance <= 25 THEN future_bid END ORDER BY captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_distance_below_25,
+  MIN(future_bid) AS lowest_contract_bid_after_entry,
+  MAX(future_bid) AS max_contract_bid_after_entry,
+  COUNT(future_bid) AS forward_quote_count
+FROM lws_future_quotes
+GROUP BY signal_id
+"""
+
+
+CREATE_SETTLEMENT_SQL = """
+CREATE TEMPORARY TABLE lws_settlement AS
+SELECT
+  c.signal_id,
+  fb.final_btc_price,
+  fb.final_btc_snapshot_at,
+  UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.result')), 'null')) AS raw_result,
+  UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.settlement_value')), 'null')) AS raw_settlement_value,
+  UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.winning_outcome')), 'null')) AS raw_winning_outcome
+FROM lws_candidates c
+LEFT JOIN lws_final_btc fb ON fb.market_pk = c.market_pk
+"""
+
+
 CREATE_OUTCOMES_SQL = """
 CREATE TEMPORARY TABLE lws_outcomes AS
-WITH future_quotes AS (
-  SELECT
-    c.signal_id,
-    fms.captured_at,
-    CASE
-      WHEN c.side = 'YES' THEN fms.btc_price - c.strike
-      WHEN c.side = 'NO' THEN c.strike - fms.btc_price
-    END AS future_entry_side_distance,
-    fms.btc_price AS future_btc_price,
-    fcs.bid_price AS future_bid
-  FROM lws_candidates c
-  LEFT JOIN market_snapshots fms
-    ON fms.market_id = c.market_pk
-   AND fms.captured_at > c.observation_ts
-   AND fms.captured_at <= c.expiry_ts
-  LEFT JOIN contract_snapshots fcs
-    ON fcs.market_snapshot_id = fms.id
-   AND fcs.contract_id = c.contract_pk
-),
-aggregated AS (
-  SELECT
-    c.signal_id,
-    MIN(fq.future_entry_side_distance) AS min_btc_distance_after_entry,
-    MIN(CASE WHEN fq.future_entry_side_distance <= 0 THEN fq.captured_at END) AS btc_cross_target_at,
-    MIN(CASE WHEN fq.future_entry_side_distance <= 50 THEN fq.captured_at END) AS btc_distance_below_50_at,
-    MIN(CASE WHEN fq.future_entry_side_distance <= 25 THEN fq.captured_at END) AS btc_distance_below_25_at,
-    CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN fq.future_entry_side_distance <= 0 THEN fq.future_bid END ORDER BY fq.captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_cross_target,
-    CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN fq.future_entry_side_distance <= 50 THEN fq.future_bid END ORDER BY fq.captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_distance_below_50,
-    CAST(SUBSTRING_INDEX(GROUP_CONCAT(CASE WHEN fq.future_entry_side_distance <= 25 THEN fq.future_bid END ORDER BY fq.captured_at ASC), ',', 1) AS DECIMAL(10,4)) AS bid_at_btc_distance_below_25,
-    MIN(fq.future_bid) AS lowest_contract_bid_after_entry,
-    MAX(fq.future_bid) AS max_contract_bid_after_entry,
-    COUNT(fq.future_bid) AS forward_quote_count
-  FROM lws_candidates c
-  LEFT JOIN future_quotes fq ON fq.signal_id = c.signal_id
-  GROUP BY c.signal_id
-),
-settlement AS (
-  SELECT
-    c.signal_id,
-    fb.final_btc_price,
-    fb.final_btc_snapshot_at,
-    UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.result')), 'null')) AS raw_result,
-    UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.settlement_value')), 'null')) AS raw_settlement_value,
-    UPPER(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(c.market_raw_payload, '$.winning_outcome')), 'null')) AS raw_winning_outcome
-  FROM lws_candidates c
-  LEFT JOIN lws_final_btc fb ON fb.market_pk = c.market_pk
-),
-scored AS (
+WITH scored AS (
   SELECT
     c.*,
-    a.forward_quote_count,
+    COALESCE(a.forward_quote_count, 0) AS forward_quote_count,
     s.final_btc_price,
     s.final_btc_snapshot_at,
     CASE
@@ -300,8 +311,8 @@ scored AS (
     ROUND((c.entry_price_used - a.lowest_contract_bid_after_entry) * 100, 4) AS max_contract_drawdown_cents,
     a.max_contract_bid_after_entry
   FROM lws_candidates c
-  LEFT JOIN aggregated a ON a.signal_id = c.signal_id
-  LEFT JOIN settlement s ON s.signal_id = c.signal_id
+  LEFT JOIN lws_aggregated a ON a.signal_id = c.signal_id
+  LEFT JOIN lws_settlement s ON s.signal_id = c.signal_id
 )
 SELECT
   *,
@@ -888,6 +899,9 @@ def build_report(output_dir: Path) -> OutputPaths:
             CREATE_RAW_CANDIDATES_SQL,
             CREATE_CANDIDATES_SQL,
             CREATE_FINAL_BTC_SQL,
+            CREATE_FUTURE_QUOTES_SQL,
+            CREATE_AGGREGATED_SQL,
+            CREATE_SETTLEMENT_SQL,
             CREATE_OUTCOMES_SQL,
             CREATE_DATA_QUALITY_SQL,
         ):
