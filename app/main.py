@@ -53,6 +53,7 @@ from app.features import Tick
 from app.models import MarketMetrics, MarketSnapshot
 from app.momentum_shadow_tracker import MomentumShadowTracker
 from app.momentum_live_trader import MomentumLiveTrader
+from app.late_winning_live_trader import LateWinningLiveTrader
 from app.ws_first_observer import WebSocketFirstObserver
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -99,6 +100,10 @@ _shadow_tracker: Optional[MomentumShadowTracker] = None
 # MOMENTUM_LIVE_* gate is set. Runs alongside — never replaces — the shadow
 # tracker. Initialized in run() after the DB pool is ready.
 _live_trader: Optional[MomentumLiveTrader] = None
+
+# Late winning-contract LIVE trader (real money). Separate from momentum;
+# disabled unless LATE_WINNING_* gates are explicitly armed.
+_late_winning_trader: Optional[LateWinningLiveTrader] = None
 
 # WebSocket-first observer. When enabled, quote snapshots handed to shadow/live
 # diagnostics come from fresh WS order books; stale/missing WS books skip ticks.
@@ -619,11 +624,31 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         except Exception as exc:
             logger.warning("Live trader error on tick #%d: %s", n, exc)
 
+    # 12. Late winning-contract strategy (real money; separate LATE_WINNING_* gates).
+    if _late_winning_trader is not None:
+        try:
+            _late_winning_trader.on_tick(
+                market_db_id  = market_db_id,
+                market_id     = market_id,
+                market_ticker = market_id,
+                contract_ids  = contract_ids,
+                target_price  = target_price,
+                captured_at   = now,
+                btc_price     = btc_price,
+                tte           = tte,
+                prices        = prices,
+                btc_ticks     = ticks,
+                snapshot_id   = snapshot_id,
+                snapshot_seq  = _snapshot_sequence[market_id],
+            )
+        except Exception as exc:
+            logger.warning("Late winning trader error on tick #%d: %s", n, exc)
+
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
-    global _stop_event, _shadow_tracker, _live_trader, _ws_observer
+    global _stop_event, _shadow_tracker, _live_trader, _late_winning_trader, _ws_observer
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -668,6 +693,14 @@ def run() -> None:
     except Exception as exc:
         logger.warning(
             "MomentumLiveTrader init failed (live trading disabled "
+            "— run scripts/migrate_add_momentum_live.py first): %s", exc
+        )
+
+    try:
+        _late_winning_trader = LateWinningLiveTrader()
+    except Exception as exc:
+        logger.warning(
+            "LateWinningLiveTrader init failed (late winning live disabled "
             "— run scripts/migrate_add_momentum_live.py first): %s", exc
         )
 

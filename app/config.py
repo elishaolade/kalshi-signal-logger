@@ -205,6 +205,51 @@ MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS = float(
     os.getenv("MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS", "0.5")
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Late-winning-contract LIVE strategy (real money) — separate explicit gates
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Rule:
+#   - buy the side BTC already favors (YES above strike, NO below strike)
+#   - enter only with <= max TTE, enough BTC distance, tight spread, and ask band
+#   - hold unless BTC crosses back through the strike; otherwise record a
+#     settlement-mode outcome at expiry.
+#
+# DEFAULTS ARE NON-LIVE.  This strategy never places orders unless its own
+# LATE_WINNING_* gates are set.
+LATE_WINNING_LIVE_ENABLED = _env_bool("LATE_WINNING_LIVE_ENABLED", "false")
+LATE_WINNING_LIVE_CONFIRM = os.getenv("LATE_WINNING_LIVE_CONFIRM", "").strip()
+LATE_WINNING_PROFILE = os.getenv(
+    "LATE_WINNING_PROFILE", "late_winning_150d_75_79c_cross_stop"
+).strip()
+
+LATE_WINNING_MIN_TTE_SECONDS = float(os.getenv("LATE_WINNING_MIN_TTE_SECONDS", "0"))
+LATE_WINNING_MAX_TTE_SECONDS = float(os.getenv("LATE_WINNING_MAX_TTE_SECONDS", "480"))
+LATE_WINNING_MIN_DISTANCE_DOLLARS = float(os.getenv("LATE_WINNING_MIN_DISTANCE_DOLLARS", "150"))
+LATE_WINNING_MIN_ASK = float(os.getenv("LATE_WINNING_MIN_ASK", "0.75"))
+# Exclusive upper bound by default: 0.80 means 75c-79c.
+LATE_WINNING_MAX_ASK = float(os.getenv("LATE_WINNING_MAX_ASK", "0.80"))
+LATE_WINNING_MAX_SPREAD = float(os.getenv("LATE_WINNING_MAX_SPREAD", "0.01"))
+
+LATE_WINNING_FIXED_CONTRACTS = int(os.getenv("LATE_WINNING_FIXED_CONTRACTS", "1"))
+LATE_WINNING_MAX_DOLLARS_PER_TRADE = float(os.getenv("LATE_WINNING_MAX_DOLLARS_PER_TRADE", "1"))
+LATE_WINNING_MAX_CONTRACTS_PER_TRADE = int(os.getenv("LATE_WINNING_MAX_CONTRACTS_PER_TRADE", "1"))
+LATE_WINNING_MAX_ACTIVE_TRADES = int(os.getenv("LATE_WINNING_MAX_ACTIVE_TRADES", "1"))
+LATE_WINNING_MAX_DAILY_LOSS_DOLLARS = float(os.getenv("LATE_WINNING_MAX_DAILY_LOSS_DOLLARS", "0"))
+
+LATE_WINNING_ENTRY_PRICE_OFFSET_CENTS = float(
+    os.getenv("LATE_WINNING_ENTRY_PRICE_OFFSET_CENTS", "0")
+)
+LATE_WINNING_ENTRY_FILL_TIMEOUT_SECONDS = float(
+    os.getenv("LATE_WINNING_ENTRY_FILL_TIMEOUT_SECONDS", "10")
+)
+LATE_WINNING_EXIT_REPRICE_SECONDS = float(
+    os.getenv("LATE_WINNING_EXIT_REPRICE_SECONDS", "5")
+)
+LATE_WINNING_RETRY_AFTER_CANCEL_SECONDS = float(
+    os.getenv("LATE_WINNING_RETRY_AFTER_CANCEL_SECONDS", "20")
+)
+
 # ── Automatic pause (live actual drifting below shadow projected) ──────────────
 # Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.
 # A window only counts once it has at least LIVE_PAUSE_MIN_TRADES completed live
