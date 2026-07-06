@@ -51,7 +51,6 @@ DROP_SQL = [
     "DROP TEMPORARY TABLE IF EXISTS lws_aggregated",
     "DROP TEMPORARY TABLE IF EXISTS lws_settlement",
     "DROP TEMPORARY TABLE IF EXISTS lws_outcomes",
-    "DROP TEMPORARY TABLE IF EXISTS lws_data_quality",
 ]
 
 
@@ -374,49 +373,6 @@ FROM scored
 """
 
 
-CREATE_DATA_QUALITY_SQL = """
-CREATE TEMPORARY TABLE lws_data_quality AS
-WITH issues AS (
-  SELECT 'missing_yes_quote' AS issue, observation_ts, NULL AS side
-  FROM lws_quote_pivot WHERE yes_bid IS NULL OR yes_ask IS NULL
-  UNION ALL SELECT 'missing_no_quote', observation_ts, NULL
-  FROM lws_quote_pivot WHERE no_bid IS NULL OR no_ask IS NULL
-  UNION ALL SELECT 'missing_btc_price', observation_ts, NULL
-  FROM lws_quote_pivot WHERE btc_price IS NULL
-  UNION ALL SELECT 'missing_strike', observation_ts, NULL
-  FROM lws_quote_pivot WHERE strike IS NULL
-  UNION ALL SELECT 'missing_expiry', observation_ts, NULL
-  FROM lws_quote_pivot WHERE expiry_ts IS NULL
-  UNION ALL SELECT 'spread_eq_zero', observation_ts, NULL
-  FROM lws_quote_pivot WHERE yes_spread = 0 OR no_spread = 0
-  UNION ALL SELECT 'spread_lt_zero', observation_ts, NULL
-  FROM lws_quote_pivot WHERE yes_spread < 0 OR no_spread < 0
-  UNION ALL SELECT 'bid_gt_ask', observation_ts, NULL
-  FROM lws_quote_pivot WHERE yes_bid > yes_ask OR no_bid > no_ask
-  UNION ALL SELECT 'ask_out_of_range', observation_ts, NULL
-  FROM lws_quote_pivot WHERE yes_ask < 0 OR yes_ask > 1 OR no_ask < 0 OR no_ask > 1
-  UNION ALL SELECT 'bid_out_of_range', observation_ts, NULL
-  FROM lws_quote_pivot WHERE yes_bid < 0 OR yes_bid > 1 OR no_bid < 0 OR no_bid > 1
-  UNION ALL SELECT 'quote_age_ms_unavailable_in_historical_snapshots', observation_ts, side
-  FROM lws_candidates WHERE quote_age_ms IS NULL
-  UNION ALL SELECT 'duplicate_qualifying_observations_per_market_side', observation_ts, side
-  FROM lws_raw_candidates WHERE raw_candidate_count_for_market_side > 1
-  UNION ALL SELECT 'no_forward_quotes_after_entry', observation_ts, side
-  FROM lws_outcomes WHERE forward_quote_count = 0
-  UNION ALL SELECT 'missing_settlement_winner', observation_ts, side
-  FROM lws_outcomes WHERE final_settlement_winner IS NULL
-)
-SELECT
-  issue,
-  side,
-  COUNT(*) AS rows_affected,
-  MAX(observation_ts) AS latest_seen
-FROM issues
-GROUP BY issue, side
-ORDER BY rows_affected DESC, issue, side
-"""
-
-
 OUTCOME_SQL = """
 SELECT
   market_ticker,
@@ -465,9 +421,6 @@ SELECT
 FROM lws_outcomes
 ORDER BY observation_ts, market_ticker, side
 """
-
-
-DATA_QUALITY_SQL = "SELECT * FROM lws_data_quality"
 
 
 SCHEMA_DISCOVERY_ROWS = [
@@ -872,6 +825,43 @@ def _fetch_all(cur, sql: str) -> list[dict[str, Any]]:
     return list(cur.fetchall())
 
 
+def _fetch_quality_rows(cur) -> list[dict[str, Any]]:
+    specs = [
+        ("missing_yes_quote", "lws_quote_pivot", "yes_bid IS NULL OR yes_ask IS NULL", "NULL"),
+        ("missing_no_quote", "lws_quote_pivot", "no_bid IS NULL OR no_ask IS NULL", "NULL"),
+        ("missing_btc_price", "lws_quote_pivot", "btc_price IS NULL", "NULL"),
+        ("missing_strike", "lws_quote_pivot", "strike IS NULL", "NULL"),
+        ("missing_expiry", "lws_quote_pivot", "expiry_ts IS NULL", "NULL"),
+        ("spread_eq_zero", "lws_quote_pivot", "yes_spread = 0 OR no_spread = 0", "NULL"),
+        ("spread_lt_zero", "lws_quote_pivot", "yes_spread < 0 OR no_spread < 0", "NULL"),
+        ("bid_gt_ask", "lws_quote_pivot", "yes_bid > yes_ask OR no_bid > no_ask", "NULL"),
+        ("ask_out_of_range", "lws_quote_pivot", "yes_ask < 0 OR yes_ask > 1 OR no_ask < 0 OR no_ask > 1", "NULL"),
+        ("bid_out_of_range", "lws_quote_pivot", "yes_bid < 0 OR yes_bid > 1 OR no_bid < 0 OR no_bid > 1", "NULL"),
+        ("quote_age_ms_unavailable_in_historical_snapshots", "lws_candidates", "quote_age_ms IS NULL", "side"),
+        ("duplicate_qualifying_observations_per_market_side", "lws_raw_candidates", "raw_candidate_count_for_market_side > 1", "side"),
+        ("no_forward_quotes_after_entry", "lws_outcomes", "forward_quote_count = 0", "side"),
+        ("missing_settlement_winner", "lws_outcomes", "final_settlement_winner IS NULL", "side"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for issue, table_name, condition, side_expr in specs:
+        group_sql = " GROUP BY side" if side_expr != "NULL" else ""
+        sql = f"""
+        SELECT
+          %s AS issue,
+          {side_expr} AS side,
+          COUNT(*) AS rows_affected,
+          MAX(observation_ts) AS latest_seen
+        FROM {table_name}
+        WHERE {condition}
+        {group_sql}
+        HAVING rows_affected > 0
+        """
+        cur.execute(sql, (issue,))
+        rows.extend(cur.fetchall())
+    rows.sort(key=lambda r: (-(int(r.get("rows_affected") or 0)), str(r.get("issue")), str(r.get("side") or "")))
+    return rows
+
+
 def _output_paths(output_dir: Path) -> OutputPaths:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"late_winning_contract_{date.today().isoformat()}"
@@ -903,12 +893,11 @@ def build_report(output_dir: Path) -> OutputPaths:
             CREATE_AGGREGATED_SQL,
             CREATE_SETTLEMENT_SQL,
             CREATE_OUTCOMES_SQL,
-            CREATE_DATA_QUALITY_SQL,
         ):
             cur.execute(sql)
 
         rows = _fetch_all(cur, OUTCOME_SQL)
-        quality = _fetch_all(cur, DATA_QUALITY_SQL)
+        quality = _fetch_quality_rows(cur)
         summary = _build_summary(rows)
 
         _write_csv(paths.candidates_csv, rows)
