@@ -307,7 +307,7 @@ WITH scored AS (
     a.bid_at_btc_distance_below_50,
     a.bid_at_btc_distance_below_25,
     a.lowest_contract_bid_after_entry,
-    ROUND((c.entry_price_used - a.lowest_contract_bid_after_entry) * 100, 4) AS max_contract_drawdown_cents,
+    GREATEST(0, ROUND((c.entry_price_used - a.lowest_contract_bid_after_entry) * 100, 4)) AS max_contract_drawdown_cents,
     a.max_contract_bid_after_entry
   FROM lws_candidates c
   LEFT JOIN lws_aggregated a ON a.signal_id = c.signal_id
@@ -399,6 +399,10 @@ SELECT
   min_btc_distance_after_entry,
   did_btc_cross_target_after_entry,
   seconds_until_btc_crossed_target,
+  btc_distance_below_50_at,
+  seconds_until_btc_distance_below_50,
+  btc_distance_below_25_at,
+  seconds_until_btc_distance_below_25,
   lowest_contract_bid_after_entry,
   max_contract_drawdown_cents,
   did_contract_drop_5c,
