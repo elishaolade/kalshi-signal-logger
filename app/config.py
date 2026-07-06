@@ -220,15 +220,15 @@ MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS = float(
 LATE_WINNING_LIVE_ENABLED = _env_bool("LATE_WINNING_LIVE_ENABLED", "false")
 LATE_WINNING_LIVE_CONFIRM = os.getenv("LATE_WINNING_LIVE_CONFIRM", "").strip()
 LATE_WINNING_PROFILE = os.getenv(
-    "LATE_WINNING_PROFILE", "late_winning_150d_75_79c_cross_stop"
+    "LATE_WINNING_PROFILE", "late_winning_150d_75_90c_cross_stop"
 ).strip()
 
 LATE_WINNING_MIN_TTE_SECONDS = float(os.getenv("LATE_WINNING_MIN_TTE_SECONDS", "0"))
 LATE_WINNING_MAX_TTE_SECONDS = float(os.getenv("LATE_WINNING_MAX_TTE_SECONDS", "480"))
 LATE_WINNING_MIN_DISTANCE_DOLLARS = float(os.getenv("LATE_WINNING_MIN_DISTANCE_DOLLARS", "150"))
 LATE_WINNING_MIN_ASK = float(os.getenv("LATE_WINNING_MIN_ASK", "0.75"))
-# Exclusive upper bound by default: 0.80 means 75c-79c.
-LATE_WINNING_MAX_ASK = float(os.getenv("LATE_WINNING_MAX_ASK", "0.80"))
+# Exclusive upper bound by default: 0.91 means 75c through 90c.
+LATE_WINNING_MAX_ASK = float(os.getenv("LATE_WINNING_MAX_ASK", "0.91"))
 LATE_WINNING_MAX_SPREAD = float(os.getenv("LATE_WINNING_MAX_SPREAD", "0.01"))
 
 LATE_WINNING_FIXED_CONTRACTS = int(os.getenv("LATE_WINNING_FIXED_CONTRACTS", "1"))

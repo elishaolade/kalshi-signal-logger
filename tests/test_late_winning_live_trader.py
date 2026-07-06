@@ -39,11 +39,11 @@ def late_winning_defaults(monkeypatch):
     monkeypatch.setattr(config, "LATE_WINNING_MAX_TTE_SECONDS", 480.0)
     monkeypatch.setattr(config, "LATE_WINNING_MIN_DISTANCE_DOLLARS", 150.0)
     monkeypatch.setattr(config, "LATE_WINNING_MIN_ASK", 0.75)
-    monkeypatch.setattr(config, "LATE_WINNING_MAX_ASK", 0.80)
+    monkeypatch.setattr(config, "LATE_WINNING_MAX_ASK", 0.91)
     monkeypatch.setattr(config, "LATE_WINNING_MAX_SPREAD", 0.01)
 
 
-def test_qualifies_yes_when_btc_is_150_above_strike_and_ask_is_75_79c():
+def test_qualifies_yes_when_btc_is_150_above_strike_and_ask_is_75_90c():
     sig = find_late_winning_signal(
         market_db_id=1,
         market_ticker="KXBTC15M-TEST",
@@ -62,7 +62,7 @@ def test_qualifies_yes_when_btc_is_150_above_strike_and_ask_is_75_79c():
     assert sig.entry_ask == pytest.approx(0.77)
 
 
-def test_qualifies_no_when_btc_is_150_below_strike_and_no_ask_is_75_79c():
+def test_qualifies_no_when_btc_is_150_below_strike_and_no_ask_is_75_90c():
     sig = find_late_winning_signal(
         market_db_id=1,
         market_ticker="KXBTC15M-TEST",
@@ -95,7 +95,7 @@ def test_rejects_if_distance_is_too_small():
     assert sig is None
 
 
-def test_rejects_if_ask_reaches_80c_exclusive_bound():
+def test_qualifies_if_ask_is_90c():
     sig = find_late_winning_signal(
         market_db_id=1,
         market_ticker="KXBTC15M-TEST",
@@ -104,7 +104,23 @@ def test_rejects_if_ask_reaches_80c_exclusive_bound():
         captured_at=datetime(2026, 7, 6, tzinfo=timezone.utc),
         btc_price=60160.0,
         tte=450,
-        prices=_prices(yes_bid=0.79, yes_ask=0.80),
+        prices=_prices(yes_bid=0.89, yes_ask=0.90),
+    )
+
+    assert sig is not None
+    assert sig.entry_ask == pytest.approx(0.90)
+
+
+def test_rejects_if_ask_reaches_91c_exclusive_bound():
+    sig = find_late_winning_signal(
+        market_db_id=1,
+        market_ticker="KXBTC15M-TEST",
+        contract_ids={"YES": 10, "NO": 11},
+        target_price=60000.0,
+        captured_at=datetime(2026, 7, 6, tzinfo=timezone.utc),
+        btc_price=60160.0,
+        tte=450,
+        prices=_prices(yes_bid=0.90, yes_ask=0.91),
     )
 
     assert sig is None

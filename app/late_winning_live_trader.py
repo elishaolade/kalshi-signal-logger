@@ -5,7 +5,7 @@ Separate real-money strategy for the late winning-contract rule:
 
     - BTC 15m market only, fed by app/main.py
     - buy the side BTC already favors
-    - enter when ask is in the configured 75c-79c band, spread is tight, and
+    - enter when ask is in the configured 75c-90c band, spread is tight, and
       BTC is already far enough past the strike
     - hold unless BTC crosses back through the strike; otherwise record a
       settlement-mode result at expiry
@@ -130,7 +130,7 @@ def find_late_winning_signal(
     Pure rule detector for the late winning-contract strategy.
 
     ``LATE_WINNING_MAX_ASK`` is treated as exclusive by design, so the default
-    0.80 means 75c through 79c.
+    0.91 means 75c through 90c.
     """
     if tte is None:
         return None
