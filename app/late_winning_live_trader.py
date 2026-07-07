@@ -115,6 +115,19 @@ def _price_for_side(prices: dict, side: str) -> tuple[Optional[float], Optional[
     )
 
 
+def _order_payload(payload: Optional[dict]) -> dict:
+    """Return the actual order object from either flat or nested API payloads."""
+    if not isinstance(payload, dict):
+        return {}
+    nested = payload.get("order")
+    return nested if isinstance(nested, dict) else payload
+
+
+def _order_id(payload: Optional[dict]) -> str:
+    order = _order_payload(payload)
+    return str(order.get("order_id") or order.get("id") or "")
+
+
 def find_late_winning_signal(
     *,
     market_db_id: int,
@@ -405,7 +418,11 @@ class LateWinningLiveTrader:
             logger.error("late winning ENTRY REJECTED #%d | %s", trade_id, exc)
             return
 
-        live.entry_order_id = str(order.get("order_id") or order.get("id") or "")
+        live.entry_order_id = _order_id(order)
+        if not live.entry_order_id:
+            adopted = self._find_order_by_client_order_id(coid, sig.market_ticker)
+            if adopted is not None:
+                live.entry_order_id = _order_id(adopted)
         execute_query(
             "UPDATE momentum_live_trades SET entry_order_id=%s WHERE id=%s",
             (live.entry_order_id, trade_id),
@@ -450,7 +467,9 @@ class LateWinningLiveTrader:
                 self._advance_pending_exit(live, captured_at, bid)
 
     def _advance_pending_entry(self, live: _LateWinningActive, captured_at: datetime) -> None:
-        if not live.entry_order_id or self._client is None:
+        if self._client is None:
+            return
+        if not live.entry_order_id and not self._adopt_or_cancel_missing_entry_order(live, captured_at):
             return
         fills = self._client.get_fills(order_id=live.entry_order_id)
         count, avg_price, fees = _summarize_fills(fills, live.side)
@@ -572,7 +591,11 @@ class LateWinningLiveTrader:
             logger.error("late winning EXIT REJECTED #%d | %s", live.live_trade_id, exc)
             return
 
-        oid = str(order.get("order_id") or order.get("id") or "")
+        oid = _order_id(order)
+        if not oid:
+            adopted = self._find_order_by_client_order_id(coid, live.market_ticker)
+            if adopted is not None:
+                oid = _order_id(adopted)
         live.exit_order_id = oid
         if oid and oid not in live.exit_order_ids:
             live.exit_order_ids.append(oid)
@@ -728,6 +751,78 @@ class LateWinningLiveTrader:
         except KalshiTradingError as exc:
             logger.warning("late winning get_order failed (%s): %s", order_id, exc)
             return None
+
+    def _find_order_by_client_order_id(self, client_order_id: str, ticker: str) -> Optional[dict]:
+        if not client_order_id or self._client is None:
+            return None
+        try:
+            return self._client.find_order_by_client_order_id(client_order_id, ticker=ticker)
+        except KalshiTradingError as exc:
+            logger.warning(
+                "late winning client-order reconcile failed (%s): %s",
+                client_order_id, exc,
+            )
+            return None
+
+    def _adopt_or_cancel_missing_entry_order(
+        self, live: _LateWinningActive, captured_at: datetime
+    ) -> bool:
+        """
+        Recover PENDING_ENTRY rows whose submit response did not persist an
+        order id. Without this, stale rows can sit forever and block entries.
+
+        Returns True only when ``live.entry_order_id`` is now available.
+        """
+        adopted = self._find_order_by_client_order_id(
+            live.entry_client_order_id, live.market_ticker
+        )
+        if adopted is not None:
+            live.entry_order_id = _order_id(adopted)
+            if live.entry_order_id:
+                execute_query(
+                    "UPDATE momentum_live_trades SET entry_order_id=%s WHERE id=%s",
+                    (live.entry_order_id, live.live_trade_id),
+                )
+                self._record_order_event(
+                    live,
+                    "entry_order_recovered",
+                    action="buy",
+                    order_id=live.entry_order_id,
+                    client_order_id=live.entry_client_order_id,
+                    raw=adopted,
+                )
+                logger.warning(
+                    "late winning ENTRY ORDER RECOVERED #%d | order=%s",
+                    live.live_trade_id, live.entry_order_id,
+                )
+                return True
+
+        elapsed = datetime.now(timezone.utc).timestamp() - (live.entry_submit_ts or live.signal_ts)
+        if elapsed <= config.LATE_WINNING_ENTRY_FILL_TIMEOUT_SECONDS:
+            return False
+
+        execute_query(
+            "UPDATE momentum_live_trades SET status='CANCELED', exit_reason='missing_entry_order_id' WHERE id=%s",
+            (live.live_trade_id,),
+        )
+        self._record_order_event(
+            live,
+            "entry_canceled",
+            action="buy",
+            requested_count=live.requested_contracts,
+            filled_count=0,
+            client_order_id=live.entry_client_order_id,
+            detail="missing entry_order_id and client-order reconcile found no order",
+        )
+        self._start_retry_cooldown(
+            live.contract_id, captured_at.timestamp(), "missing entry order id"
+        )
+        logger.warning(
+            "late winning ENTRY CANCELED #%d | missing entry_order_id",
+            live.live_trade_id,
+        )
+        self._active.pop(live.contract_id, None)
+        return False
 
     def _start_retry_cooldown(self, contract_id: int, retry_from_ts: float, reason: str) -> None:
         delay = config.LATE_WINNING_RETRY_AFTER_CANCEL_SECONDS

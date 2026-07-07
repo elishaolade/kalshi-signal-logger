@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app import config
-from app.late_winning_live_trader import find_late_winning_signal
+from app.late_winning_live_trader import _order_id, find_late_winning_signal
 
 
 def _prices(*, yes_bid=0.76, yes_ask=0.77, no_bid=0.22, no_ask=0.23):
@@ -154,3 +154,11 @@ def test_rejects_if_tte_is_more_than_8_minutes():
     )
 
     assert sig is None
+
+
+def test_order_id_handles_flat_and_nested_order_payloads():
+    assert _order_id({"order_id": "flat-123"}) == "flat-123"
+    assert _order_id({"id": "flat-id"}) == "flat-id"
+    assert _order_id({"order": {"order_id": "nested-123"}}) == "nested-123"
+    assert _order_id({"order": {"id": "nested-id"}}) == "nested-id"
+    assert _order_id({"order": {}}) == ""
