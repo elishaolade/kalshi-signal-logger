@@ -7,6 +7,7 @@ services:
       - --innodb-buffer-pool-size=64M
       - --max-connections=25
       - --table-open-cache=200
+      - --disable-log-bin
     environment:
       MYSQL_ROOT_PASSWORD: root_password
       MYSQL_DATABASE: ${MYSQL_DATABASE:-signal_logger}
