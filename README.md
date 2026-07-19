@@ -197,6 +197,18 @@ reports/montecarlo_<strategy>_YYYY_MM_DD.md
 
 The schema lives in [`sql/schema.sql`](sql/schema.sql). Docker Compose applies it automatically on first boot.
 
+## Exporting table data
+
+Use the read-only exporter when you need raw table data from the current logger database:
+
+```bash
+python scripts/export_table_data.py --table signals --format csv
+python scripts/export_table_data.py --table paper_trades --where "status = 'CLOSED'" --order-by "entry_time DESC"
+python scripts/export_table_data.py --all --format jsonl --out-dir exports/latest
+```
+
+The exporter uses the same MySQL environment variables as the logger and supports `csv`, `jsonl`, and `json` outputs.
+
 ### `markets`
 
 One row per 15-minute contract window. Keyed by `market_ticker` (e.g. `KXBTC-260527-1200-T67500`). All other tables foreign-key to this.
