@@ -35,6 +35,7 @@ from research_rapid_moderate_dominance import (  # noqa: E402
     _fee_cents,
     _first_target,
     _future_path,
+    _iso,
     _last_at_or_before,
     _load_rows,
     _mae_before,
