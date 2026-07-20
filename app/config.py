@@ -250,6 +250,55 @@ LATE_WINNING_RETRY_AFTER_CANCEL_SECONDS = float(
     os.getenv("LATE_WINNING_RETRY_AFTER_CANCEL_SECONDS", "20")
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Fast rebound TEST strategy — research-only, no real orders
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Frozen hypothesis:
+#   - first 5 minutes after BTC 15m market open
+#   - dominant side ask is 65c to <70c
+#   - dominant side repriced at a fast but not extreme pace from open
+#   - dominant_change_prev_30s_cents is >9c and <=15c
+#   - TEST buys the minority side at ask and models target/stop exits
+#
+# This subsystem never calls trading endpoints. It only writes modeled TEST
+# rows to fast_rebound_test_trades.
+FAST_REBOUND_TEST_ENABLED = _env_bool("FAST_REBOUND_TEST_ENABLED", "false")
+FAST_REBOUND_TEST_PROFILE = os.getenv(
+    "FAST_REBOUND_TEST_PROFILE",
+    "frozen_65_70_fast_rebound_reprice_9_15_target_stop_v1",
+).strip()
+FAST_REBOUND_TEST_MAX_ENTRY_SECONDS_AFTER_OPEN = float(
+    os.getenv("FAST_REBOUND_TEST_MAX_ENTRY_SECONDS_AFTER_OPEN", "300")
+)
+FAST_REBOUND_TEST_BASELINE_MAX_SECONDS_AFTER_OPEN = float(
+    os.getenv("FAST_REBOUND_TEST_BASELINE_MAX_SECONDS_AFTER_OPEN", "30")
+)
+FAST_REBOUND_TEST_DOMINANT_MIN_ASK = float(os.getenv("FAST_REBOUND_TEST_DOMINANT_MIN_ASK", "0.65"))
+FAST_REBOUND_TEST_DOMINANT_MAX_ASK = float(os.getenv("FAST_REBOUND_TEST_DOMINANT_MAX_ASK", "0.70"))
+FAST_REBOUND_TEST_SPEED_MIN_CENTS_PER_SECOND = float(
+    os.getenv("FAST_REBOUND_TEST_SPEED_MIN_CENTS_PER_SECOND", "0.15")
+)
+FAST_REBOUND_TEST_SPEED_MAX_CENTS_PER_SECOND = float(
+    os.getenv("FAST_REBOUND_TEST_SPEED_MAX_CENTS_PER_SECOND", "0.30")
+)
+FAST_REBOUND_TEST_REPRICE_30S_MIN_CENTS = float(
+    os.getenv("FAST_REBOUND_TEST_REPRICE_30S_MIN_CENTS", "9")
+)
+FAST_REBOUND_TEST_REPRICE_30S_MAX_CENTS = float(
+    os.getenv("FAST_REBOUND_TEST_REPRICE_30S_MAX_CENTS", "15")
+)
+FAST_REBOUND_TEST_MAX_SPREAD = float(os.getenv("FAST_REBOUND_TEST_MAX_SPREAD", "0.02"))
+# Comma format: target_cents:stop_cents,target_cents:stop_cents
+FAST_REBOUND_TEST_EXIT_MODELS = os.getenv(
+    "FAST_REBOUND_TEST_EXIT_MODELS", "10:10,15:10,10:15,15:15"
+).strip()
+FAST_REBOUND_TEST_TIMEOUT_SECONDS = float(os.getenv("FAST_REBOUND_TEST_TIMEOUT_SECONDS", "90"))
+FAST_REBOUND_TEST_FEE_RATE_CENTS = float(os.getenv("FAST_REBOUND_TEST_FEE_RATE_CENTS", "7.0"))
+FAST_REBOUND_TEST_EXTRA_SLIPPAGE_CENTS = float(
+    os.getenv("FAST_REBOUND_TEST_EXTRA_SLIPPAGE_CENTS", "0")
+)
+
 # ── Automatic pause (live actual drifting below shadow projected) ──────────────
 # Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.
 # A window only counts once it has at least LIVE_PAUSE_MIN_TRADES completed live

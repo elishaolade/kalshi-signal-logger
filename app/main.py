@@ -40,6 +40,7 @@ from app.config import (
     MOMENTUM_LIVE_ACTIVE_PULSE_SECONDS,
     MOMENTUM_WS_OBSERVER_ENABLED,
     POLL_INTERVAL_SECONDS,
+    FAST_REBOUND_TEST_ENABLED,
 )
 from app.data_feed import (
     get_btc_price,
@@ -54,6 +55,7 @@ from app.models import MarketMetrics, MarketSnapshot
 from app.momentum_shadow_tracker import MomentumShadowTracker
 from app.momentum_live_trader import MomentumLiveTrader
 from app.late_winning_live_trader import LateWinningLiveTrader
+from app.fast_rebound_test_tracker import FastReboundTestTracker
 from app.ws_first_observer import WebSocketFirstObserver
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -104,6 +106,9 @@ _live_trader: Optional[MomentumLiveTrader] = None
 # Late winning-contract LIVE trader (real money). Separate from momentum;
 # disabled unless LATE_WINNING_* gates are explicitly armed.
 _late_winning_trader: Optional[LateWinningLiveTrader] = None
+
+# Fast rebound TEST tracker. Research-only; no real orders.
+_fast_rebound_test_tracker: Optional[FastReboundTestTracker] = None
 
 # WebSocket-first observer. When enabled, quote snapshots handed to shadow/live
 # diagnostics come from fresh WS order books; stale/missing WS books skip ticks.
@@ -644,11 +649,30 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         except Exception as exc:
             logger.warning("Late winning trader error on tick #%d: %s", n, exc)
 
+    # 13. Fast rebound TEST tracker (research-only; never places orders).
+    if _fast_rebound_test_tracker is not None:
+        try:
+            _fast_rebound_test_tracker.on_tick(
+                market_db_id=market_db_id,
+                market_id=market_id,
+                market_ticker=market_id,
+                contract_ids=contract_ids,
+                target_price=target_price,
+                opens_at=market.get("opens_at"),
+                captured_at=now,
+                btc_price=btc_price,
+                tte=tte,
+                prices=prices,
+            )
+        except Exception as exc:
+            logger.warning("Fast rebound TEST tracker error on tick #%d: %s", n, exc)
+
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
-    global _stop_event, _shadow_tracker, _live_trader, _late_winning_trader, _ws_observer
+    global _stop_event, _shadow_tracker, _live_trader, _late_winning_trader
+    global _fast_rebound_test_tracker, _ws_observer
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -703,6 +727,15 @@ def run() -> None:
             "LateWinningLiveTrader init failed (late winning live disabled "
             "— run scripts/migrate_add_momentum_live.py first): %s", exc
         )
+
+    if FAST_REBOUND_TEST_ENABLED:
+        try:
+            _fast_rebound_test_tracker = FastReboundTestTracker()
+        except Exception as exc:
+            logger.warning(
+                "FastReboundTestTracker init failed "
+                "(run scripts/migrate_add_fast_rebound_test.py first): %s", exc
+            )
 
     logger.info(
         "Running — interval=%.1fs  active_pulse=%.3fs  tick_buffer=%d",
