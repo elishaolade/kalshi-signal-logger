@@ -36,6 +36,7 @@ class Paths:
     stability_csv: Path
     feature_compare_csv: Path
     candidates_csv: Path
+    cutoffs_csv: Path
     markdown_report: Path
 
 
@@ -159,12 +160,38 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _derive_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _cutoff_row(
+    feature_name: str,
+    source_field: str,
+    q1: float | None,
+    q2: float | None,
+) -> dict[str, Any]:
+    return {
+        "feature_name": feature_name,
+        "source_field": source_field,
+        "low_bucket_rule": f"{source_field} <= {q1}" if q1 is not None else "unknown",
+        "mid_bucket_rule": f"{source_field} > {q1} AND {source_field} <= {q2}" if q1 is not None and q2 is not None else "unknown",
+        "high_bucket_rule": f"{source_field} > {q2}" if q2 is not None else "unknown",
+        "low_max_inclusive": q1,
+        "mid_min_exclusive": q1,
+        "mid_max_inclusive": q2,
+        "high_min_exclusive": q2,
+    }
+
+
+def _derive_features(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     q_abs_dist = _quantiles(rows, "abs_btc_distance")
     q_spread = _quantiles(rows, "minority_spread")
     q_dom_speed = _quantiles(rows, "dominant_cents_per_second")
     q_dom_reprice_30 = _quantiles(rows, "dominant_change_prev_30s_cents")
     q_minority_ask = _quantiles(rows, "minority_ask")
+    cutoffs = [
+        _cutoff_row("abs_btc_distance_bucket", "abs_btc_distance", *q_abs_dist),
+        _cutoff_row("spread_bucket", "minority_spread", *q_spread),
+        _cutoff_row("dominant_speed_quantile", "dominant_cents_per_second", *q_dom_speed),
+        _cutoff_row("dominant_reprice_30s_quantile", "dominant_change_prev_30s_cents", *q_dom_reprice_30),
+        _cutoff_row("minority_ask_quantile", "minority_ask", *q_minority_ask),
+    ]
 
     for row in rows:
         btc10 = row.get("btc_move_prev_10s_dominant_side")
@@ -186,7 +213,7 @@ def _derive_features(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["dominant_speed_quantile"] = _quantile_bucket(row.get("dominant_cents_per_second"), *q_dom_speed)
         row["dominant_reprice_30s_quantile"] = _quantile_bucket(row.get("dominant_change_prev_30s_cents"), *q_dom_reprice_30)
         row["minority_ask_quantile"] = _quantile_bucket(row.get("minority_ask"), *q_minority_ask)
-    return rows
+    return rows, cutoffs
 
 
 def _deceleration_bucket(btc10: float | None, btc30: float | None) -> str:
@@ -255,6 +282,13 @@ def _summarize(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[s
     for key_values, group in groups.items():
         gross = [row["gross_pnl_cents"] for row in group if row.get("gross_pnl_cents") is not None]
         item = {key: value for key, value in zip(keys, key_values)}
+        if len(keys) == 1:
+            item["feature_name"] = keys[0]
+            item["feature_value"] = key_values[0]
+        elif len(keys) == 2 and keys[1] == "dataset_half":
+            item["feature_name"] = keys[0]
+            item["feature_value"] = key_values[0]
+            item["dataset_half"] = key_values[1]
         item.update(
             {
                 "trades": len(group),
@@ -365,13 +399,14 @@ def _paths(output_dir: Path) -> Paths:
         stability_csv=output_dir / f"{stem}_stability.csv",
         feature_compare_csv=output_dir / f"{stem}_feature_compare.csv",
         candidates_csv=output_dir / f"{stem}_candidate_features.csv",
+        cutoffs_csv=output_dir / f"{stem}_cutoffs.csv",
         markdown_report=output_dir / f"{stem}_report.md",
     )
 
 
 def build_report(input_csv: Path, output_dir: Path, min_trades: int, min_avg_gross: float) -> Paths:
     paths = _paths(output_dir)
-    rows = _derive_features(_load_rows(input_csv))
+    rows, cutoffs = _derive_features(_load_rows(input_csv))
 
     feature_keys = (
         "btc_deceleration",
@@ -401,7 +436,8 @@ def build_report(input_csv: Path, output_dir: Path, min_trades: int, min_avg_gro
     _write_csv(paths.stability_csv, stability_rows)
     _write_csv(paths.feature_compare_csv, compare_rows)
     _write_csv(paths.candidates_csv, candidate_rows)
-    paths.markdown_report.write_text(_render_report(input_csv, rows, feature_rows, stability_rows, compare_rows, candidate_rows, min_trades, min_avg_gross))
+    _write_csv(paths.cutoffs_csv, cutoffs)
+    paths.markdown_report.write_text(_render_report(input_csv, rows, feature_rows, stability_rows, compare_rows, candidate_rows, cutoffs, min_trades, min_avg_gross))
     return paths
 
 
@@ -409,31 +445,17 @@ def _stable_candidates(candidates: list[dict[str, Any]], stability_rows: list[di
     stable = []
     by_feature = defaultdict(list)
     for row in stability_rows:
-        feature_keys = [k for k in row.keys() if k not in {
-            "dataset_half", "trades", "unique_markets", "active_days", "avg_gross_pnl_cents",
-            "median_gross_pnl_cents", "total_gross_pnl_cents", "gross_profit_factor",
-            "max_gross_drawdown_cents", "gross_win_rate_pct", "target_3c_rate",
-            "target_5c_rate", "target_10c_rate", "avg_btc_move_prev_10s",
-            "avg_btc_move_prev_30s", "avg_dominant_change_prev_10s",
-            "avg_minority_change_prev_10s", "small_sample_flag",
-        }]
-        if not feature_keys:
+        feature_name = row.get("feature_name")
+        feature_value = row.get("feature_value")
+        if feature_name is None:
             continue
-        key = feature_keys[0]
-        by_feature[(key, row[key])].append(row)
+        by_feature[(feature_name, feature_value)].append(row)
     for candidate in candidates:
-        feature_keys = [k for k in candidate.keys() if k not in {
-            "trades", "unique_markets", "active_days", "avg_gross_pnl_cents",
-            "median_gross_pnl_cents", "total_gross_pnl_cents", "gross_profit_factor",
-            "max_gross_drawdown_cents", "gross_win_rate_pct", "target_3c_rate",
-            "target_5c_rate", "target_10c_rate", "avg_btc_move_prev_10s",
-            "avg_btc_move_prev_30s", "avg_dominant_change_prev_10s",
-            "avg_minority_change_prev_10s", "small_sample_flag",
-        }]
-        if not feature_keys:
+        feature_name = candidate.get("feature_name")
+        feature_value = candidate.get("feature_value")
+        if feature_name is None:
             continue
-        key = feature_keys[0]
-        halves = by_feature.get((key, candidate[key]), [])
+        halves = by_feature.get((feature_name, feature_value), [])
         if len(halves) == 2 and all((h.get("avg_gross_pnl_cents") or -999) > 0 for h in halves):
             row = dict(candidate)
             row["first_half_avg_gross"] = next((h["avg_gross_pnl_cents"] for h in halves if h["dataset_half"] == "first_half"), None)
@@ -449,6 +471,7 @@ def _render_report(
     stability_rows: list[dict[str, Any]],
     compare_rows: list[dict[str, Any]],
     candidate_rows: list[dict[str, Any]],
+    cutoffs: list[dict[str, Any]],
     min_trades: int,
     min_avg_gross: float,
 ) -> str:
@@ -471,11 +494,19 @@ def _render_report(
 
 ## Candidate Feature Buckets
 
-{_table(candidate_rows, ["trades", "avg_gross_pnl_cents", "median_gross_pnl_cents", "gross_profit_factor", "target_3c_rate", "target_5c_rate", "target_10c_rate"], 30)}
+{_table(candidate_rows, ["feature_name", "feature_value", "trades", "avg_gross_pnl_cents", "median_gross_pnl_cents", "gross_profit_factor", "target_3c_rate", "target_5c_rate", "target_10c_rate"], 30)}
 
 ## Candidate Buckets Stable In Both Halves
 
-{_table(stable, ["trades", "avg_gross_pnl_cents", "first_half_avg_gross", "second_half_avg_gross", "gross_profit_factor", "target_3c_rate", "target_5c_rate"], 20)}
+{_table(stable, ["feature_name", "feature_value", "trades", "avg_gross_pnl_cents", "first_half_avg_gross", "second_half_avg_gross", "gross_profit_factor", "target_3c_rate", "target_5c_rate"], 20)}
+
+## Quantile Cutoffs
+
+{_table(cutoffs, ["feature_name", "source_field", "low_bucket_rule", "mid_bucket_rule", "high_bucket_rule"], 20)}
+
+For example, `dominant_reprice_30s_quantile=mid` means:
+
+`dominant_change_prev_30s_cents > low_max_inclusive AND dominant_change_prev_30s_cents <= mid_max_inclusive`
 
 ## Winner / Loser Feature Comparison
 
@@ -513,6 +544,7 @@ def main() -> None:
     print(f"stability_csv={paths.stability_csv}")
     print(f"feature_compare_csv={paths.feature_compare_csv}")
     print(f"candidates_csv={paths.candidates_csv}")
+    print(f"cutoffs_csv={paths.cutoffs_csv}")
     print(f"markdown_report={paths.markdown_report}")
 
 
