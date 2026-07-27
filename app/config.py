@@ -299,6 +299,34 @@ FAST_REBOUND_TEST_EXTRA_SLIPPAGE_CENTS = float(
     os.getenv("FAST_REBOUND_TEST_EXTRA_SLIPPAGE_CENTS", "0")
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BTC impulse PAPER test — prospective, research-only, no real orders
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Frozen rule:
+#   - 08:00-11:00 ET
+#   - max one paper trade per ET calendar day
+#   - first clean quote where abs(BTC 60s move) >= $50
+#   - buy side aligned with BTC 60s direction at ask
+#   - spread <= 0.01
+#   - exit at bid after 120 seconds
+BTC_IMPULSE_PAPER_ENABLED = _env_bool("BTC_IMPULSE_PAPER_ENABLED", "false")
+BTC_IMPULSE_PAPER_PROFILE = os.getenv(
+    "BTC_IMPULSE_PAPER_PROFILE",
+    "frozen_08_11_btc_60s_abs50_aligned_120s_v1",
+).strip()
+BTC_IMPULSE_PAPER_START_HOUR_ET = int(os.getenv("BTC_IMPULSE_PAPER_START_HOUR_ET", "8"))
+BTC_IMPULSE_PAPER_END_HOUR_ET = int(os.getenv("BTC_IMPULSE_PAPER_END_HOUR_ET", "11"))
+BTC_IMPULSE_PAPER_BTC_60S_ABS_THRESHOLD = float(
+    os.getenv("BTC_IMPULSE_PAPER_BTC_60S_ABS_THRESHOLD", "50")
+)
+BTC_IMPULSE_PAPER_MAX_SPREAD = float(os.getenv("BTC_IMPULSE_PAPER_MAX_SPREAD", "0.01"))
+BTC_IMPULSE_PAPER_EXIT_SECONDS = float(os.getenv("BTC_IMPULSE_PAPER_EXIT_SECONDS", "120"))
+BTC_IMPULSE_PAPER_EXIT_TOLERANCE_SECONDS = float(
+    os.getenv("BTC_IMPULSE_PAPER_EXIT_TOLERANCE_SECONDS", "10")
+)
+BTC_IMPULSE_PAPER_FEE_RATE_CENTS = float(os.getenv("BTC_IMPULSE_PAPER_FEE_RATE_CENTS", "7.0"))
+
 # ── Automatic pause (live actual drifting below shadow projected) ──────────────
 # Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.
 # A window only counts once it has at least LIVE_PAUSE_MIN_TRADES completed live

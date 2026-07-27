@@ -41,6 +41,7 @@ from app.config import (
     MOMENTUM_WS_OBSERVER_ENABLED,
     POLL_INTERVAL_SECONDS,
     FAST_REBOUND_TEST_ENABLED,
+    BTC_IMPULSE_PAPER_ENABLED,
 )
 from app.data_feed import (
     get_btc_price,
@@ -56,6 +57,7 @@ from app.momentum_shadow_tracker import MomentumShadowTracker
 from app.momentum_live_trader import MomentumLiveTrader
 from app.late_winning_live_trader import LateWinningLiveTrader
 from app.fast_rebound_test_tracker import FastReboundTestTracker
+from app.btc_impulse_paper_tracker import BtcImpulsePaperTracker
 from app.ws_first_observer import WebSocketFirstObserver
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -109,6 +111,9 @@ _late_winning_trader: Optional[LateWinningLiveTrader] = None
 
 # Fast rebound TEST tracker. Research-only; no real orders.
 _fast_rebound_test_tracker: Optional[FastReboundTestTracker] = None
+
+# BTC impulse prospective PAPER tracker. Research-only; no real orders.
+_btc_impulse_paper_tracker: Optional[BtcImpulsePaperTracker] = None
 
 # WebSocket-first observer. When enabled, quote snapshots handed to shadow/live
 # diagnostics come from fresh WS order books; stale/missing WS books skip ticks.
@@ -667,12 +672,27 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         except Exception as exc:
             logger.warning("Fast rebound TEST tracker error on tick #%d: %s", n, exc)
 
+    # 14. BTC impulse PAPER tracker (research-only; never places orders).
+    if _btc_impulse_paper_tracker is not None:
+        try:
+            _btc_impulse_paper_tracker.on_tick(
+                market_db_id=market_db_id,
+                market_ticker=market_id,
+                contract_ids=contract_ids,
+                captured_at=now,
+                btc_price=btc_price,
+                prices=prices,
+                btc_ticks=ticks,
+            )
+        except Exception as exc:
+            logger.warning("BTC impulse PAPER tracker error on tick #%d: %s", n, exc)
+
 
 # ── Startup + main loop ───────────────────────────────────────────────────────
 
 def run() -> None:
     global _stop_event, _shadow_tracker, _live_trader, _late_winning_trader
-    global _fast_rebound_test_tracker, _ws_observer
+    global _fast_rebound_test_tracker, _btc_impulse_paper_tracker, _ws_observer
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -735,6 +755,15 @@ def run() -> None:
             logger.warning(
                 "FastReboundTestTracker init failed "
                 "(run scripts/migrate_add_fast_rebound_test.py first): %s", exc
+            )
+
+    if BTC_IMPULSE_PAPER_ENABLED:
+        try:
+            _btc_impulse_paper_tracker = BtcImpulsePaperTracker()
+        except Exception as exc:
+            logger.warning(
+                "BtcImpulsePaperTracker init failed "
+                "(run scripts/migrate_add_btc_impulse_paper_test.py first): %s", exc
             )
 
     logger.info(
