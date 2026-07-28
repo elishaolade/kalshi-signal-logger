@@ -327,6 +327,62 @@ BTC_IMPULSE_PAPER_EXIT_TOLERANCE_SECONDS = float(
 )
 BTC_IMPULSE_PAPER_FEE_RATE_CENTS = float(os.getenv("BTC_IMPULSE_PAPER_FEE_RATE_CENTS", "7.0"))
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Cheap minority Real-Money TEST — explicit small live-order experiment
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# TEST = Thirty Emailed Small Live Trades. Disabled by default. When armed, this
+# places real orders using a fixed frozen rule:
+#   - 08:00-11:00 ET
+#   - first 120 seconds after BTC 15m market open
+#   - first eligible minority side with ask 20c to <30c and spread <= 1c
+#   - exactly 2 contracts, one attempted signal per ET day
+#   - target exit when bid >= 95c, otherwise close-window bid exit
+CHEAP_MINORITY_TEST_ENABLED = _env_bool("CHEAP_MINORITY_TEST_ENABLED", "false")
+CHEAP_MINORITY_TEST_CONFIRM = os.getenv("CHEAP_MINORITY_TEST_CONFIRM", "").strip()
+CHEAP_MINORITY_TEST_PROFILE = os.getenv(
+    "CHEAP_MINORITY_TEST_PROFILE",
+    "real_money_test_cheap_minority_20_30c_tp95_v1",
+).strip()
+CHEAP_MINORITY_TEST_LABEL = os.getenv(
+    "CHEAP_MINORITY_TEST_LABEL",
+    "Real-Money TEST: Thirty Emailed Small Live Trades",
+).strip()
+CHEAP_MINORITY_TEST_STARTING_BALANCE_DOLLARS = float(
+    os.getenv("CHEAP_MINORITY_TEST_STARTING_BALANCE_DOLLARS", "10")
+)
+CHEAP_MINORITY_TEST_CONTRACTS = int(os.getenv("CHEAP_MINORITY_TEST_CONTRACTS", "2"))
+CHEAP_MINORITY_TEST_START_HOUR_ET = int(os.getenv("CHEAP_MINORITY_TEST_START_HOUR_ET", "8"))
+CHEAP_MINORITY_TEST_END_HOUR_ET = int(os.getenv("CHEAP_MINORITY_TEST_END_HOUR_ET", "11"))
+CHEAP_MINORITY_TEST_MAX_ENTRY_SECONDS_AFTER_OPEN = float(
+    os.getenv("CHEAP_MINORITY_TEST_MAX_ENTRY_SECONDS_AFTER_OPEN", "120")
+)
+CHEAP_MINORITY_TEST_MIN_ASK = float(os.getenv("CHEAP_MINORITY_TEST_MIN_ASK", "0.20"))
+CHEAP_MINORITY_TEST_MAX_ASK = float(os.getenv("CHEAP_MINORITY_TEST_MAX_ASK", "0.30"))
+CHEAP_MINORITY_TEST_MAX_SPREAD = float(os.getenv("CHEAP_MINORITY_TEST_MAX_SPREAD", "0.01"))
+CHEAP_MINORITY_TEST_TARGET_BID = float(os.getenv("CHEAP_MINORITY_TEST_TARGET_BID", "0.95"))
+CHEAP_MINORITY_TEST_ENTRY_FILL_TIMEOUT_SECONDS = float(
+    os.getenv("CHEAP_MINORITY_TEST_ENTRY_FILL_TIMEOUT_SECONDS", "10")
+)
+CHEAP_MINORITY_TEST_EXIT_FILL_TIMEOUT_SECONDS = float(
+    os.getenv("CHEAP_MINORITY_TEST_EXIT_FILL_TIMEOUT_SECONDS", "10")
+)
+CHEAP_MINORITY_TEST_CLOSE_EXIT_TTE_SECONDS = float(
+    os.getenv("CHEAP_MINORITY_TEST_CLOSE_EXIT_TTE_SECONDS", "10")
+)
+CHEAP_MINORITY_TEST_MAX_COMPLETED_TRADES = int(
+    os.getenv("CHEAP_MINORITY_TEST_MAX_COMPLETED_TRADES", "30")
+)
+CHEAP_MINORITY_TEST_MAX_CALENDAR_DAYS = int(
+    os.getenv("CHEAP_MINORITY_TEST_MAX_CALENDAR_DAYS", "45")
+)
+CHEAP_MINORITY_TEST_FEE_RATE_CENTS = float(
+    os.getenv("CHEAP_MINORITY_TEST_FEE_RATE_CENTS", "7.0")
+)
+CHEAP_MINORITY_TEST_UNFILLED_CONSUMES_DAY = _env_bool(
+    "CHEAP_MINORITY_TEST_UNFILLED_CONSUMES_DAY", "true"
+)
+
 # ── Automatic pause (live actual drifting below shadow projected) ──────────────
 # Pause is evaluated over rolling windows of the last 25 / 50 / 100 live trades.
 # A window only counts once it has at least LIVE_PAUSE_MIN_TRADES completed live

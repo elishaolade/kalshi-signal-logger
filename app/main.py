@@ -41,6 +41,7 @@ from app.config import (
     MOMENTUM_WS_OBSERVER_ENABLED,
     POLL_INTERVAL_SECONDS,
     FAST_REBOUND_TEST_ENABLED,
+    CHEAP_MINORITY_TEST_ENABLED,
     BTC_IMPULSE_PAPER_ENABLED,
 )
 from app.data_feed import (
@@ -57,6 +58,7 @@ from app.momentum_shadow_tracker import MomentumShadowTracker
 from app.momentum_live_trader import MomentumLiveTrader
 from app.late_winning_live_trader import LateWinningLiveTrader
 from app.fast_rebound_test_tracker import FastReboundTestTracker
+from app.cheap_minority_test_live_tracker import CheapMinorityRealMoneyTestTracker
 from app.btc_impulse_paper_tracker import BtcImpulsePaperTracker
 from app.ws_first_observer import WebSocketFirstObserver
 
@@ -111,6 +113,10 @@ _late_winning_trader: Optional[LateWinningLiveTrader] = None
 
 # Fast rebound TEST tracker. Research-only; no real orders.
 _fast_rebound_test_tracker: Optional[FastReboundTestTracker] = None
+
+# Cheap minority Real-Money TEST tracker. Explicitly gated; places real orders
+# only when CHEAP_MINORITY_TEST_* gates are armed.
+_cheap_minority_test_tracker: Optional[CheapMinorityRealMoneyTestTracker] = None
 
 # BTC impulse prospective PAPER tracker. Research-only; no real orders.
 _btc_impulse_paper_tracker: Optional[BtcImpulsePaperTracker] = None
@@ -672,7 +678,24 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
         except Exception as exc:
             logger.warning("Fast rebound TEST tracker error on tick #%d: %s", n, exc)
 
-    # 14. BTC impulse PAPER tracker (research-only; never places orders).
+    # 14. Cheap minority Real-Money TEST tracker (real orders; separate gates).
+    if _cheap_minority_test_tracker is not None:
+        try:
+            _cheap_minority_test_tracker.on_tick(
+                market_db_id=market_db_id,
+                market_ticker=market_id,
+                contract_ids=contract_ids,
+                opens_at=market.get("opens_at"),
+                closes_at=market.get("closes_at"),
+                captured_at=now,
+                btc_price=btc_price,
+                tte=tte,
+                prices=prices,
+            )
+        except Exception as exc:
+            logger.warning("Cheap minority Real-Money TEST tracker error on tick #%d: %s", n, exc)
+
+    # 15. BTC impulse PAPER tracker (research-only; never places orders).
     if _btc_impulse_paper_tracker is not None:
         try:
             _btc_impulse_paper_tracker.on_tick(
@@ -692,7 +715,8 @@ def _tick(n: int, btc_ticks: collections.deque) -> None:
 
 def run() -> None:
     global _stop_event, _shadow_tracker, _live_trader, _late_winning_trader
-    global _fast_rebound_test_tracker, _btc_impulse_paper_tracker, _ws_observer
+    global _fast_rebound_test_tracker, _cheap_minority_test_tracker
+    global _btc_impulse_paper_tracker, _ws_observer
 
     if LIVE_TRADING_ENABLED:
         raise RuntimeError(
@@ -755,6 +779,16 @@ def run() -> None:
             logger.warning(
                 "FastReboundTestTracker init failed "
                 "(run scripts/migrate_add_fast_rebound_test.py first): %s", exc
+            )
+
+    if CHEAP_MINORITY_TEST_ENABLED:
+        try:
+            _cheap_minority_test_tracker = CheapMinorityRealMoneyTestTracker()
+        except Exception as exc:
+            logger.warning(
+                "CheapMinorityRealMoneyTestTracker init failed "
+                "(run scripts/migrate_add_cheap_minority_real_money_test.py first): %s",
+                exc,
             )
 
     if BTC_IMPULSE_PAPER_ENABLED:
